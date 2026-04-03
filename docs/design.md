@@ -12,8 +12,8 @@
 
 | Component | Status | Notes |
 |---|---|---|
-| `SlabAllocator` | Done | Fixed-size slab allocator with bitmask occupancy, `allocate(classId, nodeType)` overload |
-| `BumpAllocator` | Done | Bump allocator for variable-length immutable payloads |
+| `SlabAllocator` | Done | Fixed-size slab allocator with bitmask occupancy, dual-mode (in-memory / file-backed) |
+| `BumpAllocator` | Done | Bump allocator for variable-length immutable payloads, dual-mode (in-memory / file-backed) |
 | `NodePtr` / `OverflowPtr` | Done | 64-bit tagged swizzled pointer encoding |
 | Node types (4/16/48/256/PrefixNode) | Done | Static operations on off-heap `MemorySegment` slices |
 | `TaoTree` core (lookup/insert/delete) | Done | Fixed-width keys, pessimistic prefix compression, zero-initialized leaf values |
@@ -25,6 +25,7 @@
 | `KeyField` / `KeyLayout` / `KeyBuilder` | Done | Compound key definition and encoding |
 | JMH benchmarks | Done | ART lookup/insert, dictionary resolve throughput |
 | GBIF species tracker example | Done | Reads Parquet, 7 dict-encoded key fields |
+| File-backed persistence | Done | `ChunkStore` + `Superblock`, single file with 64 MB chunked mmap windows |
 
 ### Concurrency model
 
@@ -44,7 +45,8 @@ and reentrant-safe. Read→write upgrade is detected and throws `IllegalStateExc
 | Configurable `prefixCapacity` | Hardcoded to 15 (fits in 24B prefix node) |
 | Reserved-range dictionary APIs | `TaoDictionary.u32WithReserved()` for pre-assigned codes |
 | Vacuum / compaction | Slab and bump allocator compaction |
-| Persistence | Serialization / deserialization of the ART to/from files |
+| Persistence: TaoDictionary | Child tree descriptors + nextCode persistence |
+| Persistence: WAL | Write-ahead log for crash recovery |
 
 ---
 
@@ -1195,15 +1197,92 @@ The ART core provides the `scan` and `delete` primitives needed for these strate
 
 ---
 
-## 14. Persistence (Future)
+## 14. Persistence
 
-The ART can be serialized to and deserialized from `MemorySegment`-backed files using the same
-slab layout. Since all pointers are swizzled `(slabClassId, slabId, offset)` values rather
-than raw memory addresses, they are position-independent and survive serialization.
+The ART supports file-backed persistence via memory-mapped I/O. All pointers are swizzled
+`(slabClassId, slabId, offset)` values — position-independent and serializable without
+pointer translation.
 
-Detailed persistence format is intentionally left for a future revision. The baseline
-implementation is in-memory with replay-based recovery from an external log (e.g., Kafka
-offsets).
+### 14.1 File format
+
+A single file with 4 KB pages, mapped via `FileChannel.map()` in 64 MB chunked windows:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Page 0: Superblock (magic, version, all metadata)           │
+├──────────────────────────────────────────────────────────────┤
+│  Pages 1+: Slab data, bitmask data, bump pages              │
+│  (allocated sequentially by SlabAllocator + BumpAllocator)   │
+│                                                              │
+│  [slab data: 256 pages = 1 MB] [bitmask: 1-2 pages]         │
+│  [bump page: 16 pages = 64 KB]                               │
+│  [slab data: 256 pages] [bitmask: 1-2 pages]                │
+│  ...                                                         │
+│  [free space]                                                │
+└──────────────────────────────────────────────────────────────┘
+```
+
+The file grows by appending 64 MB chunks (one `mmap()` per chunk, keeping VMA count low).
+On macOS/APFS, files are sparse — physical disk usage matches actual data written.
+
+### 14.2 Superblock (page 0)
+
+Contains all metadata needed to reconstruct allocator and tree state on reopen:
+
+- ChunkStore state: totalPages, nextPage, chunkSize
+- SlabAllocator class registry: per-class segmentSize, slabCount, page locations, segmentsInUse
+- BumpAllocator state: pageCount, currentPage, bumpOffset, page locations
+- Tree descriptors: root pointer, size, keyLen, node class IDs, leaf class IDs
+- Dictionary descriptors: nextCode, maxCode, treeIndex
+
+### 14.3 Chunked mapping windows
+
+Each 64 MB chunk is one `FileChannel.map()` call returning a single `MemorySegment`.
+Slabs and bump pages are `chunk.asSlice()` from the containing chunk.
+
+When a page allocation would straddle a chunk boundary, it skips to the next chunk.
+This ensures every slab is contiguous within a single mapping.
+
+### 14.4 Dual mode
+
+The same `SlabAllocator` and `BumpAllocator` support both modes:
+
+- **In-memory** (default): `Arena.allocate()` for anonymous off-heap memory.
+- **File-backed**: `ChunkStore.allocPages()` → mapped file pages.
+
+Bitmasks use `MemorySegment` in both modes. In file-backed mode, bitmask writes are
+immediately visible in the mapped file — no separate sync step for allocation tracking.
+
+### 14.5 API
+
+```java
+// Create a new file-backed tree
+var tree = TaoTree.create(Path.of("data.tao"), 16, 24);
+
+// Open an existing file-backed tree
+var tree = TaoTree.open(Path.of("data.tao"));
+
+// Explicit sync (writes superblock, forces mappings)
+tree.sync();
+
+// Close (auto-syncs)
+tree.close();
+```
+
+### 14.6 Durability model
+
+- `sync()` writes the superblock and calls `force()` on all mapped chunks.
+- `close()` calls `sync()` automatically.
+- Crash between writes and `sync()` may leave metadata stale (no WAL in v1).
+- On macOS, `force()` uses `msync(MS_SYNC)`. For full durability, `F_FULLFSYNC` is needed
+  (future enhancement).
+
+### 14.7 Future work
+
+- TaoDictionary persistence (child tree descriptors + nextCode)
+- WAL or copy-on-write for crash recovery
+- `fallocate` / `F_PREALLOCATE` for physical block reservation
+- Vacuum / compaction for file-backed stores
 
 ---
 

@@ -8,12 +8,20 @@ import org.taotree.internal.Node48;
 import org.taotree.internal.Node256;
 import org.taotree.internal.NodeConstants;
 import org.taotree.internal.BumpAllocator;
+import org.taotree.internal.ChunkStore;
 import org.taotree.internal.PrefixNode;
 import org.taotree.internal.SlabAllocator;
+import org.taotree.internal.Superblock;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
@@ -65,6 +73,7 @@ public final class TaoTree implements AutoCloseable {
     private final BumpAllocator bump;
     private final ReentrantReadWriteLock lock;
     private final boolean ownsArena;
+    private final ChunkStore chunkStore; // null for in-memory mode
 
     /** Package-private: provides overflow storage for {@link TaoString}. */
     BumpAllocator bump() { return bump; }
@@ -86,6 +95,9 @@ public final class TaoTree implements AutoCloseable {
     private long root = NodePtr.EMPTY_PTR;
     long size = 0; // package-private for TaoDictionary
 
+    // Tracked dictionaries (for persistence)
+    private final List<TaoDictionary> dicts = new ArrayList<>();
+
     // -----------------------------------------------------------------------
     // Root tree constructor (owns arena)
     // -----------------------------------------------------------------------
@@ -96,6 +108,7 @@ public final class TaoTree implements AutoCloseable {
         this.bump = new BumpAllocator(arena);
         this.lock = new ReentrantReadWriteLock(true); // fair
         this.ownsArena = true;
+        this.chunkStore = null;
 
         // Register node slab classes
         this.prefixClassId  = slab.registerClass(NodeConstants.PREFIX_SIZE);
@@ -136,6 +149,7 @@ public final class TaoTree implements AutoCloseable {
         this.bump = parent.bump;
         this.lock = parent.lock;
         this.ownsArena = false;
+        this.chunkStore = null; // child trees don't own the chunk store
 
         // Copy node class IDs
         this.prefixClassId  = parent.prefixClassId;
@@ -238,6 +252,246 @@ public final class TaoTree implements AutoCloseable {
     /** Fixed key length in bytes. */
     public int keyLen() { return keyLen; }
 
+    /** Returns true if this tree is file-backed. */
+    public boolean isFileBacked() { return chunkStore != null; }
+
+    /**
+     * Returns the dictionary at the given index.
+     *
+     * <p>Dictionaries are indexed in the order they were created (for new trees)
+     * or restored (for reopened trees).
+     *
+     * @throws IndexOutOfBoundsException if the index is out of range
+     */
+    public TaoDictionary dictionary(int index) {
+        return dicts.get(index);
+    }
+
+    /** Returns the number of tracked dictionaries. */
+    public int dictionaryCount() {
+        return dicts.size();
+    }
+
+    /** Returns an unmodifiable view of all tracked dictionaries. */
+    public List<TaoDictionary> dictionaries() {
+        return Collections.unmodifiableList(dicts);
+    }
+
+    /** Package-private: register a dictionary for persistence tracking. */
+    void registerDict(TaoDictionary dict) {
+        dicts.add(dict);
+    }
+
+    // -----------------------------------------------------------------------
+    // File-backed factory methods
+    // -----------------------------------------------------------------------
+
+    /**
+     * Create a new file-backed tree with a single leaf class.
+     *
+     * @param path      path to the store file (must not exist)
+     * @param keyLen    fixed key length in bytes
+     * @param valueSize size of the leaf value region in bytes
+     */
+    public static TaoTree create(Path path, int keyLen, int valueSize) throws IOException {
+        if (keyLen <= 0) throw new IllegalArgumentException("keyLen must be positive: " + keyLen);
+        return createFileBacked(path, SlabAllocator.DEFAULT_SLAB_SIZE, keyLen, new int[]{valueSize});
+    }
+
+    /**
+     * Create a new file-backed tree with multiple leaf classes.
+     *
+     * @param path           path to the store file (must not exist)
+     * @param keyLen         fixed key length in bytes
+     * @param leafValueSizes value sizes for each leaf class
+     */
+    public static TaoTree create(Path path, int keyLen, int[] leafValueSizes) throws IOException {
+        if (keyLen <= 0) throw new IllegalArgumentException("keyLen must be positive: " + keyLen);
+        if (leafValueSizes == null || leafValueSizes.length == 0) {
+            throw new IllegalArgumentException("At least one leaf value size required");
+        }
+        return createFileBacked(path, SlabAllocator.DEFAULT_SLAB_SIZE, keyLen, leafValueSizes);
+    }
+
+    /**
+     * Open an existing file-backed tree.
+     *
+     * @param path path to the existing store file
+     * @return the restored tree with all data intact
+     */
+    public static TaoTree open(Path path) throws IOException {
+        return openFileBacked(path);
+    }
+
+    private static TaoTree createFileBacked(Path path, int slabSize, int keyLen,
+                                            int[] leafValueSizes) throws IOException {
+        var arena = Arena.ofShared();
+        var cs = ChunkStore.create(path, arena);
+        var slab = new SlabAllocator(arena, cs, slabSize);
+        var bump = new BumpAllocator(arena, cs, BumpAllocator.DEFAULT_PAGE_SIZE);
+
+        var tree = new TaoTree(arena, slab, bump, cs, keyLen, leafValueSizes);
+        // Write initial superblock
+        tree.writeSuperblock();
+        return tree;
+    }
+
+    private static TaoTree openFileBacked(Path path) throws IOException {
+        var arena = Arena.ofShared();
+
+        // First pass: open chunk store with minimal info to read the superblock
+        // We need totalPages and nextPage to remap chunks, but those are IN the superblock.
+        // Approach: open with file size to determine totalPages, read superblock, then finalize.
+        var channel = java.nio.channels.FileChannel.open(path,
+            java.nio.file.StandardOpenOption.READ,
+            java.nio.file.StandardOpenOption.WRITE);
+        long fileSize = channel.size();
+        channel.close();
+
+        if (fileSize < ChunkStore.PAGE_SIZE) {
+            throw new IOException("File too small to contain a superblock: " + path);
+        }
+
+        // Compute totalPages and open chunk store
+        int totalPages = (int) (fileSize / ChunkStore.PAGE_SIZE);
+        // We don't know nextPage yet — read it from superblock
+        // Open with totalPages, nextPage=totalPages (conservative)
+        var cs = ChunkStore.open(path, arena, ChunkStore.DEFAULT_CHUNK_SIZE, totalPages, totalPages);
+
+        // Read superblock
+        MemorySegment sb = cs.superblock();
+        var data = Superblock.read(sb);
+
+        // Update ChunkStore with actual nextPage (we opened with totalPages as conservative value)
+        // The ChunkStore already has all chunks mapped, so we just need allocations to resume
+        // at the right position. We'll create a new ChunkStore with the correct nextPage.
+        cs.close();
+        cs = ChunkStore.open(path, arena, data.chunkSize, data.totalPages, data.nextPage);
+
+        // Restore allocators
+        var slab = new SlabAllocator(arena, cs, data.slabSize);
+        for (var clsDesc : data.classes) {
+            slab.restoreClass(clsDesc);
+        }
+
+        var bump = new BumpAllocator(arena, cs, data.bumpPageSize);
+        int bumpPagesPerPage = data.bumpPageSize / ChunkStore.PAGE_SIZE;
+        for (int loc : data.bumpPageLocations) {
+            bump.restorePage(loc, bumpPagesPerPage);
+        }
+        bump.restoreState(data.bumpCurrentPage, data.bumpOffset, data.bumpBytesAllocated);
+
+        // Restore the primary tree (index 0 in tree descriptors)
+        if (data.trees.length == 0) {
+            throw new IOException("No tree descriptors found in superblock");
+        }
+        var treeDesc = data.trees[0];
+        var tree = new TaoTree(arena, slab, bump, cs, treeDesc);
+
+        // Restore dictionaries
+        for (var dictDesc : data.dicts) {
+            var childTreeDesc = data.trees[dictDesc.treeIndex];
+            var childTree = new TaoTree(tree, childTreeDesc);
+            var dict = new TaoDictionary(tree, childTree, dictDesc.maxCode, dictDesc.nextCode);
+            tree.dicts.add(dict);
+        }
+
+        return tree;
+    }
+
+    // -----------------------------------------------------------------------
+    // File-backed constructor (create new)
+    // -----------------------------------------------------------------------
+
+    private TaoTree(Arena arena, SlabAllocator slab, BumpAllocator bump,
+                    ChunkStore chunkStore, int keyLen, int[] leafValueSizes) {
+        this.arena = arena;
+        this.slab = slab;
+        this.bump = bump;
+        this.lock = new ReentrantReadWriteLock(true);
+        this.ownsArena = true;
+        this.chunkStore = chunkStore;
+
+        // Register node slab classes
+        this.prefixClassId  = slab.registerClass(NodeConstants.PREFIX_SIZE);
+        this.node4ClassId   = slab.registerClass(NodeConstants.NODE4_SIZE);
+        this.node16ClassId  = slab.registerClass(NodeConstants.NODE16_SIZE);
+        this.node48ClassId  = slab.registerClass(NodeConstants.NODE48_SIZE);
+        this.node256ClassId = slab.registerClass(NodeConstants.NODE256_SIZE);
+
+        // Tree params
+        this.keyLen = keyLen;
+        this.keySlotSize = keyLen > 0 ? (keyLen + 7) & ~7 : 0;
+        this.leafValueSizes = leafValueSizes != null ? leafValueSizes.clone() : new int[0];
+        this.leafClassCount = this.leafValueSizes.length;
+        this.leafClassIds = new int[leafClassCount];
+        for (int i = 0; i < leafClassCount; i++) {
+            leafClassIds[i] = slab.registerClass(keySlotSize + this.leafValueSizes[i]);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // File-backed constructor (restore from superblock)
+    // -----------------------------------------------------------------------
+
+    private TaoTree(Arena arena, SlabAllocator slab, BumpAllocator bump,
+                    ChunkStore chunkStore, Superblock.TreeDescriptor desc) {
+        this.arena = arena;
+        this.slab = slab;
+        this.bump = bump;
+        this.lock = new ReentrantReadWriteLock(true);
+        this.ownsArena = true;
+        this.chunkStore = chunkStore;
+
+        this.prefixClassId  = desc.prefixClassId;
+        this.node4ClassId   = desc.node4ClassId;
+        this.node16ClassId  = desc.node16ClassId;
+        this.node48ClassId  = desc.node48ClassId;
+        this.node256ClassId = desc.node256ClassId;
+
+        this.keyLen = desc.keyLen;
+        this.keySlotSize = keyLen > 0 ? (keyLen + 7) & ~7 : 0;
+        this.leafValueSizes = desc.leafValueSizes.clone();
+        this.leafClassCount = leafValueSizes.length;
+        this.leafClassIds = desc.leafClassIds.clone();
+
+        this.root = desc.root;
+        this.size = desc.size;
+    }
+
+    // -----------------------------------------------------------------------
+    // Child tree restore constructor (shares parent's infrastructure)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Package-private: restore a child tree from a superblock descriptor.
+     * Shares the parent's arena, slab, bump, and lock.
+     * Used to reconstruct TaoDictionary child trees on reopen.
+     */
+    TaoTree(TaoTree parent, Superblock.TreeDescriptor desc) {
+        this.arena = parent.arena;
+        this.slab = parent.slab;
+        this.bump = parent.bump;
+        this.lock = parent.lock;
+        this.ownsArena = false;
+        this.chunkStore = null;
+
+        this.prefixClassId  = desc.prefixClassId;
+        this.node4ClassId   = desc.node4ClassId;
+        this.node16ClassId  = desc.node16ClassId;
+        this.node48ClassId  = desc.node48ClassId;
+        this.node256ClassId = desc.node256ClassId;
+
+        this.keyLen = desc.keyLen;
+        this.keySlotSize = keyLen > 0 ? (keyLen + 7) & ~7 : 0;
+        this.leafValueSizes = desc.leafValueSizes.clone();
+        this.leafClassCount = leafValueSizes.length;
+        this.leafClassIds = desc.leafClassIds.clone();
+
+        this.root = desc.root;
+        this.size = desc.size;
+    }
+
     // -----------------------------------------------------------------------
     // Stats (public, self-locking)
     // -----------------------------------------------------------------------
@@ -312,14 +566,103 @@ public final class TaoTree implements AutoCloseable {
     // -----------------------------------------------------------------------
 
     /**
+     * Flush all data to disk (file-backed mode only).
+     *
+     * <p>Writes the superblock (metadata) to page 0 and forces all mapped regions to disk.
+     * No-op for in-memory trees.
+     *
+     * @throws IOException if an I/O error occurs during sync
+     */
+    public void sync() throws IOException {
+        if (chunkStore == null) return;
+        lock.writeLock().lock();
+        try {
+            writeSuperblock();
+            chunkStore.sync();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
      * Close this tree, releasing the underlying arena if this is a root tree.
+     * For file-backed trees, syncs the superblock before closing.
      * Child trees (created internally by dictionaries) do not close the arena.
      */
     @Override
     public void close() {
         if (ownsArena) {
+            if (chunkStore != null) {
+                try {
+                    writeSuperblock();
+                    chunkStore.sync();
+                    chunkStore.close();
+                } catch (IOException e) {
+                    throw new UncheckedIOException("Failed to sync/close chunk store", e);
+                }
+            }
             arena.close();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistence (package-private)
+    // -----------------------------------------------------------------------
+
+    /** Package-private: export a tree descriptor for the superblock. */
+    Superblock.TreeDescriptor exportTreeDescriptor() {
+        var desc = new Superblock.TreeDescriptor();
+        desc.root = root;
+        desc.size = size;
+        desc.keyLen = keyLen;
+        desc.prefixClassId = prefixClassId;
+        desc.node4ClassId = node4ClassId;
+        desc.node16ClassId = node16ClassId;
+        desc.node48ClassId = node48ClassId;
+        desc.node256ClassId = node256ClassId;
+        desc.leafValueSizes = leafValueSizes.clone();
+        desc.leafClassIds = leafClassIds.clone();
+        return desc;
+    }
+
+    private void writeSuperblock() {
+        if (chunkStore == null) return;
+
+        var data = new Superblock.SuperblockData();
+        data.slabSize = slab.slabSize();
+        data.bumpPageSize = bump.pageSize();
+        data.chunkSize = chunkStore.chunkSize();
+        data.totalPages = chunkStore.totalPages();
+        data.nextPage = chunkStore.nextPage();
+
+        // Slab classes
+        data.classes = new Superblock.SlabClassDescriptor[slab.classCount()];
+        for (int i = 0; i < slab.classCount(); i++) {
+            data.classes[i] = slab.exportClass(i);
+        }
+
+        // Bump allocator
+        data.bumpPageCount = bump.pageCount();
+        data.bumpCurrentPage = bump.currentPage();
+        data.bumpOffset = bump.bumpOffset();
+        data.bumpBytesAllocated = bump.bytesAllocated();
+        data.bumpPageLocations = bump.exportPageLocations();
+
+        // Tree descriptors: index 0 = primary tree, index 1+ = child trees for dicts
+        int treeCount = 1 + dicts.size();
+        data.trees = new Superblock.TreeDescriptor[treeCount];
+        data.trees[0] = exportTreeDescriptor();
+        for (int i = 0; i < dicts.size(); i++) {
+            data.trees[1 + i] = dicts.get(i).childTree().exportTreeDescriptor();
+        }
+
+        // Dictionary descriptors
+        data.dicts = new Superblock.DictDescriptor[dicts.size()];
+        for (int i = 0; i < dicts.size(); i++) {
+            data.dicts[i] = dicts.get(i).exportDescriptor(1 + i);
+        }
+
+        Superblock.write(chunkStore.superblock(), data);
     }
 
     // -----------------------------------------------------------------------

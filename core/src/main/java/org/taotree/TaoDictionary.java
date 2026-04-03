@@ -1,6 +1,7 @@
 package org.taotree;
 
 import org.taotree.internal.NodePtr;
+import org.taotree.internal.Superblock;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -58,6 +59,23 @@ public final class TaoDictionary {
         this.tree = new TaoTree(tree, MAX_KEY_LEN, new int[]{CODE_SIZE});
         this.maxCode = maxCode;
         this.nextCode = startCode;
+        owner.registerDict(this);
+    }
+
+    /**
+     * Package-private: restore a dictionary from persisted state.
+     *
+     * @param owner     the owning tree
+     * @param childTree the pre-restored child tree (already has root, size, class IDs)
+     * @param maxCode   maximum code value
+     * @param nextCode  next code to assign
+     */
+    TaoDictionary(TaoTree owner, TaoTree childTree, int maxCode, int nextCode) {
+        this.owner = owner;
+        this.tree = childTree;
+        this.maxCode = maxCode;
+        this.nextCode = nextCode;
+        // Don't call owner.registerDict — the caller (TaoTree.openFileBacked) handles this
     }
 
     /** Create a u16 dictionary (codes 1..65535, 0 reserved as null sentinel). */
@@ -187,6 +205,18 @@ public final class TaoDictionary {
     // -----------------------------------------------------------------------
     // Internal
     // -----------------------------------------------------------------------
+
+    /** Package-private: export a dict descriptor for the superblock. */
+    Superblock.DictDescriptor exportDescriptor(int treeIndex) {
+        var desc = new Superblock.DictDescriptor();
+        desc.maxCode = maxCode;
+        desc.nextCode = nextCode;
+        desc.treeIndex = treeIndex;
+        return desc;
+    }
+
+    /** Package-private: the child tree backing this dictionary. */
+    TaoTree childTree() { return tree; }
 
     private int internImpl(String value) {
         byte[] padded = encodeAndPad(value);
