@@ -1,5 +1,7 @@
 package org.taotree.internal;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 
@@ -12,11 +14,17 @@ import java.lang.foreign.MemorySegment;
  * <p>Payloads are packed contiguously within pages with no per-entry metadata. The length
  * of each payload is known by the caller (stored in the TaoString leaf's {@code len} field).
  *
+ * <p>Supports two modes:
+ * <ul>
+ *   <li><b>In-memory:</b> pages are allocated from an {@link Arena}.
+ *   <li><b>File-backed:</b> pages are allocated from a {@link ChunkStore}.
+ * </ul>
+ *
  * <p>Deallocation is deferred: deleted payloads become dead space, reclaimed only during
  * compaction (vacuum).
  *
  * <p><b>Thread safety:</b> not thread-safe on its own. Must be accessed under the
- * {@code TaoTree}'s {@code ReentrantReadWriteLock}. Write operations (allocate) require
+ * owning tree's {@code ReentrantReadWriteLock}. Write operations (allocate) require
  * the write lock. Read operations (resolve) require at least the read lock.
  */
 public final class BumpAllocator implements AutoCloseable {
@@ -27,18 +35,26 @@ public final class BumpAllocator implements AutoCloseable {
     private static final int MAX_PAGES = 0x00FF_FFFF + 1; // 24-bit pageId → 16M pages
     private static final int INITIAL_PAGES_CAPACITY = 8;
 
-    private final Arena arena;
+    private final Arena arena;           // always set
+    private final ChunkStore chunkStore; // null for in-memory mode
     private final int pageSize;
 
     private MemorySegment[] pages;
-    private int pageCount;       // number of allocated pages
-    private int currentPage;     // index of the page currently being bumped into
-    private int bumpOffset;      // next free byte in currentPage
-    private long bytesAllocated; // total payload bytes allocated (not including dead space tracking)
+    private int[] pageStartPages;     // file-backed: ChunkStore start page for each bump page
+    private int[] pageSizesInPages;   // file-backed: number of ChunkStore pages per bump page
+    private int pageCount;            // number of allocated pages
+    private int currentPage;          // index of the page currently being bumped into
+    private int bumpOffset;           // next free byte in currentPage
+    private long bytesAllocated;      // total payload bytes allocated
+
+    // -----------------------------------------------------------------------
+    // Construction
+    // -----------------------------------------------------------------------
 
     public BumpAllocator(Arena arena, int pageSize) {
         if (pageSize <= 0) throw new IllegalArgumentException("pageSize must be positive");
         this.arena = arena;
+        this.chunkStore = null;
         this.pageSize = pageSize;
         this.pages = new MemorySegment[INITIAL_PAGES_CAPACITY];
         this.pageCount = 0;
@@ -49,6 +65,32 @@ public final class BumpAllocator implements AutoCloseable {
 
     public BumpAllocator(Arena arena) {
         this(arena, DEFAULT_PAGE_SIZE);
+    }
+
+    /**
+     * Create a file-backed bump allocator.
+     *
+     * @param arena      the arena controlling mapping lifetimes
+     * @param chunkStore the chunk store providing mapped file pages
+     * @param pageSize   the bump page size in bytes
+     */
+    public BumpAllocator(Arena arena, ChunkStore chunkStore, int pageSize) {
+        if (pageSize <= 0) throw new IllegalArgumentException("pageSize must be positive");
+        this.arena = arena;
+        this.chunkStore = chunkStore;
+        this.pageSize = pageSize;
+        this.pages = new MemorySegment[INITIAL_PAGES_CAPACITY];
+        this.pageStartPages = new int[INITIAL_PAGES_CAPACITY];
+        this.pageSizesInPages = new int[INITIAL_PAGES_CAPACITY];
+        this.pageCount = 0;
+        this.currentPage = -1;
+        this.bumpOffset = 0;
+        this.bytesAllocated = 0;
+    }
+
+    /** Returns true if this allocator is file-backed. */
+    public boolean isFileBacked() {
+        return chunkStore != null;
     }
 
     /**
@@ -98,6 +140,16 @@ public final class BumpAllocator implements AutoCloseable {
         return pageCount;
     }
 
+    /** Current page index. */
+    public int currentPage() {
+        return currentPage;
+    }
+
+    /** Current bump offset within the current page. */
+    public int bumpOffset() {
+        return bumpOffset;
+    }
+
     /** Page size in bytes. */
     public int pageSize() {
         return pageSize;
@@ -114,7 +166,55 @@ public final class BumpAllocator implements AutoCloseable {
 
     @Override
     public void close() {
-        // Memory is owned by the Arena — nothing to do here.
+        // Memory is owned by the Arena (in-memory) or ChunkStore (file-backed).
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistence support
+    // -----------------------------------------------------------------------
+
+    /**
+     * Export page locations for the superblock.
+     * Returns an array of ChunkStore start pages (one per bump page).
+     * Only meaningful in file-backed mode.
+     */
+    public int[] exportPageLocations() {
+        if (pageStartPages == null) return new int[0];
+        int[] result = new int[pageCount];
+        System.arraycopy(pageStartPages, 0, result, 0, pageCount);
+        return result;
+    }
+
+    /**
+     * Restore a bump page from persisted state.
+     * Must be called in file-backed mode. Remaps the page from the ChunkStore.
+     *
+     * @param startPage the ChunkStore start page
+     * @param sizeInPages the number of ChunkStore pages
+     */
+    public void restorePage(int startPage, int sizeInPages) {
+        if (chunkStore == null) {
+            throw new IllegalStateException("restorePage requires file-backed mode");
+        }
+        ensureCapacity();
+        int id = pageCount;
+        pages[id] = chunkStore.resolve(startPage, sizeInPages);
+        pageStartPages[id] = startPage;
+        pageSizesInPages[id] = sizeInPages;
+        pageCount++;
+    }
+
+    /**
+     * Restore the bump allocator state after remapping pages.
+     *
+     * @param currentPage   the current bump page index
+     * @param bumpOffset    the bump offset within the current page
+     * @param bytesAllocated total bytes allocated
+     */
+    public void restoreState(int currentPage, int bumpOffset, long bytesAllocated) {
+        this.currentPage = currentPage;
+        this.bumpOffset = bumpOffset;
+        this.bytesAllocated = bytesAllocated;
     }
 
     // ---- Internals ----
@@ -123,13 +223,22 @@ public final class BumpAllocator implements AutoCloseable {
         if (pageCount >= MAX_PAGES) {
             throw new OutOfMemoryError("BumpAllocator exhausted (" + MAX_PAGES + " pages)");
         }
-        if (pageCount >= pages.length) {
-            int newCap = Math.min(pages.length * 2, MAX_PAGES);
-            MemorySegment[] newPages = new MemorySegment[newCap];
-            System.arraycopy(pages, 0, newPages, 0, pageCount);
-            pages = newPages;
+        ensureCapacity();
+
+        if (chunkStore != null) {
+            try {
+                int chunkPages = pageSize / ChunkStore.PAGE_SIZE;
+                int startPage = chunkStore.allocPages(chunkPages);
+                pages[pageCount] = chunkStore.resolve(startPage, chunkPages);
+                pageStartPages[pageCount] = startPage;
+                pageSizesInPages[pageCount] = chunkPages;
+            } catch (IOException e) {
+                throw new UncheckedIOException("Failed to grow bump allocator", e);
+            }
+        } else {
+            pages[pageCount] = arena.allocate(pageSize, 1);
         }
-        pages[pageCount] = arena.allocate(pageSize, 1);
+
         currentPage = pageCount;
         pageCount++;
         // Reserve byte 0 on the very first page so that pack(0,0) is never returned
@@ -141,18 +250,44 @@ public final class BumpAllocator implements AutoCloseable {
         if (pageCount >= MAX_PAGES) {
             throw new OutOfMemoryError("BumpAllocator exhausted (" + MAX_PAGES + " pages)");
         }
+        ensureCapacity();
+
+        int oversizedPageId = pageCount;
+
+        if (chunkStore != null) {
+            try {
+                int chunkPages = (length + ChunkStore.PAGE_SIZE - 1) / ChunkStore.PAGE_SIZE;
+                int startPage = chunkStore.allocPages(chunkPages);
+                pages[oversizedPageId] = chunkStore.resolve(startPage, chunkPages);
+                pageStartPages[oversizedPageId] = startPage;
+                pageSizesInPages[oversizedPageId] = chunkPages;
+            } catch (IOException e) {
+                throw new UncheckedIOException("Failed to allocate oversized bump page", e);
+            }
+        } else {
+            pages[oversizedPageId] = arena.allocate(length, 1);
+        }
+
+        pageCount++;
+        bytesAllocated += length;
+        // Don't update currentPage/bumpOffset — the oversized page is a one-off
+        return OverflowPtr.pack(oversizedPageId, 0);
+    }
+
+    private void ensureCapacity() {
         if (pageCount >= pages.length) {
             int newCap = Math.min(pages.length * 2, MAX_PAGES);
             MemorySegment[] newPages = new MemorySegment[newCap];
             System.arraycopy(pages, 0, newPages, 0, pageCount);
             pages = newPages;
+            if (pageStartPages != null) {
+                int[] newSp = new int[newCap];
+                System.arraycopy(pageStartPages, 0, newSp, 0, pageCount);
+                pageStartPages = newSp;
+                int[] newSip = new int[newCap];
+                System.arraycopy(pageSizesInPages, 0, newSip, 0, pageCount);
+                pageSizesInPages = newSip;
+            }
         }
-        // Oversized page: exactly the payload size, NOT the current bump page
-        int oversizedPageId = pageCount;
-        pages[oversizedPageId] = arena.allocate(length, 1);
-        pageCount++;
-        bytesAllocated += length;
-        // Don't update currentPage/bumpOffset — the oversized page is a one-off
-        return OverflowPtr.pack(oversizedPageId, 0);
     }
 }
