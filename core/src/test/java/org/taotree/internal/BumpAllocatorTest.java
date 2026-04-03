@@ -166,4 +166,31 @@ class BumpAllocatorTest {
             assertThrows(IllegalArgumentException.class, () -> bump.allocate(-1));
         }
     }
+
+    // ---- STRONGER: input validation ----
+
+    @Test
+    void rejectZeroPageSize() {
+        try (var arena = Arena.ofConfined()) {
+            assertThrows(IllegalArgumentException.class,
+                () -> new BumpAllocator(arena, 0));
+        }
+    }
+
+    @Test
+    void rejectNegativePageSize() {
+        try (var arena = Arena.ofConfined()) {
+            assertThrows(IllegalArgumentException.class,
+                () -> new BumpAllocator(arena, -1));
+        }
+    }
+
+    @Test
+    void negativeLengthAllocateThrows() {
+        try (var arena = Arena.ofConfined()) {
+            var bump = new BumpAllocator(arena, 4096);
+            assertThrows(IllegalArgumentException.class,
+                () -> bump.allocate(-1));
+        }
+    }
 }

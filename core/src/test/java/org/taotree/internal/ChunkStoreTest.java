@@ -226,4 +226,80 @@ class ChunkStoreTest {
             }
         }
     }
+
+    // ---- STRONGER: input validation ----
+
+    @Test
+    void rejectInvalidChunkSize() throws Exception {
+        Path file = tmp.resolve("bad.tao");
+        try (var arena = Arena.ofConfined()) {
+            // Not a multiple of page size
+            assertThrows(IllegalArgumentException.class,
+                () -> ChunkStore.create(file, arena, 5000, false));
+            // Zero
+            assertThrows(IllegalArgumentException.class,
+                () -> ChunkStore.create(file, arena, 0, false));
+            // Negative
+            assertThrows(IllegalArgumentException.class,
+                () -> ChunkStore.create(file, arena, -4096, false));
+        }
+    }
+
+    // ---- File-backed: growFile across multiple chunks ----
+
+    @Test
+    void allocAcrossMultipleChunks() throws Exception {
+        Path file = tmp.resolve("multi_chunk.tao");
+        // Use tiny chunks (8 pages = 32KB per chunk) to exercise multi-chunk growth
+        long tinyChunk = 8L * ChunkStore.PAGE_SIZE;
+        try (var arena = Arena.ofConfined();
+             var store = ChunkStore.create(file, arena, tinyChunk, false)) {
+            // Allocate pages spanning 3+ chunks
+            int[] starts = new int[10];
+            for (int i = 0; i < 10; i++) {
+                starts[i] = store.allocPages(2);
+            }
+            // 10 allocations of 2 pages each = 20 pages (plus page 0 for superblock)
+            // With 8 pages per chunk, we need at least 3 chunks
+
+            // Verify we can write to all allocated pages
+            for (int i = 0; i < 10; i++) {
+                var seg = store.resolvePage(starts[i]);
+                seg.set(ValueLayout.JAVA_LONG, 0, (long) i);
+            }
+            for (int i = 0; i < 10; i++) {
+                var seg = store.resolvePage(starts[i]);
+                assertEquals((long) i, seg.get(ValueLayout.JAVA_LONG, 0));
+            }
+        }
+    }
+
+    // ---- File-backed: sync and reopen consistency ----
+
+    @Test
+    void syncAndReopenData() throws Exception {
+        Path file = tmp.resolve("sync.tao");
+        long chunk = 64L * ChunkStore.PAGE_SIZE;
+        int startPage;
+        int totalPages;
+        int nextPage;
+
+        try (var arena = Arena.ofConfined();
+             var store = ChunkStore.create(file, arena, chunk, false)) {
+            startPage = store.allocPages(4);
+            var seg = store.resolvePage(startPage);
+            seg.set(ValueLayout.JAVA_LONG, 0, 0xDEADBEEFL);
+            seg.set(ValueLayout.JAVA_LONG, 8, 0xCAFEBABEL);
+            totalPages = store.totalPages();
+            nextPage = store.nextPage();
+            store.sync();
+        }
+
+        try (var arena = Arena.ofConfined();
+             var store = ChunkStore.open(file, arena, chunk, totalPages, nextPage)) {
+            var seg = store.resolvePage(startPage);
+            assertEquals(0xDEADBEEFL, seg.get(ValueLayout.JAVA_LONG, 0));
+            assertEquals(0xCAFEBABEL, seg.get(ValueLayout.JAVA_LONG, 8));
+        }
+    }
 }

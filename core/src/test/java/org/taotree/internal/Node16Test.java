@@ -123,4 +123,144 @@ class Node16Test {
             assertEquals(4L, Node16.findChild(n16Seg, (byte) 0x40));
         }
     }
+
+    // ---- Mutation-killing: init, isFull, removeChild ----
+
+    @Test
+    void initSetsCountToZero() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            int classId = alloc.registerClass(NodeConstants.NODE16_SIZE);
+            long ptr = alloc.allocate(classId);
+            var seg = alloc.resolve(ptr);
+            Node16.init(seg);
+
+            assertEquals(0, Node16.count(seg));
+            assertFalse(Node16.isFull(seg));
+        }
+    }
+
+    @Test
+    void isFullAtCapacity() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            int classId = alloc.registerClass(NodeConstants.NODE16_SIZE);
+            long ptr = alloc.allocate(classId);
+            var seg = alloc.resolve(ptr);
+            Node16.init(seg);
+
+            for (int i = 0; i < 16; i++) {
+                assertFalse(Node16.isFull(seg));
+                Node16.insertChild(seg, (byte) (i * 16), (long) (i + 1));
+            }
+            assertTrue(Node16.isFull(seg));
+        }
+    }
+
+    @Test
+    void removeReducesCountAndCompacts() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            int classId = alloc.registerClass(NodeConstants.NODE16_SIZE);
+            long ptr = alloc.allocate(classId);
+            var seg = alloc.resolve(ptr);
+            Node16.init(seg);
+
+            for (int i = 0; i < 8; i++) {
+                Node16.insertChild(seg, (byte) (i * 10), (long) (i + 1));
+            }
+            assertEquals(8, Node16.count(seg));
+
+            // Remove middle element
+            assertTrue(Node16.removeChild(seg, (byte) 40));
+            assertEquals(7, Node16.count(seg));
+            assertEquals(NodePtr.EMPTY_PTR, Node16.findChild(seg, (byte) 40));
+
+            // All others still present
+            for (int i = 0; i < 8; i++) {
+                if (i == 4) continue;
+                assertNotEquals(NodePtr.EMPTY_PTR, Node16.findChild(seg, (byte) (i * 10)));
+            }
+        }
+    }
+
+    @Test
+    void findChildNotFound() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            int classId = alloc.registerClass(NodeConstants.NODE16_SIZE);
+            long ptr = alloc.allocate(classId);
+            var seg = alloc.resolve(ptr);
+            Node16.init(seg);
+
+            Node16.insertChild(seg, (byte) 0x42, 1L);
+            assertEquals(NodePtr.EMPTY_PTR, Node16.findChild(seg, (byte) 0x43));
+        }
+    }
+
+    // ---- STRONGER: remove first, last, and middle children ----
+
+    @Test
+    void removeFirstChild() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            int classId = alloc.registerClass(NodeConstants.NODE16_SIZE);
+            long ptr = alloc.allocate(classId);
+            var seg = alloc.resolve(ptr);
+            Node16.init(seg);
+
+            // Insert 5 sorted keys
+            byte[] keys = {0x10, 0x20, 0x30, 0x40, 0x50};
+            for (int i = 0; i < keys.length; i++) {
+                Node16.insertChild(seg, keys[i], (long) (i + 1));
+            }
+
+            // Remove first (requires shifting all remaining left)
+            assertTrue(Node16.removeChild(seg, (byte) 0x10));
+            assertEquals(4, Node16.count(seg));
+            assertEquals(NodePtr.EMPTY_PTR, Node16.findChild(seg, (byte) 0x10));
+            for (int i = 1; i < keys.length; i++) {
+                assertEquals((long) (i + 1), Node16.findChild(seg, keys[i]));
+            }
+        }
+    }
+
+    @Test
+    void removeLastChild() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            int classId = alloc.registerClass(NodeConstants.NODE16_SIZE);
+            long ptr = alloc.allocate(classId);
+            var seg = alloc.resolve(ptr);
+            Node16.init(seg);
+
+            byte[] keys = {0x10, 0x20, 0x30, 0x40, 0x50};
+            for (int i = 0; i < keys.length; i++) {
+                Node16.insertChild(seg, keys[i], (long) (i + 1));
+            }
+
+            // Remove last (no shifting needed)
+            assertTrue(Node16.removeChild(seg, (byte) 0x50));
+            assertEquals(4, Node16.count(seg));
+            assertEquals(NodePtr.EMPTY_PTR, Node16.findChild(seg, (byte) 0x50));
+            for (int i = 0; i < keys.length - 1; i++) {
+                assertEquals((long) (i + 1), Node16.findChild(seg, keys[i]));
+            }
+        }
+    }
+
+    @Test
+    void removeNonExistentChild() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            int classId = alloc.registerClass(NodeConstants.NODE16_SIZE);
+            long ptr = alloc.allocate(classId);
+            var seg = alloc.resolve(ptr);
+            Node16.init(seg);
+
+            Node16.insertChild(seg, (byte) 0x10, 1L);
+            assertFalse(Node16.removeChild(seg, (byte) 0x20));
+            assertEquals(1, Node16.count(seg));
+        }
+    }
 }

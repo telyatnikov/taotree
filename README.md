@@ -39,6 +39,8 @@ Requires Java 25+.
 gradle build                          # full build (core + jmh + examples)
 gradle :core:test                     # run tests
 gradle :core:cleanTest :core:test     # force re-run tests
+gradle :core:pitest                   # mutation testing (STRONGER mutators)
+gradle :core:jacocoTestReport         # line coverage report
 ```
 
 ## RAM Disk for Tests (optional)

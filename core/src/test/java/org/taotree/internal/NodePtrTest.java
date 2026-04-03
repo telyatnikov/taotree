@@ -95,4 +95,30 @@ class NodePtrTest {
         assertTrue(s.contains("class=5"));
         assertTrue(s.contains("slab=42"));
     }
+
+    // ---- STRONGER: isLeaf must differentiate node types ----
+
+    @Test
+    void isLeafReturnsFalseForNonLeafTypes() {
+        long node4Ptr = NodePtr.pack(NodePtr.NODE_4, 0, 0, 0);
+        long node16Ptr = NodePtr.pack(NodePtr.NODE_16, 0, 0, 0);
+        long node48Ptr = NodePtr.pack(NodePtr.NODE_48, 0, 0, 0);
+        long node256Ptr = NodePtr.pack(NodePtr.NODE_256, 0, 0, 0);
+        long prefixPtr = NodePtr.pack(NodePtr.PREFIX, 0, 0, 0);
+
+        assertFalse(NodePtr.isLeaf(node4Ptr));
+        assertFalse(NodePtr.isLeaf(node16Ptr));
+        assertFalse(NodePtr.isLeaf(node48Ptr));
+        assertFalse(NodePtr.isLeaf(node256Ptr));
+        assertFalse(NodePtr.isLeaf(prefixPtr));
+    }
+
+    @Test
+    void isLeafReturnsTrueForLeafTypes() {
+        long leafPtr = NodePtr.pack(NodePtr.LEAF, 0, 0, 0);
+        long leafInlinePtr = NodePtr.pack(NodePtr.LEAF_INLINE, 0, 0, 0);
+
+        assertTrue(NodePtr.isLeaf(leafPtr));
+        assertTrue(NodePtr.isLeaf(leafInlinePtr));
+    }
 }

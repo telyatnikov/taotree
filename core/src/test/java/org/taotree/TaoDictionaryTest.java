@@ -105,4 +105,144 @@ class TaoDictionaryTest {
             }
         }
     }
+
+    // ---- Mutation-killing: owner() ----
+
+    @Test
+    void ownerReturnsTree() {
+        try (var tree = TaoTree.forDictionaries()) {
+            var dict = TaoDictionary.u16(tree);
+            assertSame(tree, dict.owner());
+        }
+    }
+
+    // ---- Mutation-killing: nextCode() ----
+
+    @Test
+    void nextCodeTracksState() {
+        try (var tree = TaoTree.forDictionaries()) {
+            var dict = TaoDictionary.u16(tree);
+            assertEquals(1, dict.nextCode()); // starts at 1
+            dict.intern("first");
+            assertEquals(2, dict.nextCode());
+            dict.intern("second");
+            assertEquals(3, dict.nextCode());
+            dict.intern("first"); // duplicate → no increment
+            assertEquals(3, dict.nextCode());
+        }
+    }
+
+    // ---- Mutation-killing: scoped access ----
+
+    @Test
+    void scopedReadAccess() {
+        try (var tree = TaoTree.forDictionaries()) {
+            var dict = TaoDictionary.u16(tree);
+            dict.intern("test");
+
+            try (var r = dict.read()) {
+                assertEquals(1, r.size());
+                assertTrue(r.resolve("test") > 0);
+                assertEquals(-1, r.resolve("unknown"));
+            }
+        }
+    }
+
+    @Test
+    void scopedWriteAccess() {
+        try (var tree = TaoTree.forDictionaries()) {
+            var dict = TaoDictionary.u16(tree);
+
+            try (var w = dict.write()) {
+                int code = w.intern("hello");
+                assertTrue(code > 0);
+                assertEquals(1, w.size());
+                assertEquals(code, w.resolve("hello"));
+                assertEquals(-1, w.resolve("world"));
+            }
+        }
+    }
+
+    // ---- Mutation-killing: size() ----
+
+    @Test
+    void sizeTracksEntries() {
+        try (var tree = TaoTree.forDictionaries()) {
+            var dict = TaoDictionary.u16(tree);
+            assertEquals(0, dict.size());
+            dict.intern("a");
+            assertEquals(1, dict.size());
+            dict.intern("b");
+            assertEquals(2, dict.size());
+            dict.intern("a"); // duplicate
+            assertEquals(2, dict.size());
+        }
+    }
+
+    // ---- Mutation-killing: encodeAndPad boundary ----
+
+    @Test
+    void longStringNearMaxKeyLen() {
+        try (var tree = TaoTree.forDictionaries()) {
+            var dict = TaoDictionary.u32(tree);
+            // Create a string that, after encoding, fits within 128 bytes
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 120; i++) sb.append('a');
+            int code = dict.intern(sb.toString());
+            assertTrue(code > 0);
+            assertEquals(code, dict.resolve(sb.toString()));
+        }
+    }
+
+    // ---- Round 2: scope close releases lock ----
+
+    @Test
+    void readScopeCloseReleasesLock() {
+        try (var tree = TaoTree.forDictionaries()) {
+            var dict = TaoDictionary.u16(tree);
+            dict.intern("test");
+
+            // Open and close a read scope
+            var r = dict.read();
+            assertEquals(1, r.size());
+            r.close();
+
+            // If the lock wasn't released, this write would deadlock
+            try (var w = dict.write()) {
+                int code = w.intern("another");
+                assertTrue(code > 0);
+            }
+        }
+    }
+
+    @Test
+    void writeScopeCloseReleasesLock() {
+        try (var tree = TaoTree.forDictionaries()) {
+            var dict = TaoDictionary.u16(tree);
+
+            // Open and close a write scope
+            var w = dict.write();
+            w.intern("test");
+            w.close();
+
+            // If the lock wasn't released, this read would deadlock
+            try (var r = dict.read()) {
+                assertTrue(r.resolve("test") > 0);
+            }
+        }
+    }
+
+    // ---- Round 2: encodeAndPad boundary ----
+
+    @Test
+    void stringExceedingMaxKeyLenThrows() {
+        try (var tree = TaoTree.forDictionaries()) {
+            var dict = TaoDictionary.u32(tree);
+            // Create a string whose encoded form exceeds 128 bytes
+            // Each char is 1 byte in UTF-8 + null terminator, so 128 chars → 129 bytes encoded
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 128; i++) sb.append('x');
+            assertThrows(IllegalArgumentException.class, () -> dict.intern(sb.toString()));
+        }
+    }
 }

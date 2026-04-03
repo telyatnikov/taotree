@@ -185,4 +185,122 @@ class SlabAllocatorTest {
             assertEquals(0xCCCCL, alloc.resolve(p256).get(ValueLayout.JAVA_LONG, 0));
         }
     }
+
+    // ---- STRONGER: input validation ----
+
+    @Test
+    void rejectZeroSlabSize() {
+        try (var arena = Arena.ofConfined()) {
+            assertThrows(IllegalArgumentException.class,
+                () -> new SlabAllocator(arena, 0));
+        }
+    }
+
+    @Test
+    void rejectNegativeSlabSize() {
+        try (var arena = Arena.ofConfined()) {
+            assertThrows(IllegalArgumentException.class,
+                () -> new SlabAllocator(arena, -1));
+        }
+    }
+
+    @Test
+    void rejectZeroSegmentSize() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            assertThrows(IllegalArgumentException.class,
+                () -> alloc.registerClass(0));
+        }
+    }
+
+    @Test
+    void rejectNegativeSegmentSize() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            assertThrows(IllegalArgumentException.class,
+                () -> alloc.registerClass(-1));
+        }
+    }
+
+    // ---- STRONGER: allocate fills slab then grows ----
+
+    @Test
+    void allocateFillsEntireSlabThenGrows() {
+        try (var arena = Arena.ofConfined()) {
+            // Small slab: 256 bytes with 32-byte segments = 8 segments per slab
+            var alloc = new SlabAllocator(arena, 256);
+            int classId = alloc.registerClass(32);
+
+            // Fill first slab completely
+            long[] ptrs = new long[8];
+            for (int i = 0; i < 8; i++) {
+                ptrs[i] = alloc.allocate(classId);
+                alloc.resolve(ptrs[i]).set(ValueLayout.JAVA_INT, 0, i);
+            }
+
+            // 9th allocation should go to a second slab
+            long ptr9 = alloc.allocate(classId);
+            alloc.resolve(ptr9).set(ValueLayout.JAVA_INT, 0, 99);
+
+            // Verify all previous allocations still valid
+            for (int i = 0; i < 8; i++) {
+                assertEquals(i, alloc.resolve(ptrs[i]).get(ValueLayout.JAVA_INT, 0));
+            }
+            assertEquals(99, alloc.resolve(ptr9).get(ValueLayout.JAVA_INT, 0));
+        }
+    }
+
+    // ---- STRONGER: free and scan finds freed slot ----
+
+    @Test
+    void freeSlotIsReusedByNextAllocate() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, 256);
+            int classId = alloc.registerClass(32);
+
+            // Allocate all 8 slots
+            long[] ptrs = new long[8];
+            for (int i = 0; i < 8; i++) {
+                ptrs[i] = alloc.allocate(classId);
+            }
+
+            // Free slot 3
+            alloc.free(ptrs[3]);
+
+            // Next allocate should reuse the freed slot
+            long reused = alloc.allocate(classId);
+
+            // Write to the reused slot and verify
+            alloc.resolve(reused).set(ValueLayout.JAVA_INT, 0, 0xDEAD);
+            assertEquals(0xDEAD, alloc.resolve(reused).get(ValueLayout.JAVA_INT, 0));
+        }
+    }
+
+    // ---- STRONGER: non-power-of-two segments per slab ----
+
+    @Test
+    void nonPowerOfTwoSegmentsPerSlab() {
+        try (var arena = Arena.ofConfined()) {
+            // 300 bytes / 64 byte segments = 4 segments (300/64 = 4.6, rounds down)
+            var alloc = new SlabAllocator(arena, 300);
+            int classId = alloc.registerClass(64);
+
+            // Should be able to allocate 4 segments from first slab
+            long[] ptrs = new long[4];
+            for (int i = 0; i < 4; i++) {
+                ptrs[i] = alloc.allocate(classId);
+                alloc.resolve(ptrs[i]).set(ValueLayout.JAVA_INT, 0, i);
+            }
+
+            // 5th should go to second slab
+            long ptr5 = alloc.allocate(classId);
+            alloc.resolve(ptr5).set(ValueLayout.JAVA_INT, 0, 42);
+
+            // Verify all
+            for (int i = 0; i < 4; i++) {
+                assertEquals(i, alloc.resolve(ptrs[i]).get(ValueLayout.JAVA_INT, 0));
+            }
+            assertEquals(42, alloc.resolve(ptr5).get(ValueLayout.JAVA_INT, 0));
+        }
+    }
 }

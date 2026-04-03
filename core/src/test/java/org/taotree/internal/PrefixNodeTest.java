@@ -238,4 +238,78 @@ class PrefixNodeTest {
             }
         }
     }
+
+    // ---- Mutation-killing: matchKey boundary ----
+
+    @Test
+    void matchKeyZeroMatch() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            int classId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
+            long ptr = alloc.allocate(classId);
+            var seg = alloc.resolve(ptr);
+
+            byte[] prefix = {0x0A, 0x0B, 0x0C};
+            PrefixNode.init(seg, prefix, 0, 3, NodePtr.EMPTY_PTR);
+
+            // Key doesn't match at all
+            byte[] key = {(byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF};
+            assertEquals(0, PrefixNode.matchKey(seg, key, key.length, 0));
+        }
+    }
+
+    @Test
+    void matchKeyExactBoundary() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            int classId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
+            long ptr = alloc.allocate(classId);
+            var seg = alloc.resolve(ptr);
+
+            byte[] prefix = {0x0A, 0x0B, 0x0C, 0x0D};
+            PrefixNode.init(seg, prefix, 0, 4, NodePtr.EMPTY_PTR);
+
+            // Key exactly matches prefix
+            byte[] key = {0x0A, 0x0B, 0x0C, 0x0D, 0x0E};
+            assertEquals(4, PrefixNode.matchKey(seg, key, key.length, 0));
+        }
+    }
+
+    // ---- STRONGER: matchKey when key is shorter than prefix ----
+
+    @Test
+    void matchKeyKeyShorterThanPrefix() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            int classId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
+            long ptr = alloc.allocate(classId);
+            var seg = alloc.resolve(ptr);
+
+            // Prefix is 5 bytes, key is 3 bytes starting at depth 0
+            byte[] prefix = {0x0A, 0x0B, 0x0C, 0x0D, 0x0E};
+            PrefixNode.init(seg, prefix, 0, 5, NodePtr.EMPTY_PTR);
+
+            // Key has only 3 bytes → maxMatch = min(5, 3-0) = 3
+            byte[] key = {0x0A, 0x0B, 0x0C};
+            assertEquals(3, PrefixNode.matchKey(seg, key, key.length, 0));
+        }
+    }
+
+    @Test
+    void matchKeyWithLargeDepthOffset() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            int classId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
+            long ptr = alloc.allocate(classId);
+            var seg = alloc.resolve(ptr);
+
+            byte[] prefix = {0x01, 0x02, 0x03};
+            PrefixNode.init(seg, prefix, 0, 3, NodePtr.EMPTY_PTR);
+
+            // Key is 10 bytes, depth=8 → only 2 bytes left to compare
+            byte[] key = {0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x02};
+            // maxMatch = min(3, 10-8) = 2
+            assertEquals(2, PrefixNode.matchKey(seg, key, key.length, 8));
+        }
+    }
 }

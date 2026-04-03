@@ -173,4 +173,190 @@ class KeyLayoutBuilderTest {
             }
         }
     }
+
+    // ---- Mutation-killing: U8, U64, I64 encoding ----
+
+    @Test
+    void encodeU8() {
+        try (var arena = Arena.ofConfined()) {
+            var layout = KeyLayout.of(KeyField.uint8("byte"));
+            var enc = new KeyBuilder(layout, arena);
+            enc.setU8(0, (byte) 0xAB);
+            assertEquals(1, enc.keyLen());
+            assertEquals((byte) 0xAB, TaoKey.decodeU8(enc.key(), 0));
+        }
+    }
+
+    @Test
+    void encodeU64() {
+        try (var arena = Arena.ofConfined()) {
+            var layout = KeyLayout.of(KeyField.uint64("big"));
+            var enc = new KeyBuilder(layout, arena);
+            enc.setU64(0, 0x0102030405060708L);
+            assertEquals(8, enc.keyLen());
+            assertEquals(0x0102030405060708L, TaoKey.decodeU64(enc.key(), 0));
+        }
+    }
+
+    @Test
+    void encodeI64() {
+        try (var arena = Arena.ofConfined()) {
+            var layout = KeyLayout.of(KeyField.int64("signed"));
+            var enc = new KeyBuilder(layout, arena);
+            enc.setI64(0, -42L);
+            assertEquals(8, enc.keyLen());
+            assertEquals(-42L, TaoKey.decodeI64(enc.key(), 0));
+        }
+    }
+
+    @Test
+    void encodeI64OrderPreserving() {
+        try (var arena = Arena.ofConfined()) {
+            var layout = KeyLayout.of(KeyField.int64("signed"));
+            var enc1 = new KeyBuilder(layout, arena);
+            var enc2 = new KeyBuilder(layout, arena);
+
+            enc1.setI64(0, -100L);
+            enc2.setI64(0, 100L);
+
+            // Negative should sort before positive in binary comparison
+            assertTrue(enc1.key().mismatch(enc2.key()) >= 0);  // not equal
+            // First differing byte of -100 should be less than first differing byte of +100
+            byte b1 = enc1.key().get(ValueLayout.JAVA_BYTE, 0);
+            byte b2 = enc2.key().get(ValueLayout.JAVA_BYTE, 0);
+            assertTrue(Byte.toUnsignedInt(b1) < Byte.toUnsignedInt(b2),
+                "Encoded -100 should sort before +100");
+        }
+    }
+
+    // ---- Mutation-killing: name-based setters ----
+
+    @Test
+    void nameBasedSetters() {
+        try (var arena = Arena.ofConfined()) {
+            var layout = KeyLayout.of(
+                KeyField.uint8("a"),
+                KeyField.uint16("b"),
+                KeyField.uint32("c"),
+                KeyField.uint64("d"),
+                KeyField.int64("e")
+            );
+            var enc = new KeyBuilder(layout, arena);
+            enc.setU8("a", (byte) 1)
+               .setU16("b", (short) 2)
+               .setU32("c", 3)
+               .setU64("d", 4L)
+               .setI64("e", -5L);
+
+            assertEquals((byte) 1, TaoKey.decodeU8(enc.key(), 0));
+            assertEquals((short) 2, TaoKey.decodeU16(enc.key(), 1));
+            assertEquals(3, TaoKey.decodeU32(enc.key(), 3));
+            assertEquals(4L, TaoKey.decodeU64(enc.key(), 7));
+            assertEquals(-5L, TaoKey.decodeI64(enc.key(), 15));
+        }
+    }
+
+    // ---- Mutation-killing: chaining returns this ----
+
+    @Test
+    void setterChaining() {
+        try (var arena = Arena.ofConfined()) {
+            var layout = KeyLayout.of(KeyField.uint16("a"), KeyField.uint32("b"));
+            var enc = new KeyBuilder(layout, arena);
+            KeyBuilder result = enc.setU16(0, (short) 1).setU32(1, 2);
+            assertSame(enc, result, "Chained setters should return 'this'");
+        }
+    }
+
+    // ---- Mutation-killing: fieldIndex lookup ----
+
+    @Test
+    void fieldIndexLookup() {
+        var layout = KeyLayout.of(
+            KeyField.uint16("first"),
+            KeyField.uint32("second"),
+            KeyField.uint64("third")
+        );
+        assertEquals(0, layout.fieldIndex("first"));
+        assertEquals(1, layout.fieldIndex("second"));
+        assertEquals(2, layout.fieldIndex("third"));
+        assertThrows(IllegalArgumentException.class, () -> layout.fieldIndex("nonexistent"));
+    }
+
+    // ---- Mutation-killing: KeyField factories ----
+
+    @Test
+    void keyFieldFactoryWidths() {
+        assertEquals(1, KeyField.uint8("x").width());
+        assertEquals(2, KeyField.uint16("x").width());
+        assertEquals(4, KeyField.uint32("x").width());
+        assertEquals(8, KeyField.uint64("x").width());
+        assertEquals(8, KeyField.int64("x").width());
+    }
+
+    // ---- Round 2: I64 setter chaining ----
+
+    @Test
+    void setI64Chaining() {
+        try (var arena = Arena.ofConfined()) {
+            var layout = KeyLayout.of(KeyField.int64("a"), KeyField.int64("b"));
+            var enc = new KeyBuilder(layout, arena);
+            KeyBuilder result = enc.setI64(0, 100L).setI64(1, -200L);
+            assertSame(enc, result);
+            assertEquals(100L, TaoKey.decodeI64(enc.key(), 0));
+            assertEquals(-200L, TaoKey.decodeI64(enc.key(), 8));
+        }
+    }
+
+    @Test
+    void setI64ByNameChaining() {
+        try (var arena = Arena.ofConfined()) {
+            var layout = KeyLayout.of(KeyField.int64("x"), KeyField.uint32("y"));
+            var enc = new KeyBuilder(layout, arena);
+            KeyBuilder result = enc.setI64("x", 42L).setU32("y", 7);
+            assertSame(enc, result);
+            assertEquals(42L, TaoKey.decodeI64(enc.key(), 0));
+            assertEquals(7, TaoKey.decodeU32(enc.key(), 8));
+        }
+    }
+
+    @Test
+    void setDictByNameChaining() {
+        try (var tree = TaoTree.forDictionaries()) {
+            var dict = TaoDictionary.u16(tree);
+            var layout = KeyLayout.of(KeyField.dict16("d", dict), KeyField.uint32("n"));
+            try (var arena = Arena.ofConfined()) {
+                var enc = new KeyBuilder(layout, arena);
+                KeyBuilder result = enc.setDict("d", "hello").setU32("n", 99);
+                assertSame(enc, result);
+            }
+        }
+    }
+
+    // ---- STRONGER: KeyLayout.of validation ----
+
+    @Test
+    void keyLayoutRejectsNoFields() {
+        assertThrows(IllegalArgumentException.class, () -> KeyLayout.of());
+    }
+
+    // ---- STRONGER: setDict null vs non-null ----
+
+    @Test
+    void setDictNullEncodesZero() {
+        try (var tree = TaoTree.forDictionaries()) {
+            var dict = TaoDictionary.u16(tree);
+            var layout = KeyLayout.of(KeyField.dict16("d", dict));
+
+            try (var arena = Arena.ofConfined()) {
+                var enc = new KeyBuilder(layout, arena);
+                enc.setDict(0, null);
+                assertEquals((short) 0, TaoKey.decodeU16(enc.key(), 0));
+
+                // Non-null should encode to > 0
+                enc.setDict(0, "hello");
+                assertTrue(TaoKey.decodeU16(enc.key(), 0) > 0);
+            }
+        }
+    }
 }

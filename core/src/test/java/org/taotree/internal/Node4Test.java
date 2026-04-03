@@ -142,4 +142,70 @@ class Node4Test {
             assertEquals(-1, Node4.findPos(seg, (byte) 0xCC));
         }
     }
+
+    // ---- Mutation-killing: init zeroes all children ----
+
+    @Test
+    void initSetsAllChildrenToEmpty() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            int classId = alloc.registerClass(NodeConstants.NODE4_SIZE);
+            long ptr = alloc.allocate(classId);
+            var seg = alloc.resolve(ptr);
+            Node4.init(seg);
+
+            assertEquals(0, Node4.count(seg));
+            // All 4 child slots should be empty
+            for (int i = 0; i < 4; i++) {
+                assertEquals(NodePtr.EMPTY_PTR, Node4.childAt(seg, i));
+            }
+        }
+    }
+
+    @Test
+    void insertAtCapacityBoundary() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            int classId = alloc.registerClass(NodeConstants.NODE4_SIZE);
+            long ptr = alloc.allocate(classId);
+            var seg = alloc.resolve(ptr);
+            Node4.init(seg);
+
+            // Insert exactly 4 keys (full capacity)
+            Node4.insertChild(seg, (byte) 0x10, 1L);
+            Node4.insertChild(seg, (byte) 0x20, 2L);
+            Node4.insertChild(seg, (byte) 0x30, 3L);
+            Node4.insertChild(seg, (byte) 0x40, 4L);
+
+            assertTrue(Node4.isFull(seg));
+            assertEquals(4, Node4.count(seg));
+            assertEquals(1L, Node4.findChild(seg, (byte) 0x10));
+            assertEquals(2L, Node4.findChild(seg, (byte) 0x20));
+            assertEquals(3L, Node4.findChild(seg, (byte) 0x30));
+            assertEquals(4L, Node4.findChild(seg, (byte) 0x40));
+        }
+    }
+
+    @Test
+    void removeLastChildDecrementsCount() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            int classId = alloc.registerClass(NodeConstants.NODE4_SIZE);
+            long ptr = alloc.allocate(classId);
+            var seg = alloc.resolve(ptr);
+            Node4.init(seg);
+
+            Node4.insertChild(seg, (byte) 0x10, 1L);
+            Node4.insertChild(seg, (byte) 0x20, 2L);
+            assertEquals(2, Node4.count(seg));
+
+            assertTrue(Node4.removeChild(seg, (byte) 0x10));
+            assertEquals(1, Node4.count(seg));
+            assertEquals(NodePtr.EMPTY_PTR, Node4.findChild(seg, (byte) 0x10));
+            assertEquals(2L, Node4.findChild(seg, (byte) 0x20));
+
+            assertTrue(Node4.removeChild(seg, (byte) 0x20));
+            assertEquals(0, Node4.count(seg));
+        }
+    }
 }

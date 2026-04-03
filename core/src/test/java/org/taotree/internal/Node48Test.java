@@ -174,4 +174,51 @@ class Node48Test {
             assertEquals(6L, sum[0]);
         }
     }
+
+    // ---- Mutation-killing: isFull, init, removeChild ----
+
+    @Test
+    void isFullReturnsFalseBeforeCapacity() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            int classId = alloc.registerClass(NodeConstants.NODE48_SIZE);
+            long ptr = alloc.allocate(classId);
+            var seg = alloc.resolve(ptr);
+            Node48.init(seg);
+
+            for (int i = 0; i < 47; i++) {
+                assertFalse(Node48.isFull(seg));
+                Node48.insertChild(seg, (byte) i, (long) (i + 1));
+            }
+            assertFalse(Node48.isFull(seg)); // 47 not full
+            Node48.insertChild(seg, (byte) 47, 48L);
+            assertTrue(Node48.isFull(seg)); // 48 = full
+        }
+    }
+
+    @Test
+    void removeChildClearsSlot() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            int classId = alloc.registerClass(NodeConstants.NODE48_SIZE);
+            long ptr = alloc.allocate(classId);
+            var seg = alloc.resolve(ptr);
+            Node48.init(seg);
+
+            Node48.insertChild(seg, (byte) 0x10, 1L);
+            Node48.insertChild(seg, (byte) 0x20, 2L);
+            Node48.insertChild(seg, (byte) 0x30, 3L);
+
+            assertTrue(Node48.removeChild(seg, (byte) 0x20));
+            assertEquals(2, Node48.count(seg));
+            assertEquals(NodePtr.EMPTY_PTR, Node48.findChild(seg, (byte) 0x20));
+            assertEquals(1L, Node48.findChild(seg, (byte) 0x10));
+            assertEquals(3L, Node48.findChild(seg, (byte) 0x30));
+
+            // Reinsert at the freed slot
+            Node48.insertChild(seg, (byte) 0x20, 22L);
+            assertEquals(3, Node48.count(seg));
+            assertEquals(22L, Node48.findChild(seg, (byte) 0x20));
+        }
+    }
 }

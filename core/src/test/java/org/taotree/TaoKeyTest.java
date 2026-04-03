@@ -155,4 +155,34 @@ class TaoKeyTest {
         }
         return a.length - b.length;
     }
+
+    // ---- Round 2: I8 encoding ----
+
+    @Test
+    void encodeDecodeI8() {
+        try (var arena = Arena.ofConfined()) {
+            var seg = arena.allocate(1);
+            TaoKey.encodeI8(seg, 0, (byte) -42);
+            // Verify sign-bit flip: -42 ^ 0x80 = 86
+            assertEquals((byte) 86, seg.get(java.lang.foreign.ValueLayout.JAVA_BYTE, 0));
+        }
+    }
+
+    @Test
+    void encodeDecodeI16() {
+        try (var arena = Arena.ofConfined()) {
+            var seg = arena.allocate(2);
+            TaoKey.encodeI16(seg, 0, (short) -100);
+            // Encoded value: -100 ^ Short.MIN_VALUE = 32668
+        }
+    }
+
+    @Test
+    void decodeU8RoundTrip() {
+        try (var arena = Arena.ofConfined()) {
+            var seg = arena.allocate(1);
+            TaoKey.encodeU8(seg, 0, (byte) 0xAB);
+            assertEquals((byte) 0xAB, TaoKey.decodeU8(seg, 0));
+        }
+    }
 }

@@ -162,4 +162,27 @@ class Node256Test {
             assertEquals(1, Node256.count(seg)); // count unchanged
         }
     }
+
+    // ---- Mutation-killing: init zeroes all children ----
+
+    @Test
+    void initAndEmpty() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, 64 * 1024);
+            alloc.registerClass(NodeConstants.PREFIX_SIZE);
+            alloc.registerClass(NodeConstants.NODE4_SIZE);
+            alloc.registerClass(NodeConstants.NODE16_SIZE);
+            alloc.registerClass(NodeConstants.NODE48_SIZE);
+            int node256ClassId = alloc.registerClass(NodeConstants.NODE256_SIZE);
+
+            long ptr = alloc.allocate(node256ClassId);
+            var seg = alloc.resolve(ptr);
+            Node256.init(seg);
+
+            assertEquals(0, Node256.count(seg));
+            for (int i = 0; i < 256; i++) {
+                assertEquals(NodePtr.EMPTY_PTR, Node256.findChild(seg, (byte) i));
+            }
+        }
+    }
 }
