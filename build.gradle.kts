@@ -27,5 +27,17 @@ subprojects {
     tasks.withType<Test> {
         useJUnitPlatform()
         jvmArgs("--enable-native-access=ALL-UNNAMED")
+
+        // Use RAM-backed filesystem for file-backed tests when available.
+        // macOS: create with `hdiutil attach -nomount ram://524288 | xargs diskutil erasevolume APFS RAMDisk`
+        // Linux: /dev/shm is tmpfs by default
+        // Override: gradle test -PtestTmpDir=/path/to/ramdisk
+        val tmpDir = findProperty("testTmpDir") as String?
+            ?: if (file("/Volumes/RAMDisk").isDirectory) "/Volumes/RAMDisk"
+            else if (file("/dev/shm").isDirectory) "/dev/shm"
+            else null
+        if (tmpDir != null) {
+            systemProperty("java.io.tmpdir", tmpDir)
+        }
     }
 }
