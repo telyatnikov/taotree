@@ -119,6 +119,52 @@ public final class KeyBuilder {
         return setDict(layout.fieldIndex(fieldName), value);
     }
 
+    // -- Handle-based setters (type-safe, zero-lookup) --
+
+    /** Set a field via a pre-computed UInt8 handle. */
+    public KeyBuilder set(KeyHandle.UInt8 h, byte value) {
+        TaoKey.encodeU8(buf, h.offset(), value);
+        return this;
+    }
+
+    /** Set a field via a pre-computed UInt16 handle. */
+    public KeyBuilder set(KeyHandle.UInt16 h, short value) {
+        TaoKey.encodeU16(buf, h.offset(), value);
+        return this;
+    }
+
+    /** Set a field via a pre-computed UInt32 handle. */
+    public KeyBuilder set(KeyHandle.UInt32 h, int value) {
+        TaoKey.encodeU32(buf, h.offset(), value);
+        return this;
+    }
+
+    /** Set a field via a pre-computed UInt64 handle. */
+    public KeyBuilder set(KeyHandle.UInt64 h, long value) {
+        TaoKey.encodeU64(buf, h.offset(), value);
+        return this;
+    }
+
+    /** Set a field via a pre-computed Int64 handle. */
+    public KeyBuilder set(KeyHandle.Int64 h, long value) {
+        TaoKey.encodeI64(buf, h.offset(), value);
+        return this;
+    }
+
+    /** Set a dict16 field via a pre-computed handle. Interns the string automatically. */
+    public KeyBuilder set(KeyHandle.Dict16 h, String value) {
+        int code = (value != null) ? h.dict().intern(value) : 0;
+        TaoKey.encodeU16(buf, h.offset(), (short) code);
+        return this;
+    }
+
+    /** Set a dict32 field via a pre-computed handle. Interns the string automatically. */
+    public KeyBuilder set(KeyHandle.Dict32 h, String value) {
+        int code = (value != null) ? h.dict().intern(value) : 0;
+        TaoKey.encodeU32(buf, h.offset(), code);
+        return this;
+    }
+
     /** The encoded key buffer. Valid after all fields have been set. */
     public MemorySegment key() { return buf; }
 

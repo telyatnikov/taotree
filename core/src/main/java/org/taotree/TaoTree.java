@@ -9,6 +9,7 @@ import org.taotree.internal.Node256;
 import org.taotree.internal.NodeConstants;
 import org.taotree.internal.BumpAllocator;
 import org.taotree.internal.ChunkStore;
+import org.taotree.internal.Preallocator;
 import org.taotree.internal.PrefixNode;
 import org.taotree.internal.SlabAllocator;
 import org.taotree.internal.Superblock;
@@ -97,6 +98,12 @@ public final class TaoTree implements AutoCloseable {
 
     // Tracked dictionaries (for persistence)
     private final List<TaoDictionary> dicts = new ArrayList<>();
+
+    // Bound key layout (set by layout-based factory methods; null for raw-API usage)
+    private KeyLayout boundKeyLayout;
+
+    // Bound leaf layout (set by layout-based factory methods; null for raw-API usage)
+    private LeafLayout boundLeafLayout;
 
     // String layouts per slab class ID (for copyFrom out-of-line string handling)
     private final java.util.Map<Integer, StringLayout> stringLayouts = new java.util.HashMap<>();
@@ -250,6 +257,224 @@ public final class TaoTree implements AutoCloseable {
             throw new IllegalArgumentException("At least one leaf value size required");
         }
         return new TaoTree(slabSize, keyLen, leafValueSizes);
+    }
+
+    /**
+     * Create a data tree from a key layout and leaf layout.
+     *
+     * <p>Derives the key length from the key layout and the leaf value size from the
+     * leaf layout. Automatically registers {@link StringLayout}s for any
+     * {@link LeafField.Str} or {@link LeafField.Json} fields so that
+     * {@link #copyFrom} handles out-of-line strings correctly.
+     *
+     * @param keyLayout  the compound key layout
+     * @param leafLayout the leaf value layout
+     */
+    public static TaoTree open(KeyLayout keyLayout, LeafLayout leafLayout) {
+        var tree = new TaoTree(SlabAllocator.DEFAULT_SLAB_SIZE,
+            keyLayout.totalWidth(), new int[]{leafLayout.totalWidth()});
+        registerStringLayouts(tree, leafLayout, 0);
+        tree.boundKeyLayout = bindDicts(tree, keyLayout);
+        tree.boundLeafLayout = leafLayout;
+        return tree;
+    }
+
+    /**
+     * Create a data tree that shares infrastructure with an existing tree.
+     *
+     * <p>The child tree shares the parent's arena, slab allocator, bump allocator,
+     * and lock. This is the preferred way to create a data tree when dictionaries
+     * are created from a {@link #forDictionaries()} infrastructure tree.
+     *
+     * @param parent     the infrastructure tree (typically from {@link #forDictionaries()})
+     * @param keyLayout  the compound key layout
+     * @param leafLayout the leaf value layout
+     */
+    public static TaoTree open(TaoTree parent, KeyLayout keyLayout, LeafLayout leafLayout) {
+        var tree = new TaoTree(parent, keyLayout.totalWidth(),
+            new int[]{leafLayout.totalWidth()});
+        registerStringLayouts(tree, leafLayout, 0);
+        tree.boundKeyLayout = bindDicts(tree, keyLayout);
+        tree.boundLeafLayout = leafLayout;
+        return tree;
+    }
+
+    /**
+     * Create a file-backed tree from a key layout and leaf layout.
+     *
+     * @param path       path to the store file (must not exist)
+     * @param keyLayout  the compound key layout
+     * @param leafLayout the leaf value layout
+     */
+    public static TaoTree create(Path path, KeyLayout keyLayout,
+                                 LeafLayout leafLayout) throws IOException {
+        var tree = createFileBacked(path, SlabAllocator.DEFAULT_SLAB_SIZE,
+            keyLayout.totalWidth(), new int[]{leafLayout.totalWidth()},
+            ChunkStore.DEFAULT_CHUNK_SIZE, Preallocator.isSupported());
+        registerStringLayouts(tree, leafLayout, 0);
+        return tree;
+    }
+
+    /**
+     * Create a file-backed tree from a key layout and leaf layout with custom storage options.
+     *
+     * @param path        path to the store file (must not exist)
+     * @param keyLayout   the compound key layout
+     * @param leafLayout  the leaf value layout
+     * @param chunkSize   chunk size in bytes (must be a multiple of 4096)
+     * @param preallocate if true, use OS-specific preallocation
+     */
+    public static TaoTree create(Path path, KeyLayout keyLayout, LeafLayout leafLayout,
+                                 long chunkSize, boolean preallocate) throws IOException {
+        var tree = createFileBacked(path, SlabAllocator.DEFAULT_SLAB_SIZE,
+            keyLayout.totalWidth(), new int[]{leafLayout.totalWidth()},
+            chunkSize, preallocate);
+        registerStringLayouts(tree, leafLayout, 0);
+        return tree;
+    }
+
+    /** Auto-register string layouts for TaoString/JSON fields in the leaf layout. */
+    private static void registerStringLayouts(TaoTree tree, LeafLayout leafLayout,
+                                              int leafClassIndex) {
+        for (var sl : leafLayout.stringLayouts()) {
+            tree.registerStringLayout(leafClassIndex, sl);
+        }
+    }
+
+    /**
+     * Create dictionaries for any unbound dict fields in the key layout and return
+     * a new layout with the dict references filled in.
+     */
+    private static KeyLayout bindDicts(TaoTree tree, KeyLayout keyLayout) {
+        var fields = new KeyField[keyLayout.fieldCount()];
+        boolean changed = false;
+        for (int i = 0; i < fields.length; i++) {
+            var f = keyLayout.field(i);
+            if (f instanceof KeyField.DictU16 d && d.dict() == null) {
+                fields[i] = KeyField.dict16(d.name(), TaoDictionary.u16(tree));
+                changed = true;
+            } else if (f instanceof KeyField.DictU32 d && d.dict() == null) {
+                fields[i] = KeyField.dict32(d.name(), TaoDictionary.u32(tree));
+                changed = true;
+            } else {
+                fields[i] = f;
+            }
+        }
+        return changed ? KeyLayout.of(fields) : keyLayout;
+    }
+
+    // -----------------------------------------------------------------------
+    // Key handle factories
+    // -----------------------------------------------------------------------
+
+    /**
+     * Returns the bound key layout (with dictionaries resolved).
+     *
+     * @throws IllegalStateException if the tree was not created with a KeyLayout
+     */
+    public KeyLayout keyLayout() {
+        if (boundKeyLayout == null) {
+            throw new IllegalStateException("No KeyLayout bound to this tree. "
+                + "Use TaoTree.open(KeyLayout, LeafLayout) to bind a layout.");
+        }
+        return boundKeyLayout;
+    }
+
+    /**
+     * Returns the bound leaf layout.
+     *
+     * @throws IllegalStateException if the tree was not created with a LeafLayout
+     */
+    public LeafLayout leafLayout() {
+        if (boundLeafLayout == null) {
+            throw new IllegalStateException("No LeafLayout bound to this tree. "
+                + "Use TaoTree.open(KeyLayout, LeafLayout) to bind a layout.");
+        }
+        return boundLeafLayout;
+    }
+
+    /**
+     * Create a new {@link KeyBuilder} for this tree's key layout.
+     *
+     * @param arena arena for allocating the reusable key buffer
+     */
+    public KeyBuilder newKeyBuilder(Arena arena) {
+        return new KeyBuilder(keyLayout(), arena);
+    }
+
+    // -----------------------------------------------------------------------
+    // Leaf handle factories
+    // -----------------------------------------------------------------------
+
+    /** Derive an Int8 leaf handle. */
+    public LeafHandle.Int8    leafInt8(String name)    { return leafLayout().int8(name); }
+    /** Derive an Int16 leaf handle. */
+    public LeafHandle.Int16   leafInt16(String name)   { return leafLayout().int16(name); }
+    /** Derive an Int32 leaf handle. */
+    public LeafHandle.Int32   leafInt32(String name)   { return leafLayout().int32(name); }
+    /** Derive an Int64 leaf handle. */
+    public LeafHandle.Int64   leafInt64(String name)   { return leafLayout().int64(name); }
+    /** Derive a Float32 leaf handle. */
+    public LeafHandle.Float32 leafFloat32(String name) { return leafLayout().float32(name); }
+    /** Derive a Float64 leaf handle. */
+    public LeafHandle.Float64 leafFloat64(String name) { return leafLayout().float64(name); }
+    /** Derive a String leaf handle. */
+    public LeafHandle.Str     leafString(String name)  { return leafLayout().string(name); }
+    /** Derive a JSON leaf handle. */
+    public LeafHandle.Json    leafJson(String name)    { return leafLayout().json(name); }
+    /** Derive a Dict16 leaf handle. */
+    public LeafHandle.Dict16  leafDict16(String name)  { return leafLayout().dict16(name); }
+    /** Derive a Dict32 leaf handle. */
+    public LeafHandle.Dict32  leafDict32(String name)  { return leafLayout().dict32(name); }
+
+    /** Derive a Dict16 key handle for the named field. */
+    public KeyHandle.Dict16 keyDict16(String name) {
+        var kl = keyLayout();
+        int i = kl.fieldIndex(name);
+        var f = kl.field(i);
+        if (!(f instanceof KeyField.DictU16 d) || d.dict() == null) {
+            throw new IllegalArgumentException("Field '" + name + "' is not a bound dict16 field");
+        }
+        return new KeyHandle.Dict16(name, kl.offset(i), d.dict());
+    }
+
+    /** Derive a Dict32 key handle for the named field. */
+    public KeyHandle.Dict32 keyDict32(String name) {
+        var kl = keyLayout();
+        int i = kl.fieldIndex(name);
+        var f = kl.field(i);
+        if (!(f instanceof KeyField.DictU32 d) || d.dict() == null) {
+            throw new IllegalArgumentException("Field '" + name + "' is not a bound dict32 field");
+        }
+        return new KeyHandle.Dict32(name, kl.offset(i), d.dict());
+    }
+
+    /** Derive a UInt32 key handle for the named field. */
+    public KeyHandle.UInt32 keyUint32(String name) {
+        var kl = keyLayout();
+        int i = kl.fieldIndex(name);
+        return new KeyHandle.UInt32(name, kl.offset(i));
+    }
+
+    /** Derive a UInt16 key handle for the named field. */
+    public KeyHandle.UInt16 keyUint16(String name) {
+        var kl = keyLayout();
+        int i = kl.fieldIndex(name);
+        return new KeyHandle.UInt16(name, kl.offset(i));
+    }
+
+    /** Derive a UInt64 key handle for the named field. */
+    public KeyHandle.UInt64 keyUint64(String name) {
+        var kl = keyLayout();
+        int i = kl.fieldIndex(name);
+        return new KeyHandle.UInt64(name, kl.offset(i));
+    }
+
+    /** Derive an Int64 key handle for the named field. */
+    public KeyHandle.Int64 keyInt64(String name) {
+        var kl = keyLayout();
+        int i = kl.fieldIndex(name);
+        return new KeyHandle.Int64(name, kl.offset(i));
     }
 
     /** Fixed key length in bytes. */
@@ -490,7 +715,8 @@ public final class TaoTree implements AutoCloseable {
      */
     public static TaoTree create(Path path, int keyLen, int valueSize) throws IOException {
         if (keyLen <= 0) throw new IllegalArgumentException("keyLen must be positive: " + keyLen);
-        return createFileBacked(path, SlabAllocator.DEFAULT_SLAB_SIZE, keyLen, new int[]{valueSize});
+        return createFileBacked(path, SlabAllocator.DEFAULT_SLAB_SIZE, keyLen, new int[]{valueSize},
+            ChunkStore.DEFAULT_CHUNK_SIZE, Preallocator.isSupported());
     }
 
     /**
@@ -505,7 +731,24 @@ public final class TaoTree implements AutoCloseable {
         if (leafValueSizes == null || leafValueSizes.length == 0) {
             throw new IllegalArgumentException("At least one leaf value size required");
         }
-        return createFileBacked(path, SlabAllocator.DEFAULT_SLAB_SIZE, keyLen, leafValueSizes);
+        return createFileBacked(path, SlabAllocator.DEFAULT_SLAB_SIZE, keyLen, leafValueSizes,
+            ChunkStore.DEFAULT_CHUNK_SIZE, Preallocator.isSupported());
+    }
+
+    /**
+     * Create a new file-backed tree with a single leaf class and custom storage options.
+     *
+     * @param path        path to the store file (must not exist)
+     * @param keyLen      fixed key length in bytes
+     * @param valueSize   size of the leaf value region in bytes
+     * @param chunkSize   chunk size in bytes (must be a multiple of 4096)
+     * @param preallocate if true, use OS-specific preallocation to reserve physical blocks
+     */
+    public static TaoTree create(Path path, int keyLen, int valueSize,
+                                 long chunkSize, boolean preallocate) throws IOException {
+        if (keyLen <= 0) throw new IllegalArgumentException("keyLen must be positive: " + keyLen);
+        return createFileBacked(path, SlabAllocator.DEFAULT_SLAB_SIZE, keyLen, new int[]{valueSize},
+            chunkSize, preallocate);
     }
 
     /**
@@ -519,9 +762,10 @@ public final class TaoTree implements AutoCloseable {
     }
 
     private static TaoTree createFileBacked(Path path, int slabSize, int keyLen,
-                                            int[] leafValueSizes) throws IOException {
+                                            int[] leafValueSizes,
+                                            long chunkSize, boolean preallocate) throws IOException {
         var arena = Arena.ofShared();
-        var cs = ChunkStore.create(path, arena);
+        var cs = ChunkStore.create(path, arena, chunkSize, preallocate);
         var slab = new SlabAllocator(arena, cs, slabSize);
         var bump = new BumpAllocator(arena, cs, BumpAllocator.DEFAULT_PAGE_SIZE);
 
@@ -955,6 +1199,52 @@ public final class TaoTree implements AutoCloseable {
         public long size() { checkAccess(); return TaoTree.this.size; }
         public boolean isEmpty() { checkAccess(); return TaoTree.this.size == 0; }
 
+        /**
+         * Get a typed, read-only accessor for a leaf value.
+         *
+         * @param leafPtr the leaf pointer (from {@link #lookup})
+         * @param layout  the leaf value layout
+         * @return a read-only {@link LeafAccessor}
+         */
+        public LeafAccessor leaf(long leafPtr, LeafLayout layout) {
+            return new LeafAccessor(leafValue(leafPtr), layout, TaoTree.this);
+        }
+
+        /**
+         * Point lookup returning a typed, read-only accessor.
+         *
+         * @param key    the key (uses the tree's key length)
+         * @param layout the leaf value layout
+         * @return a read-only {@link LeafAccessor}, or {@code null} if not found
+         */
+        public LeafAccessor lookup(MemorySegment key, LeafLayout layout) {
+            checkAccess();
+            long ptr = lookupImpl(key, TaoTree.this.keyLen);
+            if (ptr == NOT_FOUND) return null;
+            return new LeafAccessor(leafValueImpl(ptr).asReadOnly(), layout, TaoTree.this);
+        }
+
+        /**
+         * Point lookup from a {@link KeyBuilder}, returning a typed, read-only accessor.
+         *
+         * @param kb     the key builder (must have all fields set)
+         * @param layout the leaf value layout
+         * @return a read-only {@link LeafAccessor}, or {@code null} if not found
+         */
+        public LeafAccessor lookup(KeyBuilder kb, LeafLayout layout) {
+            return lookup(kb.key(), layout);
+        }
+
+        /**
+         * Point lookup from a {@link KeyBuilder}, using the tree's bound leaf layout.
+         *
+         * @param kb the key builder (must have all fields set)
+         * @return a read-only {@link LeafAccessor}, or {@code null} if not found
+         */
+        public LeafAccessor lookup(KeyBuilder kb) {
+            return lookup(kb.key(), leafLayout());
+        }
+
         /** Package-private: access the underlying tree (for WriteScope.copyFrom). */
         TaoTree tree() { return TaoTree.this; }
 
@@ -1030,6 +1320,53 @@ public final class TaoTree implements AutoCloseable {
 
         public long size() { checkAccess(); return TaoTree.this.size; }
         public boolean isEmpty() { checkAccess(); return TaoTree.this.size == 0; }
+
+        /**
+         * Get a typed, writable accessor for a leaf value.
+         *
+         * @param leafPtr the leaf pointer (from {@link #lookup} or {@link #getOrCreate})
+         * @param layout  the leaf value layout
+         * @return a writable {@link LeafAccessor}
+         */
+        public LeafAccessor leaf(long leafPtr, LeafLayout layout) {
+            return new LeafAccessor(leafValue(leafPtr), layout, TaoTree.this);
+        }
+
+        /**
+         * Insert or lookup, returning a typed, writable accessor.
+         *
+         * <p>Uses the tree's key length and the default leaf class (0).
+         *
+         * @param key    the key
+         * @param layout the leaf value layout
+         * @return a writable {@link LeafAccessor} (existing or newly created with zeroed fields)
+         */
+        public LeafAccessor getOrCreate(MemorySegment key, LeafLayout layout) {
+            checkAccess();
+            long ptr = getOrCreateImpl(key, TaoTree.this.keyLen, 0);
+            return new LeafAccessor(leafValueImpl(ptr), layout, TaoTree.this);
+        }
+
+        /**
+         * Insert or lookup from a {@link KeyBuilder}, returning a typed, writable accessor.
+         *
+         * @param kb     the key builder (must have all fields set)
+         * @param layout the leaf value layout
+         * @return a writable {@link LeafAccessor} (existing or newly created with zeroed fields)
+         */
+        public LeafAccessor getOrCreate(KeyBuilder kb, LeafLayout layout) {
+            return getOrCreate(kb.key(), layout);
+        }
+
+        /**
+         * Insert or lookup from a {@link KeyBuilder}, using the tree's bound leaf layout.
+         *
+         * @param kb the key builder (must have all fields set)
+         * @return a writable {@link LeafAccessor} (existing or newly created with zeroed fields)
+         */
+        public LeafAccessor getOrCreate(KeyBuilder kb) {
+            return getOrCreate(kb.key(), leafLayout());
+        }
 
         // -- Write operations --
 

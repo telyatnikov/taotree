@@ -245,4 +245,59 @@ class TaoDictionaryTest {
             assertThrows(IllegalArgumentException.class, () -> dict.intern(sb.toString()));
         }
     }
+
+    // ---- Mutation-killing: MAX_KEY_LEN exact boundary ----
+
+    @Test
+    void stringExactlyAtMaxKeyLenSucceeds() {
+        try (var tree = TaoTree.forDictionaries()) {
+            var dict = TaoDictionary.u32(tree);
+            // Encoded form = raw bytes + null terminator.
+            // 127 chars → 127 bytes + 1 null = 128 bytes = MAX_KEY_LEN → should succeed
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 127; i++) sb.append('A');
+            int code = dict.intern(sb.toString());
+            assertTrue(code > 0, "String at exactly MAX_KEY_LEN should be accepted");
+            assertEquals(code, dict.resolve(sb.toString()));
+        }
+    }
+
+    // ---- Mutation-killing: WriteScope.close() releases write lock ----
+
+    @Test
+    void writeScopeCloseReleasesLockFromAnotherThread() throws Exception {
+        try (var tree = TaoTree.forDictionaries()) {
+            var dict = TaoDictionary.u16(tree);
+
+            // Open write scope and close it
+            var w = dict.write();
+            w.intern("test");
+            w.close();
+
+            // Verify lock is released: another thread must be able to acquire it
+            var result = new java.util.concurrent.atomic.AtomicBoolean(false);
+            var thread = Thread.ofVirtual().start(() -> {
+                int code = dict.resolve("test");
+                result.set(code > 0);
+            });
+            thread.join(5000);
+            assertTrue(result.get(), "Lock should be released after WriteScope.close()");
+        }
+    }
+
+    // ---- Mutation-killing: copyFrom requires write lock ----
+
+    @Test
+    void copyFromWithoutWriteLockThrows() {
+        try (var tree = TaoTree.forDictionaries()) {
+            var source = TaoDictionary.u16(tree);
+            source.intern("hello");
+
+            var target = TaoDictionary.u16(tree);
+
+            // copyFrom without holding write lock should throw
+            assertThrows(IllegalStateException.class,
+                () -> target.copyFrom(source));
+        }
+    }
 }

@@ -30,6 +30,11 @@ public sealed interface KeyField {
     static KeyField dict16(String name, TaoDictionary dict) { return new DictU16(name, dict); }
     static KeyField dict32(String name, TaoDictionary dict) { return new DictU32(name, dict); }
 
+    /** Declare a dict16 field without a dictionary instance. The tree creates it automatically. */
+    static KeyField dict16(String name) { return new DictU16(name, null); }
+    /** Declare a dict32 field without a dictionary instance. The tree creates it automatically. */
+    static KeyField dict32(String name) { return new DictU32(name, null); }
+
     // -- Record implementations --
 
     record UInt8 (String name) implements KeyField { public int width() { return 1; } }
