@@ -27,6 +27,7 @@ class SuperblockTest {
             data.bumpOffset = 1234;
             data.bumpBytesAllocated = 5678L;
             data.bumpPageLocations = new int[]{100, 200, 300};
+            data.bumpPageSizes = new int[]{16, 16, 16};
 
             // 2 slab classes
             var cls0 = new Superblock.SlabClassDescriptor();
@@ -103,6 +104,7 @@ class SuperblockTest {
             assertEquals(data.bumpOffset, restored.bumpOffset);
             assertEquals(data.bumpBytesAllocated, restored.bumpBytesAllocated);
             assertArrayEquals(data.bumpPageLocations, restored.bumpPageLocations);
+            assertArrayEquals(data.bumpPageSizes, restored.bumpPageSizes);
 
             // Verify slab classes
             assertEquals(2, restored.classes.length);

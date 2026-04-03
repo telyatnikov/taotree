@@ -218,6 +218,38 @@ public final class TaoDictionary {
     /** Package-private: the child tree backing this dictionary. */
     TaoTree childTree() { return tree; }
 
+    /**
+     * Copy all entries from the source dictionary into this dictionary.
+     *
+     * <p>This is a compaction-only operation: the target dictionary must be empty
+     * and have the same {@code maxCode} as the source. After copy, the target's
+     * {@code nextCode} matches the source's, so future interns continue the same
+     * code sequence.
+     *
+     * <p>The caller must hold the owner tree's write lock.
+     *
+     * @param source the source dictionary to copy from
+     * @throws IllegalStateException if the target is not empty or the owner's write lock is not held
+     * @throws IllegalArgumentException if maxCode doesn't match
+     */
+    public void copyFrom(TaoDictionary source) {
+        if (!owner.isWriteLockedByCurrentThread()) {
+            throw new IllegalStateException(
+                "TaoDictionary.copyFrom() requires the owner tree's write lock.");
+        }
+        if (tree.size != 0) {
+            throw new IllegalStateException(
+                "TaoDictionary.copyFrom() requires an empty target dictionary (size="
+                + tree.size + "). Use a freshly created dictionary.");
+        }
+        if (this.maxCode != source.maxCode) {
+            throw new IllegalArgumentException(
+                "maxCode mismatch: source=" + source.maxCode + " target=" + this.maxCode);
+        }
+        tree.copyFromImpl(source.tree);
+        this.nextCode = source.nextCode;
+    }
+
     private int internImpl(String value) {
         byte[] padded = encodeAndPad(value);
         long leafRef = tree.getOrCreateImpl(MemorySegment.ofArray(padded), MAX_KEY_LEN, 0);

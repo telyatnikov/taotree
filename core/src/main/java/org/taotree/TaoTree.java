@@ -98,6 +98,9 @@ public final class TaoTree implements AutoCloseable {
     // Tracked dictionaries (for persistence)
     private final List<TaoDictionary> dicts = new ArrayList<>();
 
+    // String layouts per slab class ID (for copyFrom out-of-line string handling)
+    private final java.util.Map<Integer, StringLayout> stringLayouts = new java.util.HashMap<>();
+
     // -----------------------------------------------------------------------
     // Root tree constructor (owns arena)
     // -----------------------------------------------------------------------
@@ -282,6 +285,198 @@ public final class TaoTree implements AutoCloseable {
         dicts.add(dict);
     }
 
+    /**
+     * Register a string layout for a leaf class.
+     *
+     * <p>This tells {@link #copyFrom} how to find and copy out-of-line string data
+     * within leaves of the given class. Without registration, leaf values are copied
+     * as raw bytes (out-of-line pointers would become dangling in the target tree).
+     *
+     * @param leafClassIndex the leaf class index (0-based)
+     * @param layout         the string layout descriptor
+     */
+    public void registerStringLayout(int leafClassIndex, StringLayout layout) {
+        stringLayouts.put(leafClassIds[leafClassIndex], layout);
+    }
+
+    // -----------------------------------------------------------------------
+    // Copy / compaction
+    // -----------------------------------------------------------------------
+
+    /**
+     * Copy all live entries from the source tree into this tree.
+     *
+     * <p>Walks the source tree and re-inserts every leaf into this tree. For leaves
+     * with registered {@link StringLayout}s, out-of-line string data is copied from
+     * the source's bump allocator to this tree's bump allocator and the pointer is
+     * patched in the target leaf.
+     *
+     * <p>The source tree is not modified. This tree must have the same key length
+     * and compatible leaf classes as the source.
+     *
+     * <p><b>Typical use (copy-vacuum / compaction):</b>
+     * <pre>{@code
+     * // Compact a file-backed tree into a fresh file
+     * try (var compacted = TaoTree.create(newPath, tree.keyLen(), valueSize)) {
+     *     compacted.registerStringLayout(0, TaoString.STRING_LAYOUT);
+     *     try (var w = compacted.write()) {
+     *         compacted.copyFrom(tree);
+     *     }
+     * }
+     * }</pre>
+     *
+     * <p><b>Threading:</b> The caller must hold a write scope on this tree
+     * (enforced — throws {@link IllegalStateException} if not held).
+     * The source tree should not be concurrently modified (hold a read scope on
+     * it, or ensure exclusive access).
+     *
+     * @param source the source tree to copy from
+     * @throws IllegalArgumentException if key lengths, leaf class counts, or leaf value sizes don't match
+     * @throws IllegalStateException if the target write lock is not held
+     */
+    public void copyFrom(TaoTree source) {
+        if (!lock.isWriteLockedByCurrentThread()) {
+            throw new IllegalStateException(
+                "copyFrom() requires the target tree's write lock. "
+                + "Use WriteScope.copyFrom(ReadScope) for the scope-safe API.");
+        }
+        copyFromImpl(source);
+    }
+
+    /**
+     * Package-private implementation of copyFrom. Assumes locks are already held.
+     */
+    void copyFromImpl(TaoTree source) {
+        if (source.keyLen != this.keyLen) {
+            throw new IllegalArgumentException(
+                "Key length mismatch: source=" + source.keyLen + " target=" + this.keyLen);
+        }
+        if (source.leafClassCount != this.leafClassCount) {
+            throw new IllegalArgumentException(
+                "Leaf class count mismatch: source=" + source.leafClassCount
+                + " target=" + this.leafClassCount);
+        }
+        for (int i = 0; i < source.leafClassCount; i++) {
+            if (source.leafValueSizes[i] != this.leafValueSizes[i]) {
+                throw new IllegalArgumentException(
+                    "Leaf value size mismatch at class " + i + ": source="
+                    + source.leafValueSizes[i] + " target=" + this.leafValueSizes[i]);
+            }
+        }
+        if (NodePtr.isEmpty(source.root)) return;
+        copyNode(source, source.root);
+    }
+
+    /**
+     * Recursively walk the source tree and re-insert every leaf into this tree.
+     */
+    private void copyNode(TaoTree source, long nodePtr) {
+        if (NodePtr.isEmpty(nodePtr)) return;
+
+        int type = NodePtr.nodeType(nodePtr);
+
+        if (type == NodePtr.LEAF) {
+            copyLeaf(source, nodePtr);
+            return;
+        }
+
+        if (type == NodePtr.PREFIX) {
+            MemorySegment prefSeg = source.slab.resolve(nodePtr);
+            copyNode(source, PrefixNode.child(prefSeg));
+            return;
+        }
+
+        // Inner node: recurse into all children
+        MemorySegment seg = source.slab.resolve(nodePtr);
+        switch (type) {
+            case NodePtr.NODE_4 -> {
+                int n = Node4.count(seg);
+                for (int i = 0; i < n; i++) {
+                    copyNode(source, Node4.childAt(seg, i));
+                }
+            }
+            case NodePtr.NODE_16 -> {
+                int n = Node16.count(seg);
+                for (int i = 0; i < n; i++) {
+                    copyNode(source, Node16.childAt(seg, i));
+                }
+            }
+            case NodePtr.NODE_48 ->
+                Node48.forEach(seg, (k, child) -> copyNode(source, child));
+            case NodePtr.NODE_256 ->
+                Node256.forEach(seg, (k, child) -> copyNode(source, child));
+        }
+    }
+
+    /**
+     * Copy a single leaf from source to this tree.
+     * Extracts the key, inserts into this tree, copies the value,
+     * and handles out-of-line string data if a StringLayout is registered.
+     */
+    private void copyLeaf(TaoTree source, long srcLeafPtr) {
+        // Extract key from source leaf
+        MemorySegment srcFull = source.slab.resolve(srcLeafPtr);
+        MemorySegment srcKey = srcFull.asSlice(0, keyLen);
+
+        // Determine the leaf class index in source
+        int srcSlabClassId = NodePtr.slabClassId(srcLeafPtr);
+        int leafClassIdx = -1;
+        for (int i = 0; i < source.leafClassCount; i++) {
+            if (source.leafClassIds[i] == srcSlabClassId) {
+                leafClassIdx = i;
+                break;
+            }
+        }
+        if (leafClassIdx < 0 || leafClassIdx >= this.leafClassCount) {
+            throw new IllegalStateException(
+                "Source leaf class index " + leafClassIdx + " not compatible with target tree");
+        }
+
+        // Insert into this tree
+        long tgtLeafPtr = getOrCreateImpl(srcKey, keyLen, leafClassIdx);
+
+        // Verify the target leaf's slab class matches the requested class.
+        // If the key already existed in a different leaf class, the slab class
+        // will differ and raw byte copy would be unsafe.
+        int tgtSlabClassId = NodePtr.slabClassId(tgtLeafPtr);
+        if (tgtSlabClassId != this.leafClassIds[leafClassIdx]) {
+            throw new IllegalStateException(
+                "Leaf class conflict for existing key: target slab class " + tgtSlabClassId
+                + " != expected " + this.leafClassIds[leafClassIdx]
+                + " (leaf class index " + leafClassIdx + ")."
+                + " Cannot copy into a non-empty target where the same key exists with a different leaf class.");
+        }
+
+        // Copy value portion, handling out-of-line string data if registered.
+        // Order matters: allocate overflow first, then write the final value with
+        // the patched pointer. This avoids a window where the target leaf contains
+        // a dangling source overflow pointer if allocation fails mid-copy.
+        MemorySegment srcValue = srcFull.asSlice(source.keySlotSize);
+        MemorySegment tgtValue = leafValueImpl(tgtLeafPtr);
+
+        StringLayout layout = stringLayouts.get(this.leafClassIds[leafClassIdx]);
+        if (layout != null) {
+            int len = srcValue.get(ValueLayout.JAVA_INT_UNALIGNED, layout.lenOffset());
+            if (len > layout.inlineThreshold()) {
+                // Allocate and copy overflow BEFORE writing the leaf value
+                long srcRef = srcValue.get(ValueLayout.JAVA_LONG_UNALIGNED, layout.ptrOffset());
+                MemorySegment srcData = source.bump.resolve(srcRef, len);
+
+                long tgtRef = this.bump.allocate(len);
+                MemorySegment tgtData = this.bump.resolve(tgtRef, len);
+                MemorySegment.copy(srcData, 0, tgtData, 0, len);
+
+                // Copy the full value, then patch with the target pointer
+                MemorySegment.copy(srcValue, 0, tgtValue, 0, srcValue.byteSize());
+                tgtValue.set(ValueLayout.JAVA_LONG_UNALIGNED, layout.ptrOffset(), tgtRef);
+                return;
+            }
+        }
+
+        // No overflow (or no layout registered): straight byte copy
+        MemorySegment.copy(srcValue, 0, tgtValue, 0, srcValue.byteSize());
+    }
+
     // -----------------------------------------------------------------------
     // File-backed factory methods
     // -----------------------------------------------------------------------
@@ -375,9 +570,11 @@ public final class TaoTree implements AutoCloseable {
         }
 
         var bump = new BumpAllocator(arena, cs, data.bumpPageSize);
-        int bumpPagesPerPage = data.bumpPageSize / ChunkStore.PAGE_SIZE;
-        for (int loc : data.bumpPageLocations) {
-            bump.restorePage(loc, bumpPagesPerPage);
+        for (int i = 0; i < data.bumpPageLocations.length; i++) {
+            int sizeInPages = (i < data.bumpPageSizes.length && data.bumpPageSizes[i] > 0)
+                ? data.bumpPageSizes[i]
+                : data.bumpPageSize / ChunkStore.PAGE_SIZE;
+            bump.restorePage(data.bumpPageLocations[i], sizeInPages);
         }
         bump.restoreState(data.bumpCurrentPage, data.bumpOffset, data.bumpBytesAllocated);
 
@@ -647,6 +844,7 @@ public final class TaoTree implements AutoCloseable {
         data.bumpOffset = bump.bumpOffset();
         data.bumpBytesAllocated = bump.bytesAllocated();
         data.bumpPageLocations = bump.exportPageLocations();
+        data.bumpPageSizes = bump.exportPageSizes();
 
         // Tree descriptors: index 0 = primary tree, index 1+ = child trees for dicts
         int treeCount = 1 + dicts.size();
@@ -756,6 +954,9 @@ public final class TaoTree implements AutoCloseable {
 
         public long size() { checkAccess(); return TaoTree.this.size; }
         public boolean isEmpty() { checkAccess(); return TaoTree.this.size == 0; }
+
+        /** Package-private: access the underlying tree (for WriteScope.copyFrom). */
+        TaoTree tree() { return TaoTree.this; }
 
         @Override
         public void close() {
@@ -881,6 +1082,21 @@ public final class TaoTree implements AutoCloseable {
             checkAccess();
             validateKeyLen(key.length);
             return deleteImpl(MemorySegment.ofArray(key), key.length);
+        }
+
+        /**
+         * Copy all live entries from the source tree (held by a read scope) into this tree.
+         *
+         * <p>Both locks are enforced: this tree's write lock (via this scope) and the
+         * source tree's read lock (via the source scope).
+         *
+         * @param sourceScope a read scope on the source tree
+         * @see TaoTree#copyFrom(TaoTree)
+         */
+        public void copyFrom(ReadScope sourceScope) {
+            checkAccess();
+            sourceScope.checkAccess();
+            TaoTree.this.copyFromImpl(sourceScope.tree());
         }
 
         @Override

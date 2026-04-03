@@ -94,6 +94,22 @@ public final class Superblock {
      * @return the number of bytes written
      */
     public static int write(MemorySegment page, SuperblockData data) {
+        // Pre-flight: compute total size to catch overflow before writing
+        int estimatedSize = HEADER_SIZE;
+        for (var cls : data.classes) {
+            estimatedSize += 12 + cls.slabCount * 9; // 4+4+4 + slabCount*(4+4+1)
+        }
+        for (var tree : data.trees) {
+            estimatedSize += 36 + tree.leafValueSizes.length * 8; // fixed + per-leaf
+        }
+        estimatedSize += data.dicts.length * 12;
+        estimatedSize += 4 + data.bumpPageLocations.length * 8; // count + per-page (loc+size)
+        if (estimatedSize > page.byteSize()) {
+            throw new IllegalStateException(
+                "Superblock metadata (" + estimatedSize + " bytes) exceeds page size ("
+                + page.byteSize() + " bytes). Too many slab classes or slabs for single-page superblock.");
+        }
+
         int pos = 0;
 
         // Fixed header
@@ -149,10 +165,18 @@ public final class Superblock {
             page.set(ValueLayout.JAVA_INT_UNALIGNED, pos, dict.treeIndex); pos += 4;
         }
 
-        // Bump page locations
+        // Bump page locations and sizes
         page.set(ValueLayout.JAVA_INT_UNALIGNED, pos, data.bumpPageLocations.length); pos += 4;
-        for (int loc : data.bumpPageLocations) {
-            page.set(ValueLayout.JAVA_INT_UNALIGNED, pos, loc); pos += 4;
+        for (int i = 0; i < data.bumpPageLocations.length; i++) {
+            page.set(ValueLayout.JAVA_INT_UNALIGNED, pos, data.bumpPageLocations[i]); pos += 4;
+            page.set(ValueLayout.JAVA_INT_UNALIGNED, pos, data.bumpPageSizes[i]); pos += 4;
+        }
+
+        // Post-write guard: verify we didn't exceed the page
+        if (pos > page.byteSize()) {
+            throw new IllegalStateException(
+                "Superblock overflow: wrote " + pos + " bytes into " + page.byteSize()
+                + " byte page. Multi-page superblock not yet implemented.");
         }
 
         return pos;
@@ -245,11 +269,13 @@ public final class Superblock {
             data.dicts[d] = dict;
         }
 
-        // Bump page locations
+        // Bump page locations and sizes
         int bumpLocCount = page.get(ValueLayout.JAVA_INT_UNALIGNED, pos); pos += 4;
         data.bumpPageLocations = new int[bumpLocCount];
+        data.bumpPageSizes = new int[bumpLocCount];
         for (int i = 0; i < bumpLocCount; i++) {
             data.bumpPageLocations[i] = page.get(ValueLayout.JAVA_INT_UNALIGNED, pos); pos += 4;
+            data.bumpPageSizes[i] = page.get(ValueLayout.JAVA_INT_UNALIGNED, pos); pos += 4;
         }
 
         return data;
@@ -274,6 +300,7 @@ public final class Superblock {
         public int bumpOffset;
         public long bumpBytesAllocated;
         public int[] bumpPageLocations = new int[0]; // startPage for each bump page
+        public int[] bumpPageSizes = new int[0];     // size in ChunkStore pages for each bump page
 
         // SlabAllocator state
         public SlabClassDescriptor[] classes = new SlabClassDescriptor[0];

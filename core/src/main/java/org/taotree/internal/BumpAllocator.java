@@ -186,6 +186,18 @@ public final class BumpAllocator implements AutoCloseable {
     }
 
     /**
+     * Export page sizes for the superblock.
+     * Returns an array of ChunkStore page counts (one per bump page).
+     * Oversized pages will have sizes larger than the default pageSize/PAGE_SIZE.
+     */
+    public int[] exportPageSizes() {
+        if (pageSizesInPages == null) return new int[0];
+        int[] result = new int[pageCount];
+        System.arraycopy(pageSizesInPages, 0, result, 0, pageCount);
+        return result;
+    }
+
+    /**
      * Restore a bump page from persisted state.
      * Must be called in file-backed mode. Remaps the page from the ChunkStore.
      *

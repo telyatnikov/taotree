@@ -43,6 +43,14 @@ public final class TaoString {
     /** Maximum length for inline (short) strings. */
     public static final int SHORT_THRESHOLD = 12;
 
+    /**
+     * String layout descriptor for {@link TaoTree#copyFrom}.
+     * Register with {@link TaoTree#registerStringLayout(int, StringLayout)}
+     * for leaf classes that store TaoString values.
+     */
+    public static final StringLayout STRING_LAYOUT =
+        new StringLayout(0, 8, SHORT_THRESHOLD);
+
     private static final long OFF_LEN     = 0;
     private static final long OFF_PAYLOAD = 4;
     private static final long OFF_PREFIX  = 4;
