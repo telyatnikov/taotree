@@ -26,7 +26,15 @@ subprojects {
 
     tasks.withType<Test> {
         useJUnitPlatform()
-        jvmArgs("--enable-native-access=ALL-UNNAMED")
+        jvmArgs(
+            "--enable-native-access=ALL-UNNAMED",
+            "--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED",
+            "--add-opens", "java.base/java.lang=ALL-UNNAMED"
+        )
+
+        // Fork a fresh JVM per test class so that Lincheck stress tests
+        // (which leak Arena instances) don't accumulate across classes.
+        forkEvery = 1
 
         // Use RAM-backed filesystem for file-backed tests when available.
         // macOS: create with `hdiutil attach -nomount ram://524288 | xargs diskutil erasevolume APFS RAMDisk`

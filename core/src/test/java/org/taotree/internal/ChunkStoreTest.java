@@ -22,14 +22,14 @@ class ChunkStoreTest {
         try (var arena = Arena.ofConfined();
              var store = ChunkStore.create(file, arena)) {
 
-            // Page 0 is reserved for superblock
-            assertEquals(1, store.nextPage());
+            // Pages 0-1 are reserved for superblock
+            assertEquals(2, store.nextPage());
             assertTrue(store.totalPages() > 0);
 
             // Allocate a run of 256 pages (1 MB slab)
             int start = store.allocPages(256);
-            assertEquals(1, start);
-            assertEquals(257, store.nextPage());
+            assertEquals(2, start);
+            assertEquals(258, store.nextPage());
 
             // Resolve and write
             MemorySegment seg = store.resolve(start, 256);
@@ -91,15 +91,15 @@ class ChunkStoreTest {
 
             assertEquals(1024, store.pagesPerChunk());
 
-            // Fill most of chunk 0 (page 0 is superblock, so 1023 pages available)
+            // Fill most of chunk 0 (pages 0-1 are superblock, so 1022 pages available)
             // Allocate runs of 256 pages until we can't fit another in chunk 0
-            int a = store.allocPages(256);  // pages 1-256
-            assertEquals(1, a);
-            int b = store.allocPages(256);  // pages 257-512
-            assertEquals(257, b);
-            int c = store.allocPages(256);  // pages 513-768
-            assertEquals(513, c);
-            // 769..1023 = 255 pages left, one more 256-page slab does NOT fit.
+            int a = store.allocPages(256);  // pages 2-257
+            assertEquals(2, a);
+            int b = store.allocPages(256);  // pages 258-513
+            assertEquals(258, b);
+            int c = store.allocPages(256);  // pages 514-769
+            assertEquals(514, c);
+            // 770..1023 = 254 pages left, one more 256-page slab does NOT fit.
             // Should skip to chunk 1 (page 1024).
             int d = store.allocPages(256);
             assertEquals(1024, d);  // skipped to chunk 1
@@ -119,13 +119,13 @@ class ChunkStoreTest {
         try (var arena = Arena.ofConfined();
              var store = ChunkStore.create(file, arena, smallChunk, false)) {
 
-            // Chunk 0: pages 0-511. Page 0 is superblock. Available: 1-511 = 511 pages.
-            // Allocate 256 pages: pages 1-256. nextPage = 257.
+            // Chunk 0: pages 0-511. Pages 0-1 are superblock. Available: 2-511 = 510 pages.
+            // Allocate 256 pages: pages 2-257. nextPage = 258.
             int a = store.allocPages(256);
-            assertEquals(1, a);
-            assertEquals(257, store.nextPage());
+            assertEquals(2, a);
+            assertEquals(258, store.nextPage());
 
-            // 257 + 256 = 513 > 512 — would straddle chunk boundary.
+            // 258 + 256 = 514 > 512 — would straddle chunk boundary.
             // Should skip to chunk 1 start (page 512).
             int b = store.allocPages(256);
             assertEquals(512, b);  // skipped to chunk 1
@@ -160,7 +160,7 @@ class ChunkStoreTest {
         try (var arena = Arena.ofConfined();
              var store = ChunkStore.open(file, arena, ChunkStore.DEFAULT_CHUNK_SIZE,
                  // We know: 1 chunk was allocated = 16384 pages
-                 16384, 256 + 16 + 1)) {
+                 16384, 256 + 16 + 2)) {
 
             MemorySegment slab = store.resolve(slabStart, 256);
             assertEquals(0xFACE_CAFEL, slab.get(ValueLayout.JAVA_LONG, 0));
@@ -178,7 +178,7 @@ class ChunkStoreTest {
              var store = ChunkStore.create(file, arena)) {
 
             MemorySegment sb = store.superblock();
-            assertEquals(ChunkStore.PAGE_SIZE, sb.byteSize());
+            assertEquals(2 * ChunkStore.PAGE_SIZE, sb.byteSize());
 
             // Write magic
             sb.set(ValueLayout.JAVA_LONG, 0, 0x54414F54524545L); // "TAOTREE"

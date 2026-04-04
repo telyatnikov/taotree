@@ -173,7 +173,26 @@ class TaoKeyTest {
         try (var arena = Arena.ofConfined()) {
             var seg = arena.allocate(2);
             TaoKey.encodeI16(seg, 0, (short) -100);
-            // Encoded value: -100 ^ Short.MIN_VALUE = 32668
+            // XOR with Short.MIN_VALUE flips the sign bit: -100 ^ 0x8000 = 0x7F9C = 32668
+            short raw = seg.get(java.lang.foreign.ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(
+                java.nio.ByteOrder.BIG_ENDIAN), 0);
+            assertEquals((short) (-100 ^ Short.MIN_VALUE), raw,
+                "encodeI16 must XOR with Short.MIN_VALUE");
+        }
+    }
+
+    @Test
+    void encodeI16OrderPreserving() {
+        try (var arena = Arena.ofConfined()) {
+            var neg = arena.allocate(2);
+            var pos = arena.allocate(2);
+            TaoKey.encodeI16(neg, 0, (short) -1);
+            TaoKey.encodeI16(pos, 0, (short) 1);
+            // Negative must sort before positive in unsigned byte comparison
+            int b0neg = Byte.toUnsignedInt(neg.get(java.lang.foreign.ValueLayout.JAVA_BYTE, 0));
+            int b0pos = Byte.toUnsignedInt(pos.get(java.lang.foreign.ValueLayout.JAVA_BYTE, 0));
+            assertTrue(b0neg < b0pos,
+                "Encoded -1 (first byte=" + b0neg + ") must sort before +1 (first byte=" + b0pos + ")");
         }
     }
 

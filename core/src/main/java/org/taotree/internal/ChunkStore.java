@@ -81,9 +81,9 @@ public final class ChunkStore implements AutoCloseable {
             StandardOpenOption.READ,
             StandardOpenOption.WRITE);
         var store = new ChunkStore(path, channel, arena, chunkSize, preallocate);
-        // Reserve page 0 for the superblock
-        store.growFile(1);
-        store.nextPage = 1;
+        // Reserve pages 0-1 for the superblock (8 KB)
+        store.growFile(2);
+        store.nextPage = 2;
         return store;
     }
 
@@ -209,9 +209,9 @@ public final class ChunkStore implements AutoCloseable {
     // Superblock access (page 0)
     // -----------------------------------------------------------------------
 
-    /** Returns a writable MemorySegment for page 0 (the superblock). */
+    /** Returns a writable MemorySegment for pages 0-1 (the superblock, 8 KB). */
     public MemorySegment superblock() {
-        return resolve(0, 1);
+        return resolve(0, 2);
     }
 
     // -----------------------------------------------------------------------
