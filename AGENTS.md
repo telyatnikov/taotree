@@ -24,11 +24,13 @@
 
 - Public API: `org.taotree` package — `TaoTree`, `KeyLayout`, `LeafLayout`, `KeyHandle`, `LeafHandle`, `LeafAccessor`, `KeyBuilder`, `QueryBuilder`, `LeafVisitor`, `KeyField`, `LeafField`, `TaoDictionary`, `TaoString`, `TaoKey`
 - Internal: `org.taotree.internal` — `SlabAllocator`, `BumpAllocator`, `ChunkStore`, `Node4/16/48/256`, `PrefixNode`, `NodePtr`, `OverflowPtr`, `Superblock`, `Preallocator`
+- Internal (v2 COW): `CowEngine`, `EpochReclaimer`, `PublicationState`, `WriterArena`, `CowPath`, `CheckpointV2`, `RecordHeader`, `CommitRecord`
 
 ## API Patterns
 
 - `TaoTree.open(KeyLayout, LeafLayout)` — auto-creates dicts for `KeyField.dict16/dict32`
 - `TaoTree.open(Path, KeyLayout, LeafLayout)` — reopens file-backed tree, rebinds dicts by order
+- `tree.activateCowMode()` — switches to ROWEX-hybrid COW (lock-free readers, concurrent writers)
 - `tree.keyDict16("name")` / `tree.leafInt32("name")` — derive typed handles from the tree
 - `tree.newKeyBuilder(arena)` — for writes (uses `intern()`, needs write lock for dict fields)
 - `tree.newQueryBuilder(arena)` — for reads (uses `resolve()`, safe under read lock)

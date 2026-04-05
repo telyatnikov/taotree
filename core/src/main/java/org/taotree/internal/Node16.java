@@ -117,4 +117,51 @@ public final class Node16 {
         }
         dst.set(ValueLayout.JAVA_BYTE, OFF_COUNT, (byte) n);
     }
+
+    // -----------------------------------------------------------------------
+    // COW (copy-on-write) operations
+    // -----------------------------------------------------------------------
+
+    /** Copy the source Node16 to dst, replacing one child pointer. */
+    public static void cowReplaceChild(MemorySegment dst, MemorySegment src,
+                                       byte keyByte, long newChild) {
+        MemorySegment.copy(src, 0, dst, 0, NodeConstants.NODE16_SIZE);
+        int pos = findPos(dst, keyByte);
+        if (pos >= 0) setChildAt(dst, pos, newChild);
+    }
+
+    /** Copy the source Node16 to dst with an additional child inserted (source must not be full). */
+    public static void cowInsertChild(MemorySegment dst, MemorySegment src,
+                                      byte keyByte, long childPtr) {
+        MemorySegment.copy(src, 0, dst, 0, NodeConstants.NODE16_SIZE);
+        insertChild(dst, keyByte, childPtr);
+    }
+
+    /** Copy the source Node16 to dst with one child removed. */
+    public static void cowRemoveChild(MemorySegment dst, MemorySegment src, byte keyByte) {
+        MemorySegment.copy(src, 0, dst, 0, NodeConstants.NODE16_SIZE);
+        removeChild(dst, keyByte);
+    }
+
+    /**
+     * Grow a Node16 to a Node48, inserting a new child in the process.
+     * The destination (Node48) must be freshly initialized.
+     */
+    public static void growToNode48(MemorySegment dst48, MemorySegment src16,
+                                    byte newKey, long newChild) {
+        Node48.copyFromNode16(dst48, src16);
+        Node48.insertChild(dst48, newKey, newChild);
+    }
+
+    /**
+     * Shrink a Node16 to a Node4 (copy entries into a freshly initialized Node4).
+     * Source must have count <= Node4.CAPACITY.
+     */
+    public static void shrinkToNode4(MemorySegment dst4, MemorySegment src16) {
+        int n = count(src16);
+        Node4.init(dst4);
+        for (int i = 0; i < n; i++) {
+            Node4.insertChild(dst4, keyAt(src16, i), childAt(src16, i));
+        }
+    }
 }

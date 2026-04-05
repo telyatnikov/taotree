@@ -5,6 +5,8 @@ import org.taotree.internal.Superblock;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * ART-backed intern table that maps variable-length strings to monotonic integer codes.
@@ -46,6 +48,10 @@ public final class TaoDictionary {
     private final TaoTree tree;
     private final int maxCode;
     private int nextCode;
+
+    // Per-dictionary lock for COW mode: serializes dict writes without holding
+    // the global tree lock. Multiple dicts can be interned concurrently.
+    private final ReentrantLock dictLock = new ReentrantLock();
 
     /**
      * Create a dictionary.
@@ -95,19 +101,25 @@ public final class TaoDictionary {
     // Scoped access
     // -----------------------------------------------------------------------
 
-    /** Acquire a read scope. */
+    /** Acquire a read scope. In COW mode, this is lock-free. */
     public ReadScope read() {
-        owner.acquireReadLock();
+        if (!owner.isCowMode()) {
+            owner.acquireReadLock();
+        }
         return new ReadScope();
     }
 
     /**
-     * Acquire a write scope.
+     * Acquire a write scope. In COW mode, acquires the per-dictionary lock.
      *
-     * @throws IllegalStateException if the current thread holds only a read scope
+     * @throws IllegalStateException if the current thread holds only a read scope (legacy mode)
      */
     public WriteScope write() {
-        owner.acquireWriteLock();
+        if (owner.isCowMode()) {
+            dictLock.lock();
+        } else {
+            owner.acquireWriteLock();
+        }
         return new WriteScope();
     }
 
@@ -118,13 +130,23 @@ public final class TaoDictionary {
     /**
      * Intern a string: return its code, assigning a new one if not yet known.
      *
-     * <p>Acquires the tree's write lock (reentrant if already held).
+     * <p>In COW mode, acquires a per-dictionary lock (not the global tree lock),
+     * allowing concurrent interning into different dictionaries.
+     * In legacy mode, acquires the tree's write lock (reentrant if already held).
      *
      * @param value the string to intern
      * @return the integer code (never 0 — zero is reserved as null sentinel)
      * @throws IllegalStateException if the dictionary is full, or if read->write upgrade
      */
     public int intern(String value) {
+        if (owner.isCowMode()) {
+            dictLock.lock();
+            try {
+                return internImpl(value);
+            } finally {
+                dictLock.unlock();
+            }
+        }
         owner.acquireWriteLock();
         try {
             return internImpl(value);
@@ -136,9 +158,14 @@ public final class TaoDictionary {
     /**
      * Resolve a string to its code without assigning. Returns -1 if not found.
      *
-     * <p>Acquires the tree's read lock (reentrant if already held).
+     * <p>In COW mode, this is lock-free (epoch-based via the tree's root pointer).
+     * In legacy mode, acquires the tree's read lock.
      */
     public int resolve(String value) {
+        if (owner.isCowMode()) {
+            // Lock-free resolve: child tree's root is published via setRelease
+            return resolveImpl(value);
+        }
         owner.acquireReadLock();
         try {
             return resolveImpl(value);
@@ -147,8 +174,11 @@ public final class TaoDictionary {
         }
     }
 
-    /** Number of entries. Acquires read lock. */
+    /** Number of entries. */
     public int size() {
+        if (owner.isCowMode()) {
+            return (int) tree.size;
+        }
         owner.acquireReadLock();
         try {
             return (int) tree.size;
@@ -157,8 +187,11 @@ public final class TaoDictionary {
         }
     }
 
-    /** The next code that will be assigned. Acquires read lock. */
+    /** The next code that will be assigned. */
     public int nextCode() {
+        if (owner.isCowMode()) {
+            return nextCode;
+        }
         owner.acquireReadLock();
         try {
             return nextCode;
@@ -171,7 +204,7 @@ public final class TaoDictionary {
     // ReadScope
     // -----------------------------------------------------------------------
 
-    /** Read-only scope of the dictionary. Holds the tree's read lock. */
+    /** Read-only scope of the dictionary. */
     public final class ReadScope implements AutoCloseable {
         /** Resolve a string to its code. Returns -1 if not found. */
         public int resolve(String value) { return resolveImpl(value); }
@@ -180,14 +213,18 @@ public final class TaoDictionary {
         public int size() { return (int) tree.size; }
 
         @Override
-        public void close() { owner.releaseReadLock(); }
+        public void close() {
+            if (!owner.isCowMode()) {
+                owner.releaseReadLock();
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
     // WriteScope
     // -----------------------------------------------------------------------
 
-    /** Write scope of the dictionary. Holds the tree's write lock. */
+    /** Write scope of the dictionary. */
     public final class WriteScope implements AutoCloseable {
         /** Intern a string: return its code, assigning a new one if not yet known. */
         public int intern(String value) { return internImpl(value); }
@@ -199,7 +236,13 @@ public final class TaoDictionary {
         public int size() { return (int) tree.size; }
 
         @Override
-        public void close() { owner.releaseWriteLock(); }
+        public void close() {
+            if (owner.isCowMode()) {
+                dictLock.unlock();
+            } else {
+                owner.releaseWriteLock();
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

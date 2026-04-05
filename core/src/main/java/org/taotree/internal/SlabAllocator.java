@@ -109,30 +109,36 @@ public final class SlabAllocator implements AutoCloseable {
     /**
      * Allocate a segment from the given slab class, stamping it as a {@link NodePtr#LEAF}.
      *
+     * <p>Thread-safe: synchronized to support concurrent COW writers.
+     *
      * @param slabClassId the slab class ID (from {@link #registerClass})
      * @return a {@link NodePtr}-encoded pointer to the allocated segment
      */
-    public long allocate(int slabClassId) {
+    public synchronized long allocate(int slabClassId) {
         return allocate(slabClassId, NodePtr.LEAF);
     }
 
     /**
      * Allocate a segment from the given slab class with a specific node type tag.
      *
+     * <p>Thread-safe: synchronized to support concurrent COW writers.
+     *
      * @param slabClassId the slab class ID (from {@link #registerClass})
      * @param nodeType    the {@link NodePtr} node type tag to stamp in the pointer
      * @return a {@link NodePtr}-encoded pointer to the allocated segment
      */
-    public long allocate(int slabClassId, int nodeType) {
+    public synchronized long allocate(int slabClassId, int nodeType) {
         return classes[slabClassId].allocate(nodeType);
     }
 
     /**
      * Free a previously allocated segment.
      *
+     * <p>Thread-safe: synchronized to support concurrent epoch reclamation.
+     *
      * @param ptr the {@link NodePtr}-encoded pointer returned by {@link #allocate}
      */
-    public void free(long ptr) {
+    public synchronized void free(long ptr) {
         int classId = NodePtr.slabClassId(ptr);
         classes[classId].free(ptr);
     }

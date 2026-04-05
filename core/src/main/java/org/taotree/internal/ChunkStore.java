@@ -33,6 +33,9 @@ public final class ChunkStore implements AutoCloseable {
     /** Default chunk size: 64 MB (16384 pages per chunk). */
     public static final long DEFAULT_CHUNK_SIZE = 64L * 1024 * 1024;
 
+    /** Number of reserved pages for v2 checkpoint slots (pages 0-3, 16 KB). */
+    public static final int V2_RESERVED_PAGES = 4;
+
     private static final int MAX_CHUNKS = 16384; // 64 MB × 16384 = 1 TB max
 
     private final Path path;
@@ -90,6 +93,32 @@ public final class ChunkStore implements AutoCloseable {
     /** Create a new store file with the default chunk size (64 MB) and preallocation enabled. */
     public static ChunkStore create(Path path, Arena arena) throws IOException {
         return create(path, arena, DEFAULT_CHUNK_SIZE, Preallocator.isSupported());
+    }
+
+    /**
+     * Create a new v2 store file with 4 reserved pages for two checkpoint slots.
+     *
+     * @param path        path to the store file
+     * @param arena       arena controlling the lifetime of mapped segments
+     * @param chunkSize   chunk size in bytes (must be a multiple of PAGE_SIZE)
+     * @param preallocate if true, use OS-specific preallocation to reserve physical blocks
+     */
+    public static ChunkStore createV2(Path path, Arena arena, long chunkSize,
+                                       boolean preallocate) throws IOException {
+        validateChunkSize(chunkSize);
+        var channel = FileChannel.open(path,
+            StandardOpenOption.CREATE_NEW,
+            StandardOpenOption.READ,
+            StandardOpenOption.WRITE);
+        var store = new ChunkStore(path, channel, arena, chunkSize, preallocate);
+        store.growFile(V2_RESERVED_PAGES);
+        store.nextPage = V2_RESERVED_PAGES;
+        return store;
+    }
+
+    /** Create a new v2 store file with the default chunk size (64 MB) and preallocation enabled. */
+    public static ChunkStore createV2(Path path, Arena arena) throws IOException {
+        return createV2(path, arena, DEFAULT_CHUNK_SIZE, Preallocator.isSupported());
     }
 
     /**
@@ -212,6 +241,20 @@ public final class ChunkStore implements AutoCloseable {
     /** Returns a writable MemorySegment for pages 0-1 (the superblock, 8 KB). */
     public MemorySegment superblock() {
         return resolve(0, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // V2 checkpoint slot access
+    // -----------------------------------------------------------------------
+
+    /** Returns a writable MemorySegment for checkpoint slot A (pages 0-1, 8 KB). */
+    public MemorySegment checkpointSlotA() {
+        return resolve(0, 2);
+    }
+
+    /** Returns a writable MemorySegment for checkpoint slot B (pages 2-3, 8 KB). */
+    public MemorySegment checkpointSlotB() {
+        return resolve(2, 2);
     }
 
     // -----------------------------------------------------------------------

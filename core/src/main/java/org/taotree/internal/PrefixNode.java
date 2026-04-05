@@ -110,4 +110,14 @@ public final class PrefixNode {
         }
         return maxMatch;
     }
+
+    // -----------------------------------------------------------------------
+    // COW (copy-on-write) operations
+    // -----------------------------------------------------------------------
+
+    /** Copy the source prefix node to dst with a different child pointer. */
+    public static void cowWithChild(MemorySegment dst, MemorySegment src, long newChild) {
+        MemorySegment.copy(src, 0, dst, 0, NodeConstants.PREFIX_SIZE);
+        dst.set(ValueLayout.JAVA_LONG, OFF_CHILD, newChild);
+    }
 }

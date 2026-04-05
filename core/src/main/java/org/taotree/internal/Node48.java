@@ -146,4 +146,47 @@ public final class Node48 {
     public interface KeyChildConsumer {
         void accept(byte key, long childPtr);
     }
+
+    // -----------------------------------------------------------------------
+    // COW (copy-on-write) operations
+    // -----------------------------------------------------------------------
+
+    /** Copy the source Node48 to dst, replacing one child pointer. */
+    public static void cowReplaceChild(MemorySegment dst, MemorySegment src,
+                                       byte keyByte, long newChild) {
+        MemorySegment.copy(src, 0, dst, 0, NodeConstants.NODE48_SIZE);
+        updateChild(dst, keyByte, newChild);
+    }
+
+    /** Copy the source Node48 to dst with an additional child inserted (source must not be full). */
+    public static void cowInsertChild(MemorySegment dst, MemorySegment src,
+                                      byte keyByte, long childPtr) {
+        MemorySegment.copy(src, 0, dst, 0, NodeConstants.NODE48_SIZE);
+        insertChild(dst, keyByte, childPtr);
+    }
+
+    /** Copy the source Node48 to dst with one child removed. */
+    public static void cowRemoveChild(MemorySegment dst, MemorySegment src, byte keyByte) {
+        MemorySegment.copy(src, 0, dst, 0, NodeConstants.NODE48_SIZE);
+        removeChild(dst, keyByte);
+    }
+
+    /**
+     * Grow a Node48 to a Node256, inserting a new child in the process.
+     * The destination (Node256) must be freshly initialized.
+     */
+    public static void growToNode256(MemorySegment dst256, MemorySegment src48,
+                                     byte newKey, long newChild) {
+        Node256.copyFromNode48(dst256, src48);
+        Node256.insertChild(dst256, newKey, newChild);
+    }
+
+    /**
+     * Shrink a Node48 to a Node16 (copy entries into a freshly initialized Node16).
+     * Source must have count <= Node16.CAPACITY.
+     */
+    public static void shrinkToNode16(MemorySegment dst16, MemorySegment src48) {
+        Node16.init(dst16);
+        forEach(src48, (k, c) -> Node16.insertChild(dst16, k, c));
+    }
 }

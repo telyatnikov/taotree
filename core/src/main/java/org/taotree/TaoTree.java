@@ -9,6 +9,8 @@ import org.taotree.internal.Node256;
 import org.taotree.internal.NodeConstants;
 import org.taotree.internal.BumpAllocator;
 import org.taotree.internal.ChunkStore;
+import org.taotree.internal.CowEngine;
+import org.taotree.internal.EpochReclaimer;
 import org.taotree.internal.Preallocator;
 import org.taotree.internal.PrefixNode;
 import org.taotree.internal.SlabAllocator;
@@ -19,10 +21,13 @@ import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
@@ -95,6 +100,35 @@ public final class TaoTree implements AutoCloseable {
 
     private long root = NodePtr.EMPTY_PTR;
     long size = 0; // package-private for TaoDictionary
+
+    // -- COW infrastructure (v2) --
+    // Volatile root pointer for lock-free reader access via VarHandle CAS.
+    // Writers CAS this when the root itself changes (growth, shrink).
+    // Per-subtree CAS on Node256 children bypasses this.
+    @SuppressWarnings("unused") // accessed via ROOT_HANDLE VarHandle
+    private volatile long rootPtr = NodePtr.EMPTY_PTR;
+
+    private static final VarHandle ROOT_HANDLE;
+    static {
+        try {
+            ROOT_HANDLE = MethodHandles.lookup()
+                .findVarHandle(TaoTree.class, "rootPtr", long.class);
+        } catch (ReflectiveOperationException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
+
+    // Atomic size counter for concurrent writers
+    private final AtomicLong atomicSize = new AtomicLong(0);
+
+    // Epoch-based reclaimer: deferred node freeing for lock-free readers
+    private EpochReclaimer reclaimer; // null until COW mode is activated
+
+    // COW engine: performs structural mutations via path-copy + CAS
+    private CowEngine cowEngine; // null until COW mode is activated
+
+    // True when COW mode is active (v2). False for legacy RW-lock mode.
+    private volatile boolean cowMode = false;
 
     // Tracked dictionaries (for persistence)
     private final List<TaoDictionary> dicts = new ArrayList<>();
@@ -1012,6 +1046,153 @@ public final class TaoTree implements AutoCloseable {
     }
 
     // -----------------------------------------------------------------------
+    // COW mode activation
+    // -----------------------------------------------------------------------
+
+    /**
+     * Activate ROWEX-hybrid COW mode (v2 concurrency model).
+     *
+     * <p>After activation:
+     * <ul>
+     *   <li>Readers are completely lock-free (one acquire, then plain loads)
+     *   <li>Writers use COW path-copy + per-subtree CAS
+     *   <li>Nodes are retired (deferred free) instead of immediately freed
+     * </ul>
+     *
+     * <p>This is a one-way transition. Cannot be deactivated.
+     */
+    public void activateCowMode() {
+        if (cowMode) return;
+        reclaimer = new EpochReclaimer(slab);
+        cowEngine = new CowEngine(slab, reclaimer,
+            prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
+            keyLen, keySlotSize, leafClassIds);
+        // Sync root and size to the atomic versions
+        ROOT_HANDLE.setRelease(this, root);
+        atomicSize.set(size);
+        cowMode = true;
+    }
+
+    /** Returns true if COW mode is active. */
+    public boolean isCowMode() { return cowMode; }
+
+    /** Returns the epoch reclaimer (null if COW mode not active). */
+    EpochReclaimer reclaimer() { return reclaimer; }
+
+    // -----------------------------------------------------------------------
+    // Lock-free lookup (COW mode)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Lock-free point lookup. Uses one acquire on the root pointer, then
+     * plain loads for the entire traversal.
+     */
+    long lookupLockFree(MemorySegment key, int keyLen) {
+        long node = (long) ROOT_HANDLE.getAcquire(this);
+        int depth = 0;
+
+        while (!NodePtr.isEmpty(node)) {
+            int type = NodePtr.nodeType(node);
+
+            if (type == NodePtr.LEAF) {
+                return leafKeyMatches(node, key, keyLen) ? node : NodePtr.EMPTY_PTR;
+            }
+
+            if (type == NodePtr.PREFIX) {
+                MemorySegment prefSeg = slab.resolve(node);
+                int prefLen = PrefixNode.count(prefSeg);
+                int matched = PrefixNode.matchKey(prefSeg, key, keyLen, depth);
+                if (matched < prefLen) {
+                    return NodePtr.EMPTY_PTR;
+                }
+                depth += prefLen;
+                node = PrefixNode.child(prefSeg);
+                continue;
+            }
+
+            if (depth >= keyLen) return NodePtr.EMPTY_PTR;
+            byte keyByte = key.get(ValueLayout.JAVA_BYTE, depth);
+            node = findChild(node, type, keyByte);
+            depth++;
+        }
+        return NodePtr.EMPTY_PTR;
+    }
+
+    /**
+     * COW insert with retry. Uses CowEngine for structural mutation
+     * and per-subtree CAS for publication. Retries on CAS failure.
+     */
+    long cowGetOrCreateWithRetry(MemorySegment key, int keyLen, int leafClass) {
+        while (true) {
+            long currentRoot = (long) ROOT_HANDLE.getAcquire(this);
+            var result = cowEngine.cowGetOrCreate(currentRoot, key, keyLen, leafClass);
+
+            if (!result.created()) {
+                return result.leafPtr(); // key already existed
+            }
+
+            if (result.published()) {
+                // Per-subtree CAS succeeded
+                atomicSize.incrementAndGet();
+                reclaimer.advanceGeneration();
+                // Sync legacy fields for backward compat
+                root = (long) ROOT_HANDLE.getAcquire(this);
+                size = atomicSize.get();
+                return result.leafPtr();
+            }
+
+            // Need root-level CAS (no Node256 ancestor or root changed)
+            if (!NodePtr.isEmpty(result.newRoot())) {
+                boolean success = ROOT_HANDLE.compareAndSet(this, currentRoot, result.newRoot());
+                if (success) {
+                    atomicSize.incrementAndGet();
+                    reclaimer.advanceGeneration();
+                    root = result.newRoot();
+                    size = atomicSize.get();
+                    return result.leafPtr();
+                }
+                // CAS failed — another writer changed the root
+                cowEngine.retireSpeculative(result.newRoot());
+            }
+            // Retry from scratch
+        }
+    }
+
+    /**
+     * COW delete with retry.
+     */
+    boolean cowDeleteWithRetry(MemorySegment key, int keyLen) {
+        while (true) {
+            long currentRoot = (long) ROOT_HANDLE.getAcquire(this);
+            var result = cowEngine.cowDelete(currentRoot, key, keyLen);
+
+            if (!result.deleted()) {
+                return false;
+            }
+
+            if (result.published()) {
+                atomicSize.decrementAndGet();
+                reclaimer.advanceGeneration();
+                root = (long) ROOT_HANDLE.getAcquire(this);
+                size = atomicSize.get();
+                return true;
+            }
+
+            // Root-level CAS
+            long newRoot = result.newRoot();
+            boolean success = ROOT_HANDLE.compareAndSet(this, currentRoot, newRoot);
+            if (success) {
+                atomicSize.decrementAndGet();
+                reclaimer.advanceGeneration();
+                root = newRoot;
+                size = atomicSize.get();
+                return true;
+            }
+            // CAS failed — retry
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Stats (public, self-locking)
     // -----------------------------------------------------------------------
 
@@ -1190,7 +1371,8 @@ public final class TaoTree implements AutoCloseable {
     // -----------------------------------------------------------------------
 
     /**
-     * Acquire a read scope. Holds the read lock until closed.
+     * Acquire a read scope. In COW mode, this is lock-free (epoch-based).
+     * In legacy mode, holds the read lock until closed.
      *
      * <p>Use within try-with-resources:
      * <pre>{@code
@@ -1201,12 +1383,18 @@ public final class TaoTree implements AutoCloseable {
      * }</pre>
      */
     public ReadScope read() {
+        if (cowMode) {
+            int slot = reclaimer.enterEpoch();
+            return new ReadScope(slot);
+        }
         acquireReadLock();
-        return new ReadScope();
+        return new ReadScope(-1);
     }
 
     /**
-     * Acquire a write scope. Holds the write lock until closed.
+     * Acquire a write scope. In COW mode, no global lock is held —
+     * individual mutations use per-subtree CAS.
+     * In legacy mode, holds the write lock until closed.
      *
      * <p>Use within try-with-resources:
      * <pre>{@code
@@ -1220,8 +1408,11 @@ public final class TaoTree implements AutoCloseable {
      *                               a write scope (read→write upgrade is not supported)
      */
     public WriteScope write() {
+        if (cowMode) {
+            return new WriteScope(true);
+        }
         acquireWriteLock();
-        return new WriteScope();
+        return new WriteScope(false);
     }
 
     // -----------------------------------------------------------------------
@@ -1238,8 +1429,11 @@ public final class TaoTree implements AutoCloseable {
 
         private boolean closed;
         private final Thread ownerThread = Thread.currentThread();
+        private final int epochSlot; // -1 for legacy lock mode
 
-        private ReadScope() {}
+        private ReadScope(int epochSlot) {
+            this.epochSlot = epochSlot;
+        }
 
         /**
          * Point lookup.
@@ -1248,19 +1442,21 @@ public final class TaoTree implements AutoCloseable {
         public long lookup(MemorySegment key, int keyLen) {
             checkAccess();
             validateKeyLen(keyLen);
-            return lookupImpl(key, keyLen);
+            return cowMode ? lookupLockFree(key, keyLen) : lookupImpl(key, keyLen);
         }
 
         /** Point lookup (uses the tree's key length). */
         public long lookup(MemorySegment key) {
             checkAccess();
-            return lookupImpl(key, TaoTree.this.keyLen);
+            return cowMode ? lookupLockFree(key, TaoTree.this.keyLen)
+                           : lookupImpl(key, TaoTree.this.keyLen);
         }
 
         public long lookup(byte[] key) {
             checkAccess();
             validateKeyLen(key.length);
-            return lookupImpl(MemorySegment.ofArray(key), key.length);
+            var seg = MemorySegment.ofArray(key);
+            return cowMode ? lookupLockFree(seg, key.length) : lookupImpl(seg, key.length);
         }
 
         /**
@@ -1274,8 +1470,14 @@ public final class TaoTree implements AutoCloseable {
             return leafValueImpl(leafPtr).asReadOnly();
         }
 
-        public long size() { checkAccess(); return TaoTree.this.size; }
-        public boolean isEmpty() { checkAccess(); return TaoTree.this.size == 0; }
+        public long size() {
+            checkAccess();
+            return cowMode ? atomicSize.get() : TaoTree.this.size;
+        }
+        public boolean isEmpty() {
+            checkAccess();
+            return cowMode ? atomicSize.get() == 0 : TaoTree.this.size == 0;
+        }
 
         /**
          * Get a typed, read-only accessor for a leaf value.
@@ -1297,7 +1499,8 @@ public final class TaoTree implements AutoCloseable {
          */
         public LeafAccessor lookup(MemorySegment key, LeafLayout layout) {
             checkAccess();
-            long ptr = lookupImpl(key, TaoTree.this.keyLen);
+            long ptr = cowMode ? lookupLockFree(key, TaoTree.this.keyLen)
+                               : lookupImpl(key, TaoTree.this.keyLen);
             if (ptr == NOT_FOUND) return null;
             return new LeafAccessor(leafValueImpl(ptr).asReadOnly(), layout, TaoTree.this);
         }
@@ -1391,7 +1594,11 @@ public final class TaoTree implements AutoCloseable {
             if (!closed) {
                 checkThread();
                 closed = true;
-                releaseReadLock();
+                if (epochSlot >= 0) {
+                    reclaimer.exitEpoch(epochSlot);
+                } else {
+                    releaseReadLock();
+                }
             }
         }
 
@@ -1423,27 +1630,32 @@ public final class TaoTree implements AutoCloseable {
 
         private boolean closed;
         private final Thread ownerThread = Thread.currentThread();
+        private final boolean cowModeScope; // true if using COW, false for legacy lock
 
-        private WriteScope() {}
+        private WriteScope(boolean cowModeScope) {
+            this.cowModeScope = cowModeScope;
+        }
 
         // -- Read operations (also available under write lock) --
 
         public long lookup(MemorySegment key, int keyLen) {
             checkAccess();
             validateKeyLen(keyLen);
-            return lookupImpl(key, keyLen);
+            return cowModeScope ? lookupLockFree(key, keyLen) : lookupImpl(key, keyLen);
         }
 
         /** Point lookup (uses the tree's key length). */
         public long lookup(MemorySegment key) {
             checkAccess();
-            return lookupImpl(key, TaoTree.this.keyLen);
+            return cowModeScope ? lookupLockFree(key, TaoTree.this.keyLen)
+                                : lookupImpl(key, TaoTree.this.keyLen);
         }
 
         public long lookup(byte[] key) {
             checkAccess();
             validateKeyLen(key.length);
-            return lookupImpl(MemorySegment.ofArray(key), key.length);
+            var seg = MemorySegment.ofArray(key);
+            return cowModeScope ? lookupLockFree(seg, key.length) : lookupImpl(seg, key.length);
         }
 
         /**
@@ -1456,8 +1668,14 @@ public final class TaoTree implements AutoCloseable {
             return leafValueImpl(leafPtr);
         }
 
-        public long size() { checkAccess(); return TaoTree.this.size; }
-        public boolean isEmpty() { checkAccess(); return TaoTree.this.size == 0; }
+        public long size() {
+            checkAccess();
+            return cowModeScope ? atomicSize.get() : TaoTree.this.size;
+        }
+        public boolean isEmpty() {
+            checkAccess();
+            return cowModeScope ? atomicSize.get() == 0 : TaoTree.this.size == 0;
+        }
 
         /**
          * Get a typed, writable accessor for a leaf value.
@@ -1481,7 +1699,9 @@ public final class TaoTree implements AutoCloseable {
          */
         public LeafAccessor getOrCreate(MemorySegment key, LeafLayout layout) {
             checkAccess();
-            long ptr = getOrCreateImpl(key, TaoTree.this.keyLen, 0);
+            long ptr = cowModeScope
+                ? cowGetOrCreateWithRetry(key, TaoTree.this.keyLen, 0)
+                : getOrCreateImpl(key, TaoTree.this.keyLen, 0);
             return new LeafAccessor(leafValueImpl(ptr), layout, TaoTree.this);
         }
 
@@ -1520,27 +1740,37 @@ public final class TaoTree implements AutoCloseable {
             checkAccess();
             validateKeyLen(keyLen);
             validateLeafClass(leafClass);
-            return getOrCreateImpl(key, keyLen, leafClass);
+            return cowModeScope
+                ? cowGetOrCreateWithRetry(key, keyLen, leafClass)
+                : getOrCreateImpl(key, keyLen, leafClass);
         }
 
         /** Insert or lookup using the tree's key length and the default leaf class (0). */
         public long getOrCreate(MemorySegment key) {
             checkAccess();
-            return getOrCreateImpl(key, TaoTree.this.keyLen, 0);
+            return cowModeScope
+                ? cowGetOrCreateWithRetry(key, TaoTree.this.keyLen, 0)
+                : getOrCreateImpl(key, TaoTree.this.keyLen, 0);
         }
 
         public long getOrCreate(byte[] key, int leafClass) {
             checkAccess();
             validateKeyLen(key.length);
             validateLeafClass(leafClass);
-            return getOrCreateImpl(MemorySegment.ofArray(key), key.length, leafClass);
+            var seg = MemorySegment.ofArray(key);
+            return cowModeScope
+                ? cowGetOrCreateWithRetry(seg, key.length, leafClass)
+                : getOrCreateImpl(seg, key.length, leafClass);
         }
 
         /** Insert or lookup using the default leaf class (0). */
         public long getOrCreate(byte[] key) {
             checkAccess();
             validateKeyLen(key.length);
-            return getOrCreateImpl(MemorySegment.ofArray(key), key.length, 0);
+            var seg = MemorySegment.ofArray(key);
+            return cowModeScope
+                ? cowGetOrCreateWithRetry(seg, key.length, 0)
+                : getOrCreateImpl(seg, key.length, 0);
         }
 
         /**
@@ -1550,13 +1780,18 @@ public final class TaoTree implements AutoCloseable {
         public boolean delete(MemorySegment key, int keyLen) {
             checkAccess();
             validateKeyLen(keyLen);
-            return deleteImpl(key, keyLen);
+            return cowModeScope
+                ? cowDeleteWithRetry(key, keyLen)
+                : deleteImpl(key, keyLen);
         }
 
         public boolean delete(byte[] key) {
             checkAccess();
             validateKeyLen(key.length);
-            return deleteImpl(MemorySegment.ofArray(key), key.length);
+            var seg = MemorySegment.ofArray(key);
+            return cowModeScope
+                ? cowDeleteWithRetry(seg, key.length)
+                : deleteImpl(seg, key.length);
         }
 
         /**
@@ -1579,7 +1814,11 @@ public final class TaoTree implements AutoCloseable {
             if (!closed) {
                 checkThread();
                 closed = true;
-                releaseWriteLock();
+                if (!cowModeScope) {
+                    releaseWriteLock();
+                }
+                // In COW mode, no lock to release. Individual mutations
+                // were already published via CAS.
             }
         }
 

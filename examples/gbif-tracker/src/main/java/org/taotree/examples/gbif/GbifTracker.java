@@ -103,6 +103,14 @@ public class GbifTracker {
         // Create a fresh persistent store
         try (var tree = createFresh(storePath)) {
 
+            // Activate COW mode if requested (lock-free readers, concurrent writers)
+            boolean cowMode = Arrays.stream(args).anyMatch("--cow"::equals);
+            if (cowMode) {
+                tree.activateCowMode();
+                System.out.println("COW mode: ACTIVE (lock-free readers, concurrent writers)");
+                System.out.println();
+            }
+
             var KINGDOM = tree.keyDict16("kingdom");
             var PHYLUM  = tree.keyDict16("phylum");
             var FAMILY  = tree.keyDict16("family");

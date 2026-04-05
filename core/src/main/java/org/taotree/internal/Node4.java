@@ -136,4 +136,51 @@ public final class Node4 {
     public static boolean isFull(MemorySegment seg) {
         return count(seg) >= CAPACITY;
     }
+
+    // -----------------------------------------------------------------------
+    // COW (copy-on-write) operations — used by the ROWEX-hybrid COW engine.
+    // These methods create a modified copy of a node in a destination segment
+    // without mutating the source. The caller is responsible for allocation.
+    // -----------------------------------------------------------------------
+
+    /**
+     * Copy the source Node4 to dst, replacing one child pointer.
+     * The destination must be pre-allocated with NODE4_SIZE bytes.
+     */
+    public static void cowReplaceChild(MemorySegment dst, MemorySegment src,
+                                       byte keyByte, long newChild) {
+        MemorySegment.copy(src, 0, dst, 0, NodeConstants.NODE4_SIZE);
+        int pos = findPos(dst, keyByte);
+        if (pos >= 0) setChildAt(dst, pos, newChild);
+    }
+
+    /**
+     * Copy the source Node4 to dst with an additional child inserted.
+     * The source must NOT be full (count < 4). The destination must be
+     * pre-allocated with NODE4_SIZE bytes and freshly zeroed.
+     */
+    public static void cowInsertChild(MemorySegment dst, MemorySegment src,
+                                      byte keyByte, long childPtr) {
+        MemorySegment.copy(src, 0, dst, 0, NodeConstants.NODE4_SIZE);
+        insertChild(dst, keyByte, childPtr);
+    }
+
+    /**
+     * Copy the source Node4 to dst with one child removed.
+     * The destination must be pre-allocated with NODE4_SIZE bytes.
+     */
+    public static void cowRemoveChild(MemorySegment dst, MemorySegment src, byte keyByte) {
+        MemorySegment.copy(src, 0, dst, 0, NodeConstants.NODE4_SIZE);
+        removeChild(dst, keyByte);
+    }
+
+    /**
+     * Grow a Node4 to a Node16, inserting a new child in the process.
+     * The destination (Node16) must be freshly initialized.
+     */
+    public static void growToNode16(MemorySegment dst16, MemorySegment src4,
+                                    byte newKey, long newChild) {
+        Node16.copyFromNode4(dst16, src4);
+        Node16.insertChild(dst16, newKey, newChild);
+    }
 }

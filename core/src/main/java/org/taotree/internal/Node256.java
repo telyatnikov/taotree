@@ -100,4 +100,46 @@ public final class Node256 {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // COW (copy-on-write) operations
+    // -----------------------------------------------------------------------
+
+    /** Copy the source Node256 to dst, replacing one child pointer. */
+    public static void cowReplaceChild(MemorySegment dst, MemorySegment src,
+                                       byte keyByte, long newChild) {
+        MemorySegment.copy(src, 0, dst, 0, NodeConstants.NODE256_SIZE);
+        setChild(dst, keyByte, newChild);
+    }
+
+    /** Copy the source Node256 to dst with an additional child inserted. */
+    public static void cowInsertChild(MemorySegment dst, MemorySegment src,
+                                      byte keyByte, long childPtr) {
+        MemorySegment.copy(src, 0, dst, 0, NodeConstants.NODE256_SIZE);
+        insertChild(dst, keyByte, childPtr);
+    }
+
+    /** Copy the source Node256 to dst with one child removed. */
+    public static void cowRemoveChild(MemorySegment dst, MemorySegment src, byte keyByte) {
+        MemorySegment.copy(src, 0, dst, 0, NodeConstants.NODE256_SIZE);
+        removeChild(dst, keyByte);
+    }
+
+    /**
+     * Shrink a Node256 to a Node48 (copy entries into a freshly initialized Node48).
+     * Source must have count <= Node48.CAPACITY.
+     */
+    public static void shrinkToNode48(MemorySegment dst48, MemorySegment src256) {
+        Node48.init(dst48);
+        forEach(src256, (k, c) -> Node48.insertChild(dst48, k, c));
+    }
+
+    /**
+     * Return the byte offset of the child pointer slot for the given key byte.
+     * Used for per-subtree CAS: two writers targeting different key bytes
+     * target different memory addresses.
+     */
+    public static long childOffset(byte keyByte) {
+        return OFF_CHILDREN + (long) Byte.toUnsignedInt(keyByte) * 8;
+    }
 }
