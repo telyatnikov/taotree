@@ -18,19 +18,22 @@
 - Lincheck tests are excluded from PIT (`excludedTestClasses = "org.taotree.Lincheck*"`)
 - `forkEvery = 1` isolates test classes in separate JVMs (Lincheck Arena leak mitigation)
 - File-backed tests auto-detect RAMDisk at `/Volumes/RAMDisk` (macOS) or `/dev/shm` (Linux)
-- Superblock uses 2 pages (8 KB) to accommodate trees with many dictionaries
+- File-backed trees use v2 checkpoint format (mirrored A/B slots, CRC-32C, shadow paging)
+- `Superblock.java` retained as internal data model for `CheckpointIO` serialization
 
 ## Architecture Quick Reference
 
 - Public API: `org.taotree` package — `TaoTree`, `KeyLayout`, `LeafLayout`, `KeyHandle`, `LeafHandle`, `LeafAccessor`, `KeyBuilder`, `QueryBuilder`, `LeafVisitor`, `KeyField`, `LeafField`, `TaoDictionary`, `TaoString`, `TaoKey`
-- Internal: `org.taotree.internal` — `SlabAllocator`, `BumpAllocator`, `ChunkStore`, `Node4/16/48/256`, `PrefixNode`, `NodePtr`, `OverflowPtr`, `Superblock`, `Preallocator`
-- Internal (v2 COW): `CowEngine`, `EpochReclaimer`, `WriterArena`, `CheckpointV2`, `RecordHeader`, `CommitRecord`, `ShadowPagingRecovery`, `Compactor`
+- Internal: `org.taotree.internal` — `SlabAllocator`, `BumpAllocator`, `ChunkStore`, `Node4/16/48/256`, `PrefixNode`, `NodePtr`, `OverflowPtr`, `Preallocator`
+- Internal (v2 persistence): `CheckpointV2`, `CheckpointIO`, `RecordHeader`, `CommitRecord`, `ShadowPagingRecovery`, `Superblock` (data model)
+- Internal (COW concurrency): `CowEngine`, `EpochReclaimer`, `WriterArena`, `Compactor`
 
 ## API Patterns
 
 - `TaoTree.open(KeyLayout, LeafLayout)` — auto-creates dicts for `KeyField.dict16/dict32`
 - `TaoTree.open(Path, KeyLayout, LeafLayout)` — reopens file-backed tree, rebinds dicts by order
 - `tree.activateCowMode()` — switches to ROWEX-hybrid COW (lock-free readers, concurrent writers)
+- `tree.compact()` — post-order compaction: arena→slab migration, checkpoint, epoch reclamation
 - `tree.keyDict16("name")` / `tree.leafInt32("name")` — derive typed handles from the tree
 - `tree.newKeyBuilder(arena)` — for writes (uses `intern()`, needs write lock for dict fields)
 - `tree.newQueryBuilder(arena)` — for reads (uses `resolve()`, safe under read lock)

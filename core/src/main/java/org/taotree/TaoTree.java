@@ -17,7 +17,6 @@ import org.taotree.internal.CowEngine;
 import org.taotree.internal.EpochReclaimer;
 import org.taotree.internal.Preallocator;
 import org.taotree.internal.PrefixNode;
-import org.taotree.internal.RecordHeader;
 import org.taotree.internal.ShadowPagingRecovery;
 import org.taotree.internal.SlabAllocator;
 import org.taotree.internal.Superblock;
@@ -91,7 +90,6 @@ public final class TaoTree implements AutoCloseable {
     // -- V2 checkpoint state (file-backed mode) --
     private long checkpointGeneration;  // monotonically increasing generation (shared by checkpoints + commits)
     private int activeSlotPage = CheckpointV2.SLOT_A_PAGE; // which checkpoint slot was last written
-    private boolean v2Format;           // true if using v2 checkpoint format
 
     // -- V2 commit record state (shadow paging) --
     private int nextCommitPage = -1;    // pre-reserved page for the next commit record (-1 = none)
@@ -902,7 +900,6 @@ public final class TaoTree implements AutoCloseable {
         var bump = new BumpAllocator(arena, cs, BumpAllocator.DEFAULT_PAGE_SIZE);
 
         var tree = new TaoTree(arena, slab, bump, cs, keyLen, leafValueSizes);
-        tree.v2Format = true;
         // Write initial v2 checkpoint to slot A
         tree.writeCheckpointV2();
         // Reserve a page for the first commit record (at nextPage, so recovery finds it)
@@ -913,86 +910,65 @@ public final class TaoTree implements AutoCloseable {
     private static TaoTree openFileBacked(Path path) throws IOException {
         var arena = Arena.ofShared();
 
-        // First pass: open chunk store to read the metadata header.
+        // Open chunk store to read checkpoint slots.
         var channel = java.nio.channels.FileChannel.open(path,
             java.nio.file.StandardOpenOption.READ,
             java.nio.file.StandardOpenOption.WRITE);
         long fileSize = channel.size();
         channel.close();
 
-        if (fileSize < 2L * ChunkStore.PAGE_SIZE) {
-            throw new IOException("File too small to contain metadata: " + path);
+        if (fileSize < (long) ChunkStore.V2_RESERVED_PAGES * ChunkStore.PAGE_SIZE) {
+            throw new IOException("File too small to contain v2 checkpoint: " + path);
         }
 
         int totalPages = (int) (fileSize / ChunkStore.PAGE_SIZE);
         var cs = ChunkStore.open(path, arena, ChunkStore.DEFAULT_CHUNK_SIZE, totalPages, totalPages);
 
-        // Detect format: v2 has RecordHeader.MAGIC_V2 at page 0 offset 0
-        MemorySegment page0 = cs.resolvePage(0);
-        long magic = page0.get(ValueLayout.JAVA_LONG_UNALIGNED, 0);
+        // Read v2 mirrored checkpoints
+        MemorySegment slotA = cs.checkpointSlotA();
+        MemorySegment slotB = cs.checkpointSlotB();
+        var cp = CheckpointV2.chooseBest(slotA, slotB);
+        if (cp == null) {
+            throw new IOException("No valid v2 checkpoint found in " + path);
+        }
+        var data = CheckpointIO.fromCheckpoint(cp);
+        long cpGeneration = cp.generation;
+        int cpActiveSlot = (cp.slotId == 0)
+            ? CheckpointV2.SLOT_A_PAGE
+            : CheckpointV2.SLOT_B_PAGE;
 
-        Superblock.SuperblockData data;
-        boolean isV2;
-        long cpGeneration = 0;
-        int cpActiveSlot = CheckpointV2.SLOT_A_PAGE;
-        int recoveredNextPage;
+        // Scan forward for commit records written since this checkpoint
+        var recovered = ShadowPagingRecovery.recover(
+            cs,
+            cpGeneration,
+            data.trees.length > 0 ? data.trees[0].root : NodePtr.EMPTY_PTR,
+            data.trees.length > 0 ? data.trees[0].size : 0,
+            data.dicts.length,
+            dictRootsFromData(data),
+            dictNextCodesFromData(data),
+            dictSizesFromData(data),
+            data.nextPage,
+            totalPages);
 
-        if (magic == RecordHeader.MAGIC_V2) {
-            // v2 checkpoint format
-            isV2 = true;
-            MemorySegment slotA = cs.checkpointSlotA();
-            MemorySegment slotB = cs.checkpointSlotB();
-            var cp = CheckpointV2.chooseBest(slotA, slotB);
-            if (cp == null) {
-                throw new IOException("No valid v2 checkpoint found in " + path);
+        // Apply recovered state (may update root, size, dict state, nextPage)
+        if (recovered.generation > cpGeneration) {
+            if (data.trees.length > 0) {
+                data.trees[0].root = recovered.primaryRoot;
+                data.trees[0].size = recovered.primarySize;
             }
-            data = CheckpointIO.fromCheckpoint(cp);
-            cpGeneration = cp.generation;
-            cpActiveSlot = (cp.slotId == 0)
-                ? CheckpointV2.SLOT_A_PAGE
-                : CheckpointV2.SLOT_B_PAGE;
-
-            // Scan forward for commit records written since this checkpoint
-            var recovered = ShadowPagingRecovery.recover(
-                cs,
-                cpGeneration,
-                data.trees.length > 0 ? data.trees[0].root : NodePtr.EMPTY_PTR,
-                data.trees.length > 0 ? data.trees[0].size : 0,
-                data.dicts.length,
-                dictRootsFromData(data),
-                dictNextCodesFromData(data),
-                dictSizesFromData(data),
-                data.nextPage,
-                totalPages);
-
-            // Apply recovered state (may update root, size, dict state, nextPage)
-            if (recovered.generation > cpGeneration) {
-                if (data.trees.length > 0) {
-                    data.trees[0].root = recovered.primaryRoot;
-                    data.trees[0].size = recovered.primarySize;
+            for (int i = 0; i < Math.min(recovered.dictionaryCount, data.dicts.length); i++) {
+                if (1 + i < data.trees.length) {
+                    data.trees[1 + i].root = recovered.dictRoots[i];
+                    data.trees[1 + i].size = recovered.dictSizes[i];
                 }
-                for (int i = 0; i < Math.min(recovered.dictionaryCount, data.dicts.length); i++) {
-                    // Dict tree state is at trees[1+i]
-                    if (1 + i < data.trees.length) {
-                        data.trees[1 + i].root = recovered.dictRoots[i];
-                        data.trees[1 + i].size = recovered.dictSizes[i];
-                    }
-                }
-                cpGeneration = recovered.generation;
             }
-            recoveredNextPage = recovered.nextPage;
-        } else {
-            // v1 superblock format
-            isV2 = false;
-            MemorySegment sb = cs.superblock();
-            data = Superblock.read(sb);
-            recoveredNextPage = data.nextPage;
+            cpGeneration = recovered.generation;
         }
 
         // Reopen ChunkStore with the correct nextPage (from checkpoint or recovery)
         cs.close();
         cs = ChunkStore.open(path, arena, data.chunkSize,
-            Math.max(data.totalPages, recoveredNextPage), recoveredNextPage);
+            Math.max(data.totalPages, recovered.nextPage), recovered.nextPage);
 
         // Restore allocators
         var slab = new SlabAllocator(arena, cs, data.slabSize);
@@ -1009,13 +985,12 @@ public final class TaoTree implements AutoCloseable {
         }
         bump.restoreState(data.bumpCurrentPage, data.bumpOffset, data.bumpBytesAllocated);
 
-        // Restore the primary tree (index 0 in tree descriptors)
+        // Restore the primary tree
         if (data.trees.length == 0) {
-            throw new IOException("No tree descriptors found in metadata");
+            throw new IOException("No tree descriptors found in checkpoint");
         }
         var treeDesc = data.trees[0];
         var tree = new TaoTree(arena, slab, bump, cs, treeDesc);
-        tree.v2Format = isV2;
         tree.checkpointGeneration = cpGeneration;
         tree.activeSlotPage = cpActiveSlot;
 
@@ -1027,10 +1002,8 @@ public final class TaoTree implements AutoCloseable {
             tree.dicts.add(dict);
         }
 
-        // For v2 format, reserve the next commit record page for shadow paging
-        if (isV2) {
-            tree.reserveNextCommitPage();
-        }
+        // Reserve the next commit record page for shadow paging
+        tree.reserveNextCommitPage();
 
         return tree;
     }
@@ -1383,12 +1356,8 @@ public final class TaoTree implements AutoCloseable {
             }
 
             // Write a full checkpoint with the compacted state
-            if (v2Format) {
-                writeCheckpointV2();
-                commitsSinceCheckpoint = 0;
-            } else {
-                writeSuperblock();
-            }
+            writeCheckpointV2();
+            commitsSinceCheckpoint = 0;
             chunkStore.sync();
 
             // Advance durable generation — retired nodes older than this can now be freed
@@ -1445,10 +1414,10 @@ public final class TaoTree implements AutoCloseable {
     /**
      * Flush all data to disk (file-backed mode only).
      *
-     * <p>For v2 format, writes a lightweight commit record (one page) and forces
-     * all mapped regions. Every {@value #COMMITS_PER_CHECKPOINT} commits, also
-     * writes a full mirrored checkpoint to bound recovery time.
-     * For v1 format, writes the superblock. No-op for in-memory trees.
+     * <p>Writes a lightweight commit record (one page) and forces all mapped
+     * regions. Every {@value #COMMITS_PER_CHECKPOINT} commits, also writes a
+     * full mirrored checkpoint to bound recovery time and advances
+     * {@code durableGeneration} for epoch reclamation. No-op for in-memory trees.
      *
      * @throws IOException if an I/O error occurs during sync
      */
@@ -1456,23 +1425,18 @@ public final class TaoTree implements AutoCloseable {
         if (chunkStore == null) return;
         lock.writeLock().lock();
         try {
-            if (v2Format) {
-                writeCommitRecord();
-                commitsSinceCheckpoint++;
-                if (commitsSinceCheckpoint >= COMMITS_PER_CHECKPOINT) {
-                    writeCheckpointV2();
-                    commitsSinceCheckpoint = 0;
-                    chunkStore.sync();
-                    // Full checkpoint is now durable — advance durableGeneration
-                    if (reclaimer != null) {
-                        reclaimer.advanceDurableGeneration(checkpointGeneration);
-                        reclaimer.reclaim();
-                    }
-                } else {
-                    chunkStore.sync();
+            writeCommitRecord();
+            commitsSinceCheckpoint++;
+            if (commitsSinceCheckpoint >= COMMITS_PER_CHECKPOINT) {
+                writeCheckpointV2();
+                commitsSinceCheckpoint = 0;
+                chunkStore.sync();
+                // Full checkpoint is now durable — advance durableGeneration
+                if (reclaimer != null) {
+                    reclaimer.advanceDurableGeneration(checkpointGeneration);
+                    reclaimer.reclaim();
                 }
             } else {
-                writeSuperblock();
                 chunkStore.sync();
             }
         } finally {
@@ -1490,13 +1454,8 @@ public final class TaoTree implements AutoCloseable {
         if (ownsArena) {
             if (chunkStore != null) {
                 try {
-                    if (v2Format) {
-                        writeCheckpointV2();
-                    } else {
-                        writeSuperblock();
-                    }
+                    writeCheckpointV2();
                     chunkStore.sync();
-                    // Advance durable generation on clean shutdown
                     if (reclaimer != null) {
                         reclaimer.advanceDurableGeneration(checkpointGeneration);
                         reclaimer.reclaim();
@@ -1533,11 +1492,6 @@ public final class TaoTree implements AutoCloseable {
         return desc;
     }
 
-    private void writeSuperblock() {
-        if (chunkStore == null) return;
-        Superblock.write(chunkStore.superblock(), gatherMetadata());
-    }
-
     /**
      * Write a v2 checkpoint to the inactive slot (mirrored A/B).
      * Each call toggles between slot A and slot B, so a torn write
@@ -1564,7 +1518,7 @@ public final class TaoTree implements AutoCloseable {
 
     /**
      * Gather all tree metadata into a {@link Superblock.SuperblockData} structure.
-     * Used by both v1 writeSuperblock and v2 writeCheckpointV2.
+     * Used by writeCheckpointV2 for v2 checkpoint serialization.
      */
     private Superblock.SuperblockData gatherMetadata() {
         var data = new Superblock.SuperblockData();
