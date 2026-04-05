@@ -28,6 +28,8 @@ public final class CowEngine {
 
     private final SlabAllocator slab;
     private final EpochReclaimer reclaimer;
+    private final WriterArena arena;       // null for in-memory mode (allocations go to slab)
+    private final ChunkStore chunkStore;   // null for in-memory mode (needed for arena resolve)
 
     // Node slab class IDs
     private final int prefixClassId;
@@ -45,8 +47,20 @@ public final class CowEngine {
                      int prefixClassId, int node4ClassId, int node16ClassId,
                      int node48ClassId, int node256ClassId,
                      int keyLen, int keySlotSize, int[] leafClassIds) {
+        this(slab, reclaimer, null, null,
+             prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
+             keyLen, keySlotSize, leafClassIds);
+    }
+
+    public CowEngine(SlabAllocator slab, EpochReclaimer reclaimer,
+                     WriterArena arena, ChunkStore chunkStore,
+                     int prefixClassId, int node4ClassId, int node16ClassId,
+                     int node48ClassId, int node256ClassId,
+                     int keyLen, int keySlotSize, int[] leafClassIds) {
         this.slab = slab;
         this.reclaimer = reclaimer;
+        this.arena = arena;
+        this.chunkStore = chunkStore;
         this.prefixClassId = prefixClassId;
         this.node4ClassId = node4ClassId;
         this.node16ClassId = node16ClassId;
@@ -119,7 +133,7 @@ public final class CowEngine {
             }
 
             if (type == NodePtr.PREFIX) {
-                MemorySegment prefSeg = slab.resolve(node);
+                MemorySegment prefSeg = resolveAny(node);
                 int prefLen = PrefixNode.count(prefSeg);
                 int matched = PrefixNode.matchKey(prefSeg, key, keyLen, depth);
 
@@ -189,7 +203,7 @@ public final class CowEngine {
             }
 
             if (type == NodePtr.PREFIX) {
-                MemorySegment prefSeg = slab.resolve(node);
+                MemorySegment prefSeg = resolveAny(node);
                 int prefLen = PrefixNode.count(prefSeg);
                 int matched = PrefixNode.matchKey(prefSeg, key, keyLen, depth);
                 if (matched < prefLen) {
@@ -264,7 +278,7 @@ public final class CowEngine {
 
             if (type == NodePtr.NODE_256) {
                 // Per-subtree CAS on this Node256's child slot
-                MemorySegment seg = slab.resolve(oldNode);
+                MemorySegment seg = resolveAny(oldNode);
                 long childOffset = Node256.childOffset(kb);
                 // Expected value: the original child at this slot
                 long expected = (i + 1 < path.depth)
@@ -337,7 +351,7 @@ public final class CowEngine {
 
             if (type == NodePtr.NODE_256) {
                 // Per-subtree CAS
-                MemorySegment seg = slab.resolve(oldNode);
+                MemorySegment seg = resolveAny(oldNode);
                 long childOffset = Node256.childOffset(kb);
                 long expected = (i + 1 < path.depth)
                     ? path.nodePtrs[i + 1]
@@ -380,35 +394,35 @@ public final class CowEngine {
 
     private long cowNodeReplaceChild(long oldNodePtr, int type, byte keyByte,
                                      long newChild) {
-        MemorySegment oldSeg = slab.resolve(oldNodePtr);
+        MemorySegment oldSeg = resolveAny(oldNodePtr);
         return switch (type) {
             case NodePtr.PREFIX -> {
-                long newPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-                MemorySegment newSeg = slab.resolve(newPtr);
+                long newPtr = cowAlloc(prefixClassId, NodePtr.PREFIX);
+                MemorySegment newSeg = resolveAny(newPtr);
                 PrefixNode.cowWithChild(newSeg, oldSeg, newChild);
                 yield newPtr;
             }
             case NodePtr.NODE_4 -> {
-                long newPtr = slab.allocate(node4ClassId, NodePtr.NODE_4);
-                MemorySegment newSeg = slab.resolve(newPtr);
+                long newPtr = cowAlloc(node4ClassId, NodePtr.NODE_4);
+                MemorySegment newSeg = resolveAny(newPtr);
                 Node4.cowReplaceChild(newSeg, oldSeg, keyByte, newChild);
                 yield newPtr;
             }
             case NodePtr.NODE_16 -> {
-                long newPtr = slab.allocate(node16ClassId, NodePtr.NODE_16);
-                MemorySegment newSeg = slab.resolve(newPtr);
+                long newPtr = cowAlloc(node16ClassId, NodePtr.NODE_16);
+                MemorySegment newSeg = resolveAny(newPtr);
                 Node16.cowReplaceChild(newSeg, oldSeg, keyByte, newChild);
                 yield newPtr;
             }
             case NodePtr.NODE_48 -> {
-                long newPtr = slab.allocate(node48ClassId, NodePtr.NODE_48);
-                MemorySegment newSeg = slab.resolve(newPtr);
+                long newPtr = cowAlloc(node48ClassId, NodePtr.NODE_48);
+                MemorySegment newSeg = resolveAny(newPtr);
                 Node48.cowReplaceChild(newSeg, oldSeg, keyByte, newChild);
                 yield newPtr;
             }
             case NodePtr.NODE_256 -> {
-                long newPtr = slab.allocate(node256ClassId, NodePtr.NODE_256);
-                MemorySegment newSeg = slab.resolve(newPtr);
+                long newPtr = cowAlloc(node256ClassId, NodePtr.NODE_256);
+                MemorySegment newSeg = resolveAny(newPtr);
                 Node256.cowReplaceChild(newSeg, oldSeg, keyByte, newChild);
                 yield newPtr;
             }
@@ -421,52 +435,52 @@ public final class CowEngine {
      */
     private long cowNodeInsertChild(long oldNodePtr, int type, byte keyByte,
                                     long childPtr) {
-        MemorySegment oldSeg = slab.resolve(oldNodePtr);
+        MemorySegment oldSeg = resolveAny(oldNodePtr);
         return switch (type) {
             case NodePtr.NODE_4 -> {
                 if (Node4.isFull(oldSeg)) {
                     // Grow to Node16
-                    long newPtr = slab.allocate(node16ClassId, NodePtr.NODE_16);
-                    MemorySegment newSeg = slab.resolve(newPtr);
+                    long newPtr = cowAlloc(node16ClassId, NodePtr.NODE_16);
+                    MemorySegment newSeg = resolveAny(newPtr);
                     Node16.init(newSeg);
                     Node4.growToNode16(newSeg, oldSeg, keyByte, childPtr);
                     yield newPtr;
                 }
-                long newPtr = slab.allocate(node4ClassId, NodePtr.NODE_4);
-                MemorySegment newSeg = slab.resolve(newPtr);
+                long newPtr = cowAlloc(node4ClassId, NodePtr.NODE_4);
+                MemorySegment newSeg = resolveAny(newPtr);
                 Node4.cowInsertChild(newSeg, oldSeg, keyByte, childPtr);
                 yield newPtr;
             }
             case NodePtr.NODE_16 -> {
                 if (Node16.isFull(oldSeg)) {
-                    long newPtr = slab.allocate(node48ClassId, NodePtr.NODE_48);
-                    MemorySegment newSeg = slab.resolve(newPtr);
+                    long newPtr = cowAlloc(node48ClassId, NodePtr.NODE_48);
+                    MemorySegment newSeg = resolveAny(newPtr);
                     Node48.init(newSeg);
                     Node16.growToNode48(newSeg, oldSeg, keyByte, childPtr);
                     yield newPtr;
                 }
-                long newPtr = slab.allocate(node16ClassId, NodePtr.NODE_16);
-                MemorySegment newSeg = slab.resolve(newPtr);
+                long newPtr = cowAlloc(node16ClassId, NodePtr.NODE_16);
+                MemorySegment newSeg = resolveAny(newPtr);
                 Node16.cowInsertChild(newSeg, oldSeg, keyByte, childPtr);
                 yield newPtr;
             }
             case NodePtr.NODE_48 -> {
                 if (Node48.isFull(oldSeg)) {
-                    long newPtr = slab.allocate(node256ClassId, NodePtr.NODE_256);
-                    MemorySegment newSeg = slab.resolve(newPtr);
+                    long newPtr = cowAlloc(node256ClassId, NodePtr.NODE_256);
+                    MemorySegment newSeg = resolveAny(newPtr);
                     Node256.init(newSeg);
                     Node48.growToNode256(newSeg, oldSeg, keyByte, childPtr);
                     yield newPtr;
                 }
-                long newPtr = slab.allocate(node48ClassId, NodePtr.NODE_48);
-                MemorySegment newSeg = slab.resolve(newPtr);
+                long newPtr = cowAlloc(node48ClassId, NodePtr.NODE_48);
+                MemorySegment newSeg = resolveAny(newPtr);
                 Node48.cowInsertChild(newSeg, oldSeg, keyByte, childPtr);
                 yield newPtr;
             }
             case NodePtr.NODE_256 -> {
                 // Node256 never grows — just insert
-                long newPtr = slab.allocate(node256ClassId, NodePtr.NODE_256);
-                MemorySegment newSeg = slab.resolve(newPtr);
+                long newPtr = cowAlloc(node256ClassId, NodePtr.NODE_256);
+                MemorySegment newSeg = resolveAny(newPtr);
                 Node256.cowInsertChild(newSeg, oldSeg, keyByte, childPtr);
                 yield newPtr;
             }
@@ -478,7 +492,7 @@ public final class CowEngine {
      * COW remove a child from an inner node. Handles shrink and collapse.
      */
     private long cowNodeAfterRemoval(long oldNodePtr, int type, byte keyByte) {
-        MemorySegment oldSeg = slab.resolve(oldNodePtr);
+        MemorySegment oldSeg = resolveAny(oldNodePtr);
         int count = nodeCount(oldSeg, type);
 
         // Remove child
@@ -497,15 +511,15 @@ public final class CowEngine {
                     long collapsed = cowCollapseSingleChild(oldSeg, type, keyByte);
                     yield collapsed;
                 }
-                long newPtr = slab.allocate(node4ClassId, NodePtr.NODE_4);
-                MemorySegment newSeg = slab.resolve(newPtr);
+                long newPtr = cowAlloc(node4ClassId, NodePtr.NODE_4);
+                MemorySegment newSeg = resolveAny(newPtr);
                 Node4.cowRemoveChild(newSeg, oldSeg, keyByte);
                 yield newPtr;
             }
             case NodePtr.NODE_16 -> {
                 if (newCount <= NodeConstants.NODE16_SHRINK_THRESHOLD) {
-                    long newPtr = slab.allocate(node4ClassId, NodePtr.NODE_4);
-                    MemorySegment newSeg = slab.resolve(newPtr);
+                    long newPtr = cowAlloc(node4ClassId, NodePtr.NODE_4);
+                    MemorySegment newSeg = resolveAny(newPtr);
                     Node4.init(newSeg);
                     // Copy all children except the removed one
                     int n = Node16.count(oldSeg);
@@ -517,38 +531,38 @@ public final class CowEngine {
                     }
                     yield newPtr;
                 }
-                long newPtr = slab.allocate(node16ClassId, NodePtr.NODE_16);
-                MemorySegment newSeg = slab.resolve(newPtr);
+                long newPtr = cowAlloc(node16ClassId, NodePtr.NODE_16);
+                MemorySegment newSeg = resolveAny(newPtr);
                 Node16.cowRemoveChild(newSeg, oldSeg, keyByte);
                 yield newPtr;
             }
             case NodePtr.NODE_48 -> {
                 if (newCount <= NodeConstants.NODE48_SHRINK_THRESHOLD) {
-                    long newPtr = slab.allocate(node16ClassId, NodePtr.NODE_16);
-                    MemorySegment newSeg = slab.resolve(newPtr);
+                    long newPtr = cowAlloc(node16ClassId, NodePtr.NODE_16);
+                    MemorySegment newSeg = resolveAny(newPtr);
                     Node16.init(newSeg);
                     Node48.forEach(oldSeg, (k, c) -> {
                         if (k != keyByte) Node16.insertChild(newSeg, k, c);
                     });
                     yield newPtr;
                 }
-                long newPtr = slab.allocate(node48ClassId, NodePtr.NODE_48);
-                MemorySegment newSeg = slab.resolve(newPtr);
+                long newPtr = cowAlloc(node48ClassId, NodePtr.NODE_48);
+                MemorySegment newSeg = resolveAny(newPtr);
                 Node48.cowRemoveChild(newSeg, oldSeg, keyByte);
                 yield newPtr;
             }
             case NodePtr.NODE_256 -> {
                 if (newCount <= NodeConstants.NODE256_SHRINK_THRESHOLD) {
-                    long newPtr = slab.allocate(node48ClassId, NodePtr.NODE_48);
-                    MemorySegment newSeg = slab.resolve(newPtr);
+                    long newPtr = cowAlloc(node48ClassId, NodePtr.NODE_48);
+                    MemorySegment newSeg = resolveAny(newPtr);
                     Node48.init(newSeg);
                     Node256.forEach(oldSeg, (k, c) -> {
                         if (k != keyByte) Node48.insertChild(newSeg, k, c);
                     });
                     yield newPtr;
                 }
-                long newPtr = slab.allocate(node256ClassId, NodePtr.NODE_256);
-                MemorySegment newSeg = slab.resolve(newPtr);
+                long newPtr = cowAlloc(node256ClassId, NodePtr.NODE_256);
+                MemorySegment newSeg = resolveAny(newPtr);
                 Node256.cowRemoveChild(newSeg, oldSeg, keyByte);
                 yield newPtr;
             }
@@ -580,7 +594,7 @@ public final class CowEngine {
 
         // Wrap in prefix
         if (NodePtr.nodeType(child) == NodePtr.PREFIX) {
-            MemorySegment childPrefSeg = slab.resolve(child);
+            MemorySegment childPrefSeg = resolveAny(child);
             int childPrefLen = PrefixNode.count(childPrefSeg);
             byte[] m = new byte[1 + childPrefLen];
             m[0] = keyByte;
@@ -592,8 +606,8 @@ public final class CowEngine {
             return wrapInPrefixBytes(m, 0, m.length, grandChild);
         }
 
-        long prefPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-        MemorySegment prefSeg = slab.resolve(prefPtr);
+        long prefPtr = cowAlloc(prefixClassId, NodePtr.PREFIX);
+        MemorySegment prefSeg = resolveAny(prefPtr);
         PrefixNode.init(prefSeg, new byte[]{keyByte}, 0, 1, child);
         return prefPtr;
     }
@@ -606,7 +620,7 @@ public final class CowEngine {
 
     private SubtreeResult cowExpandLeaf(long existingLeafPtr, MemorySegment newKey,
                                         int newKeyLen, int depth, int leafClass) {
-        MemorySegment existingKey = slab.resolve(existingLeafPtr, keyLen);
+        MemorySegment existingKey = resolveAny(existingLeafPtr, keyLen);
 
         int mismatch = depth;
         while (mismatch < newKeyLen &&
@@ -621,8 +635,8 @@ public final class CowEngine {
 
         long newLeafPtr = allocateLeaf(newKey, newKeyLen, leafClass);
 
-        long n4Ptr = slab.allocate(node4ClassId, NodePtr.NODE_4);
-        MemorySegment n4Seg = slab.resolve(n4Ptr);
+        long n4Ptr = cowAlloc(node4ClassId, NodePtr.NODE_4);
+        MemorySegment n4Seg = resolveAny(n4Ptr);
         Node4.init(n4Seg);
 
         byte existingByte = existingKey.get(ValueLayout.JAVA_BYTE, mismatch);
@@ -646,8 +660,8 @@ public final class CowEngine {
 
         long newLeafPtr = allocateLeaf(key, keyLen, leafClass);
 
-        long n4Ptr = slab.allocate(node4ClassId, NodePtr.NODE_4);
-        MemorySegment n4Seg = slab.resolve(n4Ptr);
+        long n4Ptr = cowAlloc(node4ClassId, NodePtr.NODE_4);
+        MemorySegment n4Seg = resolveAny(n4Ptr);
         Node4.init(n4Seg);
 
         byte existingByte = PrefixNode.keyAt(prefSeg, matchedCount);
@@ -656,8 +670,8 @@ public final class CowEngine {
         long existingChild;
         int remainingPrefixLen = prefLen - matchedCount - 1;
         if (remainingPrefixLen > 0) {
-            long newPrefPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-            MemorySegment newPrefSeg = slab.resolve(newPrefPtr);
+            long newPrefPtr = cowAlloc(prefixClassId, NodePtr.PREFIX);
+            MemorySegment newPrefSeg = resolveAny(newPrefPtr);
             byte[] remaining = new byte[remainingPrefixLen];
             for (int i = 0; i < remainingPrefixLen; i++) {
                 remaining[i] = PrefixNode.keyAt(prefSeg, matchedCount + 1 + i);
@@ -678,8 +692,8 @@ public final class CowEngine {
 
         long subtree;
         if (matchedCount > 0) {
-            long wrapPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-            MemorySegment wrapSeg = slab.resolve(wrapPtr);
+            long wrapPtr = cowAlloc(prefixClassId, NodePtr.PREFIX);
+            MemorySegment wrapSeg = resolveAny(wrapPtr);
             byte[] shared = new byte[matchedCount];
             for (int i = 0; i < matchedCount; i++) {
                 shared[i] = key.get(ValueLayout.JAVA_BYTE, depth + i);
@@ -693,16 +707,16 @@ public final class CowEngine {
     }
 
     private long cowPrefixWithChild(long oldPrefixPtr, long newChild) {
-        long newPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-        MemorySegment newSeg = slab.resolve(newPtr);
-        MemorySegment oldSeg = slab.resolve(oldPrefixPtr);
+        long newPtr = cowAlloc(prefixClassId, NodePtr.PREFIX);
+        MemorySegment newSeg = resolveAny(newPtr);
+        MemorySegment oldSeg = resolveAny(oldPrefixPtr);
         PrefixNode.cowWithChild(newSeg, oldSeg, newChild);
         return newPtr;
     }
 
     private long cowMergePrefixes(long outerPtr, long innerPtr) {
-        MemorySegment outerSeg = slab.resolve(outerPtr);
-        MemorySegment innerSeg = slab.resolve(innerPtr);
+        MemorySegment outerSeg = resolveAny(outerPtr);
+        MemorySegment innerSeg = resolveAny(innerPtr);
         int outerLen = PrefixNode.count(outerSeg);
         int innerLen = PrefixNode.count(innerSeg);
         long innerChild = PrefixNode.child(innerSeg);
@@ -716,11 +730,68 @@ public final class CowEngine {
     }
 
     // -----------------------------------------------------------------------
+    // Allocation and resolution (dispatch between arena and slab)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Allocate a new node. When a WriterArena is available, allocation goes to
+     * the arena (contiguous pages for shadow-paging durability). Otherwise,
+     * allocation goes to the shared SlabAllocator.
+     *
+     * @return the NodePtr for the new node
+     */
+    private long cowAlloc(int classId, int nodeType) {
+        if (arena != null) {
+            return arena.alloc(slab.segmentSize(classId), nodeType, classId).nodePtr();
+        }
+        return slab.allocate(classId, nodeType);
+    }
+
+    /** Allocate a node and return a writable segment for it. */
+    private MemorySegment cowAllocSeg(int classId, int nodeType) {
+        if (arena != null) {
+            return arena.alloc(slab.segmentSize(classId), nodeType, classId).segment();
+        }
+        long ptr = slab.allocate(classId, nodeType);
+        return resolveAny(ptr);
+    }
+
+    /** Allocate a leaf node with a specific leaf class. */
+    private long cowAllocLeaf(int leafClass) {
+        int classId = leafClassIds[leafClass];
+        if (arena != null) {
+            return arena.alloc(slab.segmentSize(classId), NodePtr.LEAF, classId).nodePtr();
+        }
+        return slab.allocate(classId);
+    }
+
+    /**
+     * Resolve any NodePtr (slab-allocated or arena-allocated) to a MemorySegment.
+     */
+    private MemorySegment resolveAny(long ptr) {
+        if (arena != null && WriterArena.isArenaAllocated(ptr)) {
+            int classId = NodePtr.slabClassId(ptr);
+            return WriterArena.resolve(chunkStore, ptr, slab.segmentSize(classId));
+        }
+        return slab.resolve(ptr);
+    }
+
+    /**
+     * Resolve any NodePtr with an explicit length.
+     */
+    private MemorySegment resolveAny(long ptr, int length) {
+        if (arena != null && WriterArena.isArenaAllocated(ptr)) {
+            return WriterArena.resolve(chunkStore, ptr, length);
+        }
+        return slab.resolve(ptr, length);
+    }
+
+    // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
 
     private long findChild(long nodePtr, int type, byte keyByte) {
-        MemorySegment seg = slab.resolve(nodePtr);
+        MemorySegment seg = resolveAny(nodePtr);
         return switch (type) {
             case NodePtr.NODE_4 -> Node4.findChild(seg, keyByte);
             case NodePtr.NODE_16 -> Node16.findChild(seg, keyByte);
@@ -742,13 +813,13 @@ public final class CowEngine {
 
     private boolean leafKeyMatches(long leafPtr, MemorySegment key, int keyLen) {
         if (keyLen != this.keyLen) return false;
-        MemorySegment leafKey = slab.resolve(leafPtr, this.keyLen);
+        MemorySegment leafKey = resolveAny(leafPtr, this.keyLen);
         return leafKey.mismatch(key.asSlice(0, this.keyLen)) == -1;
     }
 
     private long allocateLeaf(MemorySegment key, int keyLen, int leafClass) {
-        long ptr = slab.allocate(leafClassIds[leafClass]);
-        MemorySegment seg = slab.resolve(ptr);
+        long ptr = cowAllocLeaf(leafClass);
+        MemorySegment seg = resolveAny(ptr);
         MemorySegment.copy(key, 0, seg, 0, this.keyLen);
         seg.asSlice(this.keyLen).fill((byte) 0);
         return ptr;
@@ -758,8 +829,8 @@ public final class CowEngine {
         if (from >= to) return child;
         int len = to - from;
         if (len <= NodeConstants.PREFIX_CAPACITY) {
-            long prefPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-            MemorySegment prefSeg = slab.resolve(prefPtr);
+            long prefPtr = cowAlloc(prefixClassId, NodePtr.PREFIX);
+            MemorySegment prefSeg = resolveAny(prefPtr);
             PrefixNode.init(prefSeg, key, from, len, child);
             return prefPtr;
         }
@@ -769,8 +840,8 @@ public final class CowEngine {
         while (pos > from) {
             int chunkLen = Math.min(pos - from, NodeConstants.PREFIX_CAPACITY);
             int chunkStart = pos - chunkLen;
-            long prefPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-            MemorySegment prefSeg = slab.resolve(prefPtr);
+            long prefPtr = cowAlloc(prefixClassId, NodePtr.PREFIX);
+            MemorySegment prefSeg = resolveAny(prefPtr);
             PrefixNode.init(prefSeg, key, chunkStart, chunkLen, current);
             current = prefPtr;
             pos = chunkStart;
@@ -782,8 +853,8 @@ public final class CowEngine {
         if (from >= to) return child;
         int len = to - from;
         if (len <= NodeConstants.PREFIX_CAPACITY) {
-            long prefPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-            MemorySegment prefSeg = slab.resolve(prefPtr);
+            long prefPtr = cowAlloc(prefixClassId, NodePtr.PREFIX);
+            MemorySegment prefSeg = resolveAny(prefPtr);
             PrefixNode.init(prefSeg, key, from, len, child);
             return prefPtr;
         }
@@ -792,8 +863,8 @@ public final class CowEngine {
         while (pos > from) {
             int chunkLen = Math.min(pos - from, NodeConstants.PREFIX_CAPACITY);
             int chunkStart = pos - chunkLen;
-            long prefPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-            MemorySegment prefSeg = slab.resolve(prefPtr);
+            long prefPtr = cowAlloc(prefixClassId, NodePtr.PREFIX);
+            MemorySegment prefSeg = resolveAny(prefPtr);
             PrefixNode.init(prefSeg, key, chunkStart, chunkLen, current);
             current = prefPtr;
             pos = chunkStart;

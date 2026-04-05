@@ -32,12 +32,8 @@ pitest {
     mutationThreshold = 75  // fail build if mutation score drops below 75%
 
     // Exclude Preallocator (platform-specific native calls, not meaningfully mutable)
-    // Exclude CowPath (superseded by CowEngine's internal PathStack, retained for future use)
-    // Exclude PublicationState (trivial record with no logic)
     excludedClasses = setOf(
-        "org.taotree.internal.Preallocator",
-        "org.taotree.internal.CowPath",
-        "org.taotree.internal.PublicationState"
+        "org.taotree.internal.Preallocator"
     )
 
     // Exclude Lincheck stress tests — they test concurrency, not code paths,

@@ -21,6 +21,7 @@ public final class Compactor {
     private final SlabAllocator slab;
     private final BumpAllocator bump;
     private final EpochReclaimer reclaimer;
+    private final ChunkStore chunkStore; // null if no arena pointers to resolve
 
     // Node slab class IDs (same as the tree's)
     private final int prefixClassId;
@@ -37,9 +38,20 @@ public final class Compactor {
                      int prefixClassId, int node4ClassId, int node16ClassId,
                      int node48ClassId, int node256ClassId,
                      int keyLen, int keySlotSize, int[] leafClassIds, int[] leafValueSizes) {
+        this(slab, bump, reclaimer, null,
+             prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
+             keyLen, keySlotSize, leafClassIds, leafValueSizes);
+    }
+
+    public Compactor(SlabAllocator slab, BumpAllocator bump, EpochReclaimer reclaimer,
+                     ChunkStore chunkStore,
+                     int prefixClassId, int node4ClassId, int node16ClassId,
+                     int node48ClassId, int node256ClassId,
+                     int keyLen, int keySlotSize, int[] leafClassIds, int[] leafValueSizes) {
         this.slab = slab;
         this.bump = bump;
         this.reclaimer = reclaimer;
+        this.chunkStore = chunkStore;
         this.prefixClassId = prefixClassId;
         this.node4ClassId = node4ClassId;
         this.node16ClassId = node16ClassId;
@@ -84,6 +96,15 @@ public final class Compactor {
     // Recursive post-order traversal
     // -----------------------------------------------------------------------
 
+    /** Resolve a pointer that may be slab-allocated or arena-allocated. */
+    private MemorySegment resolveAny(long ptr) {
+        if (chunkStore != null && WriterArena.isArenaAllocated(ptr)) {
+            int classId = NodePtr.slabClassId(ptr);
+            return WriterArena.resolve(chunkStore, ptr, slab.segmentSize(classId));
+        }
+        return slab.resolve(ptr);
+    }
+
     private long compactNode(long nodePtr, long[] count) {
         if (NodePtr.isEmpty(nodePtr)) return NodePtr.EMPTY_PTR;
         int type = NodePtr.nodeType(nodePtr);
@@ -96,7 +117,7 @@ public final class Compactor {
 
         // Prefix node: compact child first (post-order), then copy prefix
         if (type == NodePtr.PREFIX) {
-            MemorySegment seg = slab.resolve(nodePtr);
+            MemorySegment seg = resolveAny(nodePtr);
             long child = PrefixNode.child(seg);
             long newChild = compactNode(child, count);
             // Allocate new prefix with the compacted child
@@ -107,7 +128,7 @@ public final class Compactor {
         }
 
         // Inner node: compact all children first (post-order), then copy this node
-        MemorySegment seg = slab.resolve(nodePtr);
+        MemorySegment seg = resolveAny(nodePtr);
         return switch (type) {
             case NodePtr.NODE_4   -> compactNode4(seg, count);
             case NodePtr.NODE_16  -> compactNode16(seg, count);
@@ -132,7 +153,7 @@ public final class Compactor {
         int classId = NodePtr.slabClassId(oldPtr);
         int nodeType = NodePtr.nodeType(oldPtr);
         int segSize = slab.segmentSize(classId);
-        MemorySegment oldSeg = slab.resolve(oldPtr);
+        MemorySegment oldSeg = resolveAny(oldPtr);
         long newPtr = slab.allocate(classId, nodeType);
         MemorySegment newSeg = slab.resolve(newPtr);
         MemorySegment.copy(oldSeg, 0, newSeg, 0, segSize);

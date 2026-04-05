@@ -24,7 +24,7 @@
 
 - Public API: `org.taotree` package — `TaoTree`, `KeyLayout`, `LeafLayout`, `KeyHandle`, `LeafHandle`, `LeafAccessor`, `KeyBuilder`, `QueryBuilder`, `LeafVisitor`, `KeyField`, `LeafField`, `TaoDictionary`, `TaoString`, `TaoKey`
 - Internal: `org.taotree.internal` — `SlabAllocator`, `BumpAllocator`, `ChunkStore`, `Node4/16/48/256`, `PrefixNode`, `NodePtr`, `OverflowPtr`, `Superblock`, `Preallocator`
-- Internal (v2 COW): `CowEngine`, `EpochReclaimer`, `PublicationState`, `WriterArena`, `CowPath`, `CheckpointV2`, `RecordHeader`, `CommitRecord`
+- Internal (v2 COW): `CowEngine`, `EpochReclaimer`, `WriterArena`, `CheckpointV2`, `RecordHeader`, `CommitRecord`, `ShadowPagingRecovery`, `Compactor`
 
 ## API Patterns
 

@@ -8,13 +8,20 @@ import org.taotree.internal.Node48;
 import org.taotree.internal.Node256;
 import org.taotree.internal.NodeConstants;
 import org.taotree.internal.BumpAllocator;
+import org.taotree.internal.CheckpointIO;
+import org.taotree.internal.CheckpointV2;
 import org.taotree.internal.ChunkStore;
+import org.taotree.internal.CommitRecord;
+import org.taotree.internal.Compactor;
 import org.taotree.internal.CowEngine;
 import org.taotree.internal.EpochReclaimer;
 import org.taotree.internal.Preallocator;
 import org.taotree.internal.PrefixNode;
+import org.taotree.internal.RecordHeader;
+import org.taotree.internal.ShadowPagingRecovery;
 import org.taotree.internal.SlabAllocator;
 import org.taotree.internal.Superblock;
+import org.taotree.internal.WriterArena;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -80,6 +87,19 @@ public final class TaoTree implements AutoCloseable {
     private final ReentrantReadWriteLock lock;
     private final boolean ownsArena;
     private final ChunkStore chunkStore; // null for in-memory mode
+
+    // -- V2 checkpoint state (file-backed mode) --
+    private long checkpointGeneration;  // monotonically increasing generation (shared by checkpoints + commits)
+    private int activeSlotPage = CheckpointV2.SLOT_A_PAGE; // which checkpoint slot was last written
+    private boolean v2Format;           // true if using v2 checkpoint format
+
+    // -- V2 commit record state (shadow paging) --
+    private int nextCommitPage = -1;    // pre-reserved page for the next commit record (-1 = none)
+    private int prevCommitPage;         // page of the previous commit record (for backward linkage)
+    private int commitsSinceCheckpoint; // count since last full checkpoint
+
+    /** How many commit records between full checkpoints. */
+    private static final int COMMITS_PER_CHECKPOINT = 64;
 
     /** Package-private: provides overflow storage for {@link TaoString}. */
     BumpAllocator bump() { return bump; }
@@ -877,22 +897,23 @@ public final class TaoTree implements AutoCloseable {
                                             int[] leafValueSizes,
                                             long chunkSize, boolean preallocate) throws IOException {
         var arena = Arena.ofShared();
-        var cs = ChunkStore.create(path, arena, chunkSize, preallocate);
+        var cs = ChunkStore.createV2(path, arena, chunkSize, preallocate);
         var slab = new SlabAllocator(arena, cs, slabSize);
         var bump = new BumpAllocator(arena, cs, BumpAllocator.DEFAULT_PAGE_SIZE);
 
         var tree = new TaoTree(arena, slab, bump, cs, keyLen, leafValueSizes);
-        // Write initial superblock
-        tree.writeSuperblock();
+        tree.v2Format = true;
+        // Write initial v2 checkpoint to slot A
+        tree.writeCheckpointV2();
+        // Reserve a page for the first commit record (at nextPage, so recovery finds it)
+        tree.reserveNextCommitPage();
         return tree;
     }
 
     private static TaoTree openFileBacked(Path path) throws IOException {
         var arena = Arena.ofShared();
 
-        // First pass: open chunk store with minimal info to read the superblock
-        // We need totalPages and nextPage to remap chunks, but those are IN the superblock.
-        // Approach: open with file size to determine totalPages, read superblock, then finalize.
+        // First pass: open chunk store to read the metadata header.
         var channel = java.nio.channels.FileChannel.open(path,
             java.nio.file.StandardOpenOption.READ,
             java.nio.file.StandardOpenOption.WRITE);
@@ -900,24 +921,78 @@ public final class TaoTree implements AutoCloseable {
         channel.close();
 
         if (fileSize < 2L * ChunkStore.PAGE_SIZE) {
-            throw new IOException("File too small to contain a superblock: " + path);
+            throw new IOException("File too small to contain metadata: " + path);
         }
 
-        // Compute totalPages and open chunk store
         int totalPages = (int) (fileSize / ChunkStore.PAGE_SIZE);
-        // We don't know nextPage yet — read it from superblock
-        // Open with totalPages, nextPage=totalPages (conservative)
         var cs = ChunkStore.open(path, arena, ChunkStore.DEFAULT_CHUNK_SIZE, totalPages, totalPages);
 
-        // Read superblock
-        MemorySegment sb = cs.superblock();
-        var data = Superblock.read(sb);
+        // Detect format: v2 has RecordHeader.MAGIC_V2 at page 0 offset 0
+        MemorySegment page0 = cs.resolvePage(0);
+        long magic = page0.get(ValueLayout.JAVA_LONG_UNALIGNED, 0);
 
-        // Update ChunkStore with actual nextPage (we opened with totalPages as conservative value)
-        // The ChunkStore already has all chunks mapped, so we just need allocations to resume
-        // at the right position. We'll create a new ChunkStore with the correct nextPage.
+        Superblock.SuperblockData data;
+        boolean isV2;
+        long cpGeneration = 0;
+        int cpActiveSlot = CheckpointV2.SLOT_A_PAGE;
+        int recoveredNextPage;
+
+        if (magic == RecordHeader.MAGIC_V2) {
+            // v2 checkpoint format
+            isV2 = true;
+            MemorySegment slotA = cs.checkpointSlotA();
+            MemorySegment slotB = cs.checkpointSlotB();
+            var cp = CheckpointV2.chooseBest(slotA, slotB);
+            if (cp == null) {
+                throw new IOException("No valid v2 checkpoint found in " + path);
+            }
+            data = CheckpointIO.fromCheckpoint(cp);
+            cpGeneration = cp.generation;
+            cpActiveSlot = (cp.slotId == 0)
+                ? CheckpointV2.SLOT_A_PAGE
+                : CheckpointV2.SLOT_B_PAGE;
+
+            // Scan forward for commit records written since this checkpoint
+            var recovered = ShadowPagingRecovery.recover(
+                cs,
+                cpGeneration,
+                data.trees.length > 0 ? data.trees[0].root : NodePtr.EMPTY_PTR,
+                data.trees.length > 0 ? data.trees[0].size : 0,
+                data.dicts.length,
+                dictRootsFromData(data),
+                dictNextCodesFromData(data),
+                dictSizesFromData(data),
+                data.nextPage,
+                totalPages);
+
+            // Apply recovered state (may update root, size, dict state, nextPage)
+            if (recovered.generation > cpGeneration) {
+                if (data.trees.length > 0) {
+                    data.trees[0].root = recovered.primaryRoot;
+                    data.trees[0].size = recovered.primarySize;
+                }
+                for (int i = 0; i < Math.min(recovered.dictionaryCount, data.dicts.length); i++) {
+                    // Dict tree state is at trees[1+i]
+                    if (1 + i < data.trees.length) {
+                        data.trees[1 + i].root = recovered.dictRoots[i];
+                        data.trees[1 + i].size = recovered.dictSizes[i];
+                    }
+                }
+                cpGeneration = recovered.generation;
+            }
+            recoveredNextPage = recovered.nextPage;
+        } else {
+            // v1 superblock format
+            isV2 = false;
+            MemorySegment sb = cs.superblock();
+            data = Superblock.read(sb);
+            recoveredNextPage = data.nextPage;
+        }
+
+        // Reopen ChunkStore with the correct nextPage (from checkpoint or recovery)
         cs.close();
-        cs = ChunkStore.open(path, arena, data.chunkSize, data.totalPages, data.nextPage);
+        cs = ChunkStore.open(path, arena, data.chunkSize,
+            Math.max(data.totalPages, recoveredNextPage), recoveredNextPage);
 
         // Restore allocators
         var slab = new SlabAllocator(arena, cs, data.slabSize);
@@ -936,10 +1011,13 @@ public final class TaoTree implements AutoCloseable {
 
         // Restore the primary tree (index 0 in tree descriptors)
         if (data.trees.length == 0) {
-            throw new IOException("No tree descriptors found in superblock");
+            throw new IOException("No tree descriptors found in metadata");
         }
         var treeDesc = data.trees[0];
         var tree = new TaoTree(arena, slab, bump, cs, treeDesc);
+        tree.v2Format = isV2;
+        tree.checkpointGeneration = cpGeneration;
+        tree.activeSlotPage = cpActiveSlot;
 
         // Restore dictionaries
         for (var dictDesc : data.dicts) {
@@ -949,7 +1027,45 @@ public final class TaoTree implements AutoCloseable {
             tree.dicts.add(dict);
         }
 
+        // For v2 format, reserve the next commit record page for shadow paging
+        if (isV2) {
+            tree.reserveNextCommitPage();
+        }
+
         return tree;
+    }
+
+    // -----------------------------------------------------------------------
+    // Recovery helpers
+    // -----------------------------------------------------------------------
+
+    /** Extract dict roots from superblock data for recovery. */
+    private static long[] dictRootsFromData(Superblock.SuperblockData data) {
+        long[] roots = new long[data.dicts.length];
+        for (int i = 0; i < data.dicts.length; i++) {
+            int treeIdx = data.dicts[i].treeIndex;
+            roots[i] = treeIdx < data.trees.length ? data.trees[treeIdx].root : 0;
+        }
+        return roots;
+    }
+
+    /** Extract dict next codes from superblock data for recovery. */
+    private static long[] dictNextCodesFromData(Superblock.SuperblockData data) {
+        long[] codes = new long[data.dicts.length];
+        for (int i = 0; i < data.dicts.length; i++) {
+            codes[i] = data.dicts[i].nextCode;
+        }
+        return codes;
+    }
+
+    /** Extract dict sizes from superblock data for recovery. */
+    private static long[] dictSizesFromData(Superblock.SuperblockData data) {
+        long[] sizes = new long[data.dicts.length];
+        for (int i = 0; i < data.dicts.length; i++) {
+            int treeIdx = data.dicts[i].treeIndex;
+            sizes[i] = treeIdx < data.trees.length ? data.trees[treeIdx].size : 0;
+        }
+        return sizes;
     }
 
     // -----------------------------------------------------------------------
@@ -1064,9 +1180,18 @@ public final class TaoTree implements AutoCloseable {
     public void activateCowMode() {
         if (cowMode) return;
         reclaimer = new EpochReclaimer(slab);
-        cowEngine = new CowEngine(slab, reclaimer,
-            prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
-            keyLen, keySlotSize, leafClassIds);
+        if (chunkStore != null) {
+            // File-backed: use WriterArena for contiguous COW allocations
+            var writerArena = new WriterArena(chunkStore);
+            cowEngine = new CowEngine(slab, reclaimer, writerArena, chunkStore,
+                prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
+                keyLen, keySlotSize, leafClassIds);
+        } else {
+            // In-memory: allocate from slab (no arena needed)
+            cowEngine = new CowEngine(slab, reclaimer,
+                prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
+                keyLen, keySlotSize, leafClassIds);
+        }
         // Sync root and size to the atomic versions
         ROOT_HANDLE.setRelease(this, root);
         atomicSize.set(size);
@@ -1099,7 +1224,7 @@ public final class TaoTree implements AutoCloseable {
             }
 
             if (type == NodePtr.PREFIX) {
-                MemorySegment prefSeg = slab.resolve(node);
+                MemorySegment prefSeg = resolveNode(node);
                 int prefLen = PrefixNode.count(prefSeg);
                 int matched = PrefixNode.matchKey(prefSeg, key, keyLen, depth);
                 if (matched < prefLen) {
@@ -1224,6 +1349,58 @@ public final class TaoTree implements AutoCloseable {
         finally { lock.readLock().unlock(); }
     }
 
+    /**
+     * Compact the tree: walk all live nodes in post-order, copy into packed
+     * slab layout, publish the new root, write a full checkpoint, and advance
+     * {@code durableGeneration} to enable reclamation of old arena pages.
+     *
+     * <p>This is a blocking operation that acquires the write lock. In COW mode,
+     * readers remain lock-free during compaction — they see the old tree until
+     * the new root is published.
+     *
+     * @throws IOException if an I/O error occurs during checkpoint write
+     */
+    public void compact() throws IOException {
+        if (chunkStore == null) return;
+        lock.writeLock().lock();
+        try {
+            long currentRoot = cowMode ? (long) ROOT_HANDLE.getAcquire(this) : root;
+            if (NodePtr.isEmpty(currentRoot)) return;
+
+            var compactor = new Compactor(slab, bump, reclaimer, chunkStore,
+                prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
+                keyLen, keySlotSize, leafClassIds, leafValueSizes);
+
+            var result = compactor.compact(currentRoot);
+
+            // Publish the compacted root
+            long oldRoot = currentRoot;
+            if (cowMode) {
+                ROOT_HANDLE.setRelease(this, result.newRoot());
+                root = result.newRoot();
+            } else {
+                root = result.newRoot();
+            }
+
+            // Write a full checkpoint with the compacted state
+            if (v2Format) {
+                writeCheckpointV2();
+                commitsSinceCheckpoint = 0;
+            } else {
+                writeSuperblock();
+            }
+            chunkStore.sync();
+
+            // Advance durable generation — retired nodes older than this can now be freed
+            if (reclaimer != null) {
+                reclaimer.advanceDurableGeneration(checkpointGeneration);
+                reclaimer.reclaim();
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Lock operations (package-private, used by TaoDictionary)
     // -----------------------------------------------------------------------
@@ -1268,8 +1445,10 @@ public final class TaoTree implements AutoCloseable {
     /**
      * Flush all data to disk (file-backed mode only).
      *
-     * <p>Writes the superblock (metadata) to page 0 and forces all mapped regions to disk.
-     * No-op for in-memory trees.
+     * <p>For v2 format, writes a lightweight commit record (one page) and forces
+     * all mapped regions. Every {@value #COMMITS_PER_CHECKPOINT} commits, also
+     * writes a full mirrored checkpoint to bound recovery time.
+     * For v1 format, writes the superblock. No-op for in-memory trees.
      *
      * @throws IOException if an I/O error occurs during sync
      */
@@ -1277,8 +1456,25 @@ public final class TaoTree implements AutoCloseable {
         if (chunkStore == null) return;
         lock.writeLock().lock();
         try {
-            writeSuperblock();
-            chunkStore.sync();
+            if (v2Format) {
+                writeCommitRecord();
+                commitsSinceCheckpoint++;
+                if (commitsSinceCheckpoint >= COMMITS_PER_CHECKPOINT) {
+                    writeCheckpointV2();
+                    commitsSinceCheckpoint = 0;
+                    chunkStore.sync();
+                    // Full checkpoint is now durable — advance durableGeneration
+                    if (reclaimer != null) {
+                        reclaimer.advanceDurableGeneration(checkpointGeneration);
+                        reclaimer.reclaim();
+                    }
+                } else {
+                    chunkStore.sync();
+                }
+            } else {
+                writeSuperblock();
+                chunkStore.sync();
+            }
         } finally {
             lock.writeLock().unlock();
         }
@@ -1286,7 +1482,7 @@ public final class TaoTree implements AutoCloseable {
 
     /**
      * Close this tree, releasing the underlying arena if this is a root tree.
-     * For file-backed trees, syncs the superblock before closing.
+     * For file-backed trees, writes a full checkpoint and syncs before closing.
      * Child trees (created internally by dictionaries) do not close the arena.
      */
     @Override
@@ -1294,12 +1490,24 @@ public final class TaoTree implements AutoCloseable {
         if (ownsArena) {
             if (chunkStore != null) {
                 try {
-                    writeSuperblock();
+                    if (v2Format) {
+                        writeCheckpointV2();
+                    } else {
+                        writeSuperblock();
+                    }
                     chunkStore.sync();
+                    // Advance durable generation on clean shutdown
+                    if (reclaimer != null) {
+                        reclaimer.advanceDurableGeneration(checkpointGeneration);
+                        reclaimer.reclaim();
+                    }
                     chunkStore.close();
                 } catch (IOException e) {
                     throw new UncheckedIOException("Failed to sync/close chunk store", e);
                 }
+            }
+            if (reclaimer != null) {
+                reclaimer.close();
             }
             arena.close();
         }
@@ -1327,7 +1535,38 @@ public final class TaoTree implements AutoCloseable {
 
     private void writeSuperblock() {
         if (chunkStore == null) return;
+        Superblock.write(chunkStore.superblock(), gatherMetadata());
+    }
 
+    /**
+     * Write a v2 checkpoint to the inactive slot (mirrored A/B).
+     * Each call toggles between slot A and slot B, so a torn write
+     * to the new slot never corrupts the previous valid checkpoint.
+     */
+    private void writeCheckpointV2() {
+        if (chunkStore == null) return;
+
+        // Gather metadata into SuperblockData (reuse existing collector)
+        var sbData = gatherMetadata();
+
+        // Write to the INACTIVE slot (the one NOT written last time)
+        int targetSlotPage = CheckpointV2.inactiveSlotPage(activeSlotPage);
+        long targetSlotId = (targetSlotPage == CheckpointV2.SLOT_A_PAGE) ? 0 : 1;
+        checkpointGeneration++;
+
+        var cpData = CheckpointIO.toCheckpoint(sbData, checkpointGeneration, targetSlotId);
+        MemorySegment slot = chunkStore.resolve(targetSlotPage, CheckpointV2.SLOT_SIZE_PAGES);
+        slot.fill((byte) 0);
+        CheckpointV2.write(slot, cpData);
+
+        activeSlotPage = targetSlotPage;
+    }
+
+    /**
+     * Gather all tree metadata into a {@link Superblock.SuperblockData} structure.
+     * Used by both v1 writeSuperblock and v2 writeCheckpointV2.
+     */
+    private Superblock.SuperblockData gatherMetadata() {
         var data = new Superblock.SuperblockData();
         data.slabSize = slab.slabSize();
         data.bumpPageSize = bump.pageSize();
@@ -1363,7 +1602,72 @@ public final class TaoTree implements AutoCloseable {
             data.dicts[i] = dicts.get(i).exportDescriptor(1 + i);
         }
 
-        Superblock.write(chunkStore.superblock(), data);
+        return data;
+    }
+
+    /**
+     * Write a lightweight commit record to the pre-reserved page.
+     *
+     * <p>The commit record captures the current tree root, size, and dictionary
+     * state in a single 4 KB page. Recovery scans these records forward from
+     * the last checkpoint to reconstruct the latest state.
+     *
+     * <p>Crash safety: the commit record page was pre-reserved (zeroed) at the
+     * position where recovery expects it. If we crash before writing, recovery
+     * reads the zeroed page, finds no valid commit record, and stops — state
+     * reverts to the last valid commit or checkpoint. If we crash after writing
+     * but before forcing, the commit record may or may not be durable, which
+     * is the expected trade-off for non-forced syncs.
+     */
+    private void writeCommitRecord() {
+        if (chunkStore == null || nextCommitPage < 0) return;
+
+        checkpointGeneration++;
+
+        var commitData = new CommitRecord.CommitData();
+        commitData.generation = checkpointGeneration;
+        commitData.prevCommitPage = prevCommitPage;
+        commitData.primaryRoot = cowMode ? (long) ROOT_HANDLE.getAcquire(this) : root;
+        commitData.primarySize = cowMode ? atomicSize.get() : size;
+        commitData.arenaStartPage = nextCommitPage;
+        // arenaEndPage = everything allocated so far, including the commit page itself
+        commitData.arenaEndPage = chunkStore.nextPage();
+
+        // Dictionary state
+        commitData.dictionaryCount = dicts.size();
+        commitData.dictRoots = new long[dicts.size()];
+        commitData.dictNextCodes = new long[dicts.size()];
+        commitData.dictSizes = new long[dicts.size()];
+        for (int i = 0; i < dicts.size(); i++) {
+            var dict = dicts.get(i);
+            var childTree = dict.childTree();
+            commitData.dictRoots[i] = childTree.root;
+            commitData.dictNextCodes[i] = dict.nextCode();
+            commitData.dictSizes[i] = childTree.size;
+        }
+
+        // Write to the pre-reserved page
+        MemorySegment page = chunkStore.resolvePage(nextCommitPage);
+        CommitRecord.write(page, commitData);
+
+        prevCommitPage = nextCommitPage;
+        // Reserve the next commit record page for the next sync
+        reserveNextCommitPage();
+    }
+
+    /**
+     * Pre-reserve one ChunkStore page for the next commit record.
+     * This ensures the commit record is at the exact page position
+     * where {@link ShadowPagingRecovery} expects to find it.
+     */
+    private void reserveNextCommitPage() {
+        try {
+            nextCommitPage = chunkStore.allocPages(1);
+            // Zero the page so it reads as "no valid commit record" until written
+            chunkStore.resolvePage(nextCommitPage).fill((byte) 0);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to reserve commit record page", e);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1856,11 +2160,11 @@ public final class TaoTree implements AutoCloseable {
         }
 
         if (type == NodePtr.PREFIX) {
-            MemorySegment seg = slab.resolve(nodePtr);
+            MemorySegment seg = resolveNode(nodePtr);
             return walkLeaves(PrefixNode.child(seg), visitor);
         }
 
-        MemorySegment seg = slab.resolve(nodePtr);
+        MemorySegment seg = resolveNode(nodePtr);
         return switch (type) {
             case NodePtr.NODE_4 -> {
                 int n = Node4.count(seg);
@@ -1921,7 +2225,7 @@ public final class TaoTree implements AutoCloseable {
 
             if (type == NodePtr.LEAF) {
                 // Leaf: check if its key matches the prefix
-                MemorySegment leafSeg = slab.resolve(node);
+                MemorySegment leafSeg = resolveNode(node);
                 for (int i = depth; i < prefixLen; i++) {
                     if (leafSeg.get(ValueLayout.JAVA_BYTE, i) !=
                         prefix.get(ValueLayout.JAVA_BYTE, i)) {
@@ -1932,7 +2236,7 @@ public final class TaoTree implements AutoCloseable {
             }
 
             if (type == NodePtr.PREFIX) {
-                MemorySegment seg = slab.resolve(node);
+                MemorySegment seg = resolveNode(node);
                 int prefLen = PrefixNode.count(seg);
                 // Compare prefix bytes against compressed prefix bytes
                 int toMatch = Math.min(prefLen, prefixLen - depth);
@@ -1949,7 +2253,7 @@ public final class TaoTree implements AutoCloseable {
 
             // Inner node: look up the child for the next prefix byte
             byte keyByte = prefix.get(ValueLayout.JAVA_BYTE, depth);
-            MemorySegment seg = slab.resolve(node);
+            MemorySegment seg = resolveNode(node);
             long child = switch (type) {
                 case NodePtr.NODE_4 -> Node4.findChild(seg, keyByte);
                 case NodePtr.NODE_16 -> Node16.findChild(seg, keyByte);
@@ -2019,7 +2323,7 @@ public final class TaoTree implements AutoCloseable {
             }
 
             if (type == NodePtr.PREFIX) {
-                MemorySegment prefSeg = slab.resolve(node);
+                MemorySegment prefSeg = resolveNode(node);
                 int prefLen = PrefixNode.count(prefSeg);
                 int matched = PrefixNode.matchKey(prefSeg, key, keyLen, depth);
                 if (matched < prefLen) {
@@ -2057,8 +2361,30 @@ public final class TaoTree implements AutoCloseable {
     }
 
     MemorySegment leafValueImpl(long leafPtr) {
-        MemorySegment full = slab.resolve(leafPtr);
+        MemorySegment full = resolveNode(leafPtr);
         return full.asSlice(keySlotSize);
+    }
+
+    /**
+     * Resolve a NodePtr to a MemorySegment, handling both slab-allocated and
+     * arena-allocated pointers. Used by readers and internal methods.
+     */
+    private MemorySegment resolveNode(long ptr) {
+        if (chunkStore != null && WriterArena.isArenaAllocated(ptr)) {
+            int classId = NodePtr.slabClassId(ptr);
+            return WriterArena.resolve(chunkStore, ptr, slab.segmentSize(classId));
+        }
+        return slab.resolve(ptr);
+    }
+
+    /**
+     * Resolve a NodePtr with an explicit length.
+     */
+    private MemorySegment resolveNode(long ptr, int length) {
+        if (chunkStore != null && WriterArena.isArenaAllocated(ptr)) {
+            return WriterArena.resolve(chunkStore, ptr, length);
+        }
+        return slab.resolve(ptr, length);
     }
 
     // =======================================================================
@@ -2084,7 +2410,7 @@ public final class TaoTree implements AutoCloseable {
             }
 
             if (type == NodePtr.PREFIX) {
-                MemorySegment prefSeg = slab.resolve(nodePtr);
+                MemorySegment prefSeg = resolveNode(nodePtr);
                 int prefLen = PrefixNode.count(prefSeg);
                 int matched = PrefixNode.matchKey(prefSeg, key, keyLen, depth);
 
@@ -2117,7 +2443,7 @@ public final class TaoTree implements AutoCloseable {
                 return leafPtr;
             }
 
-            MemorySegment nodeSeg = slab.resolve(nodePtr);
+            MemorySegment nodeSeg = resolveNode(nodePtr);
             parentSeg = nodeSeg;
             parentOff = childOffset(type, nodeSeg, keyByte);
             nodePtr = child;
@@ -2127,7 +2453,7 @@ public final class TaoTree implements AutoCloseable {
 
     private long expandLeaf(long existingLeafPtr, MemorySegment newKey, int newKeyLen,
                             int depth, int leafClass) {
-        MemorySegment existingKey = slab.resolve(existingLeafPtr, keyLen);
+        MemorySegment existingKey = resolveNode(existingLeafPtr, keyLen);
 
         int mismatch = depth;
         while (mismatch < newKeyLen &&
@@ -2144,7 +2470,7 @@ public final class TaoTree implements AutoCloseable {
         size++;
 
         long n4Ptr = slab.allocate(node4ClassId, NodePtr.NODE_4);
-        MemorySegment n4Seg = slab.resolve(n4Ptr);
+        MemorySegment n4Seg = resolveNode(n4Ptr);
         Node4.init(n4Seg);
 
         byte existingByte = existingKey.get(ValueLayout.JAVA_BYTE, mismatch);
@@ -2168,7 +2494,7 @@ public final class TaoTree implements AutoCloseable {
         long newLeafPtr = allocateLeaf(key, keyLen, leafClass);
 
         long n4Ptr = slab.allocate(node4ClassId, NodePtr.NODE_4);
-        MemorySegment n4Seg = slab.resolve(n4Ptr);
+        MemorySegment n4Seg = resolveNode(n4Ptr);
         Node4.init(n4Seg);
 
         byte existingByte = PrefixNode.keyAt(prefSeg, matchedCount);
@@ -2178,7 +2504,7 @@ public final class TaoTree implements AutoCloseable {
         int remainingPrefixLen = prefLen - matchedCount - 1;
         if (remainingPrefixLen > 0) {
             long newPrefPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-            MemorySegment newPrefSeg = slab.resolve(newPrefPtr);
+            MemorySegment newPrefSeg = resolveNode(newPrefPtr);
             byte[] remaining = new byte[remainingPrefixLen];
             for (int i = 0; i < remainingPrefixLen; i++) {
                 remaining[i] = PrefixNode.keyAt(prefSeg, matchedCount + 1 + i);
@@ -2198,7 +2524,7 @@ public final class TaoTree implements AutoCloseable {
 
         if (matchedCount > 0) {
             long wrapPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-            MemorySegment wrapSeg = slab.resolve(wrapPtr);
+            MemorySegment wrapSeg = resolveNode(wrapPtr);
             byte[] shared = new byte[matchedCount];
             for (int i = 0; i < matchedCount; i++) {
                 shared[i] = key.get(ValueLayout.JAVA_BYTE, depth + i);
@@ -2211,13 +2537,13 @@ public final class TaoTree implements AutoCloseable {
 
     private void insertChildIntoNode(long nodePtr, int type, byte keyByte, long childPtr,
                                      MemorySegment parentSeg, long parentOff) {
-        MemorySegment seg = slab.resolve(nodePtr);
+        MemorySegment seg = resolveNode(nodePtr);
 
         switch (type) {
             case NodePtr.NODE_4 -> {
                 if (Node4.isFull(seg)) {
                     long n16Ptr = slab.allocate(node16ClassId, NodePtr.NODE_16);
-                    MemorySegment n16Seg = slab.resolve(n16Ptr);
+                    MemorySegment n16Seg = resolveNode(n16Ptr);
                     Node16.init(n16Seg);
                     Node16.copyFromNode4(n16Seg, seg);
                     Node16.insertChild(n16Seg, keyByte, childPtr);
@@ -2230,7 +2556,7 @@ public final class TaoTree implements AutoCloseable {
             case NodePtr.NODE_16 -> {
                 if (Node16.isFull(seg)) {
                     long n48Ptr = slab.allocate(node48ClassId, NodePtr.NODE_48);
-                    MemorySegment n48Seg = slab.resolve(n48Ptr);
+                    MemorySegment n48Seg = resolveNode(n48Ptr);
                     Node48.init(n48Seg);
                     Node48.copyFromNode16(n48Seg, seg);
                     Node48.insertChild(n48Seg, keyByte, childPtr);
@@ -2243,7 +2569,7 @@ public final class TaoTree implements AutoCloseable {
             case NodePtr.NODE_48 -> {
                 if (Node48.isFull(seg)) {
                     long n256Ptr = slab.allocate(node256ClassId, NodePtr.NODE_256);
-                    MemorySegment n256Seg = slab.resolve(n256Ptr);
+                    MemorySegment n256Seg = resolveNode(n256Ptr);
                     Node256.init(n256Seg);
                     Node256.copyFromNode48(n256Seg, seg);
                     Node256.insertChild(n256Seg, keyByte, childPtr);
@@ -2280,7 +2606,7 @@ public final class TaoTree implements AutoCloseable {
         }
 
         if (type == NodePtr.PREFIX) {
-            MemorySegment prefSeg = slab.resolve(nodePtr);
+            MemorySegment prefSeg = resolveNode(nodePtr);
             int prefLen = PrefixNode.count(prefSeg);
             int matched = PrefixNode.matchKey(prefSeg, key, keyLen, depth);
             if (matched < prefLen) return nodePtr;
@@ -2310,7 +2636,7 @@ public final class TaoTree implements AutoCloseable {
         long newChild = doDelete(child, key, keyLen, depth + 1, deleted);
         if (!deleted[0]) return nodePtr;
 
-        MemorySegment seg = slab.resolve(nodePtr);
+        MemorySegment seg = resolveNode(nodePtr);
 
         if (NodePtr.isEmpty(newChild)) {
             removeChildFromNode(seg, type, keyByte);
@@ -2331,7 +2657,7 @@ public final class TaoTree implements AutoCloseable {
     }
 
     private long mergePrefixes(long outerPtr, MemorySegment outerSeg, long innerPtr) {
-        MemorySegment innerSeg = slab.resolve(innerPtr);
+        MemorySegment innerSeg = resolveNode(innerPtr);
         int outerLen = PrefixNode.count(outerSeg);
         int innerLen = PrefixNode.count(innerSeg);
         long innerChild = PrefixNode.child(innerSeg);
@@ -2358,7 +2684,7 @@ public final class TaoTree implements AutoCloseable {
         long child = singleChild[0];
 
         if (NodePtr.nodeType(child) == NodePtr.PREFIX) {
-            MemorySegment childPrefSeg = slab.resolve(child);
+            MemorySegment childPrefSeg = resolveNode(child);
             int childPrefLen = PrefixNode.count(childPrefSeg);
             byte[] m = new byte[1 + childPrefLen];
             m[0] = prefixByte[0];
@@ -2369,7 +2695,7 @@ public final class TaoTree implements AutoCloseable {
         }
 
         long prefPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-        MemorySegment prefSeg = slab.resolve(prefPtr);
+        MemorySegment prefSeg = resolveNode(prefPtr);
         PrefixNode.init(prefSeg, prefixByte, 0, 1, child);
         return prefPtr;
     }
@@ -2388,7 +2714,7 @@ public final class TaoTree implements AutoCloseable {
 
     private long shrinkNode256ToNode48(long oldPtr, MemorySegment oldSeg) {
         long n48Ptr = slab.allocate(node48ClassId, NodePtr.NODE_48);
-        MemorySegment n48Seg = slab.resolve(n48Ptr);
+        MemorySegment n48Seg = resolveNode(n48Ptr);
         Node48.init(n48Seg);
         Node256.forEach(oldSeg, (k, c) -> Node48.insertChild(n48Seg, k, c));
         slab.free(oldPtr);
@@ -2397,7 +2723,7 @@ public final class TaoTree implements AutoCloseable {
 
     private long shrinkNode48ToNode16(long oldPtr, MemorySegment oldSeg) {
         long n16Ptr = slab.allocate(node16ClassId, NodePtr.NODE_16);
-        MemorySegment n16Seg = slab.resolve(n16Ptr);
+        MemorySegment n16Seg = resolveNode(n16Ptr);
         Node16.init(n16Seg);
         Node48.forEach(oldSeg, (k, c) -> Node16.insertChild(n16Seg, k, c));
         slab.free(oldPtr);
@@ -2406,7 +2732,7 @@ public final class TaoTree implements AutoCloseable {
 
     private long shrinkNode16ToNode4(long oldPtr, MemorySegment oldSeg) {
         long n4Ptr = slab.allocate(node4ClassId, NodePtr.NODE_4);
-        MemorySegment n4Seg = slab.resolve(n4Ptr);
+        MemorySegment n4Seg = resolveNode(n4Ptr);
         Node4.init(n4Seg);
         int n = Node16.count(oldSeg);
         for (int i = 0; i < n; i++) {
@@ -2421,7 +2747,7 @@ public final class TaoTree implements AutoCloseable {
     // =======================================================================
 
     private long findChild(long nodePtr, int type, byte keyByte) {
-        MemorySegment seg = slab.resolve(nodePtr);
+        MemorySegment seg = resolveNode(nodePtr);
         return switch (type) {
             case NodePtr.NODE_4   -> Node4.findChild(seg, keyByte);
             case NodePtr.NODE_16  -> Node16.findChild(seg, keyByte);
@@ -2484,13 +2810,13 @@ public final class TaoTree implements AutoCloseable {
 
     private boolean leafKeyMatches(long leafPtr, MemorySegment key, int keyLen) {
         if (keyLen != this.keyLen) return false;
-        MemorySegment leafKey = slab.resolve(leafPtr, this.keyLen);
+        MemorySegment leafKey = resolveNode(leafPtr, this.keyLen);
         return leafKey.mismatch(key.asSlice(0, this.keyLen)) == -1;
     }
 
     private long allocateLeaf(MemorySegment key, int keyLen, int leafClass) {
         long ptr = slab.allocate(leafClassIds[leafClass]);
-        MemorySegment seg = slab.resolve(ptr);
+        MemorySegment seg = resolveNode(ptr);
         // Copy key into the first keyLen bytes
         MemorySegment.copy(key, 0, seg, 0, this.keyLen);
         // Zero everything after the key (padding + value) so callers never see stale bytes
@@ -2508,7 +2834,7 @@ public final class TaoTree implements AutoCloseable {
             int chunkLen = Math.min(pos - from, NodeConstants.PREFIX_CAPACITY);
             int chunkStart = pos - chunkLen;
             long prefPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-            MemorySegment prefSeg = slab.resolve(prefPtr);
+            MemorySegment prefSeg = resolveNode(prefPtr);
             PrefixNode.init(prefSeg, key, chunkStart, chunkLen, current);
             current = prefPtr;
             pos = chunkStart;
@@ -2526,7 +2852,7 @@ public final class TaoTree implements AutoCloseable {
             int chunkLen = Math.min(pos - from, NodeConstants.PREFIX_CAPACITY);
             int chunkStart = pos - chunkLen;
             long prefPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-            MemorySegment prefSeg = slab.resolve(prefPtr);
+            MemorySegment prefSeg = resolveNode(prefPtr);
             PrefixNode.init(prefSeg, key, chunkStart, chunkLen, current);
             current = prefPtr;
             pos = chunkStart;
@@ -2547,7 +2873,7 @@ public final class TaoTree implements AutoCloseable {
             int type = NodePtr.nodeType(node);
             if (type == NodePtr.LEAF) return node;
             if (type == NodePtr.PREFIX) {
-                MemorySegment seg = slab.resolve(node);
+                MemorySegment seg = resolveNode(node);
                 depth += PrefixNode.count(seg);
                 node = PrefixNode.child(seg);
                 continue;
