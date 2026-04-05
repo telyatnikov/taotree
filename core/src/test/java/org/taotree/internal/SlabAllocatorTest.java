@@ -303,4 +303,73 @@ class SlabAllocatorTest {
             assertEquals(42, alloc.resolve(ptr5).get(ValueLayout.JAVA_INT, 0));
         }
     }
+
+    // ---- allocate with nodeType ----
+
+    @Test
+    void allocateWithNodeType() {
+        try (var arena = Arena.ofConfined();
+             var alloc = new SlabAllocator(arena, 4096)) {
+
+            int classId = alloc.registerClass(64);
+
+            // Allocate with LEAF type (default)
+            long leafPtr = alloc.allocate(classId);
+            assertEquals(NodePtr.LEAF, NodePtr.nodeType(leafPtr));
+
+            // Allocate with specific node types
+            long n4Ptr = alloc.allocate(classId, NodePtr.NODE_4);
+            assertEquals(NodePtr.NODE_4, NodePtr.nodeType(n4Ptr));
+
+            long n16Ptr = alloc.allocate(classId, NodePtr.NODE_16);
+            assertEquals(NodePtr.NODE_16, NodePtr.nodeType(n16Ptr));
+
+            long prefixPtr = alloc.allocate(classId, NodePtr.PREFIX);
+            assertEquals(NodePtr.PREFIX, NodePtr.nodeType(prefixPtr));
+
+            // All pointers should be unique
+            assertNotEquals(leafPtr, n4Ptr);
+            assertNotEquals(n4Ptr, n16Ptr);
+            assertNotEquals(n16Ptr, prefixPtr);
+        }
+    }
+
+    // ---- isFileBacked ----
+
+    @Test
+    void inMemoryIsNotFileBacked() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena, 4096);
+            assertFalse(alloc.isFileBacked());
+        }
+    }
+
+    // ---- default slab size constructor ----
+
+    @Test
+    void defaultSlabSizeConstructor() {
+        try (var arena = Arena.ofConfined()) {
+            var alloc = new SlabAllocator(arena);
+            int classId = alloc.registerClass(64);
+            long ptr = alloc.allocate(classId);
+            assertFalse(NodePtr.isEmpty(ptr));
+            assertEquals(64, alloc.resolve(ptr).byteSize());
+        }
+    }
+
+    // ---- boundary: slabSize = 1 should still work ----
+
+    @Test
+    void slabSizeOne() {
+        try (var arena = Arena.ofConfined()) {
+            // slabSize=1 means 1 byte slabs, segment size must be 1
+            var alloc = new SlabAllocator(arena, 1);
+            int classId = alloc.registerClass(1);
+            long ptr = alloc.allocate(classId);
+            assertFalse(NodePtr.isEmpty(ptr));
+            // Write and read a single byte
+            alloc.resolve(ptr).set(ValueLayout.JAVA_BYTE, 0, (byte) 0x42);
+            assertEquals((byte) 0x42, alloc.resolve(ptr).get(ValueLayout.JAVA_BYTE, 0));
+        }
+    }
 }

@@ -121,4 +121,105 @@ class NodePtrTest {
         assertTrue(NodePtr.isLeaf(leafPtr));
         assertTrue(NodePtr.isLeaf(leafInlinePtr));
     }
+
+    // ---- toString coverage for all node types ----
+
+    @Test
+    void toStringAllNodeTypes() {
+        // Covers every branch of the toString switch statement
+        String prefix = NodePtr.toString(NodePtr.pack(NodePtr.PREFIX, 1, 2, 3));
+        assertTrue(prefix.startsWith("PREFIX["));
+
+        String n4 = NodePtr.toString(NodePtr.pack(NodePtr.NODE_4, 1, 2, 3));
+        assertTrue(n4.startsWith("NODE_4["));
+
+        String n16 = NodePtr.toString(NodePtr.pack(NodePtr.NODE_16, 1, 2, 3));
+        assertTrue(n16.startsWith("NODE_16["));
+
+        String n48 = NodePtr.toString(NodePtr.pack(NodePtr.NODE_48, 1, 2, 3));
+        assertTrue(n48.startsWith("NODE_48["));
+
+        String n256 = NodePtr.toString(NodePtr.pack(NodePtr.NODE_256, 1, 2, 3));
+        assertTrue(n256.startsWith("NODE_256["));
+
+        String leaf = NodePtr.toString(NodePtr.pack(NodePtr.LEAF, 1, 2, 3));
+        assertTrue(leaf.startsWith("LEAF["));
+
+        String leafInline = NodePtr.toString(NodePtr.pack(NodePtr.LEAF_INLINE, 1, 2, 3));
+        assertTrue(leafInline.startsWith("LEAF_INLINE["));
+
+        // EMPTY type but non-zero payload (theoretical edge case)
+        long emptyType = NodePtr.pack(NodePtr.EMPTY, 1, 2, 3);
+        String emptyNonZero = NodePtr.toString(emptyType);
+        assertTrue(emptyNonZero.startsWith("EMPTY["));
+    }
+
+    @Test
+    void toStringUnknownType() {
+        // Craft a pointer with a type > 7 using packWithMetadata
+        // Metadata byte = 0x08 → nodeType = 8 (UNKNOWN)
+        long ptr = NodePtr.packWithMetadata(0x08, 1, 2, 3);
+        String s = NodePtr.toString(ptr);
+        assertTrue(s.startsWith("UNKNOWN(8)"));
+    }
+
+    // ---- withNodeType preserves high metadata bits ----
+
+    @Test
+    void withNodeTypePreservesGateFlag() {
+        // Set gate flag (bit 7) in metadata using packWithMetadata
+        int meta = 0x86; // gate=1, reserved=000, type=6 (LEAF)
+        long ptr = NodePtr.packWithMetadata(meta, 3, 10, 200);
+        assertEquals(NodePtr.LEAF, NodePtr.nodeType(ptr));
+
+        // Change type to NODE_4
+        long changed = NodePtr.withNodeType(ptr, NodePtr.NODE_4);
+        assertEquals(NodePtr.NODE_4, NodePtr.nodeType(changed));
+        // Gate flag (bit 7 of metadata) should be preserved
+        int newMeta = NodePtr.metadata(changed);
+        assertTrue((newMeta & 0x80) != 0, "Gate flag should be preserved");
+        // Payload should be preserved
+        assertEquals(3, NodePtr.slabClassId(changed));
+        assertEquals(10, NodePtr.slabId(changed));
+        assertEquals(200, NodePtr.offset(changed));
+    }
+
+    // ---- isInnerNode boundary cases ----
+
+    @Test
+    void isInnerNodeBoundaries() {
+        // EMPTY (0) is not inner
+        assertFalse(NodePtr.isInnerNode(NodePtr.pack(NodePtr.EMPTY, 0, 0, 0)));
+        // PREFIX (1) is not inner
+        assertFalse(NodePtr.isInnerNode(NodePtr.pack(NodePtr.PREFIX, 0, 0, 0)));
+        // NODE_4 (2) is inner — lower bound
+        assertTrue(NodePtr.isInnerNode(NodePtr.pack(NodePtr.NODE_4, 0, 0, 0)));
+        // NODE_256 (5) is inner — upper bound
+        assertTrue(NodePtr.isInnerNode(NodePtr.pack(NodePtr.NODE_256, 0, 0, 0)));
+        // LEAF (6) is not inner
+        assertFalse(NodePtr.isInnerNode(NodePtr.pack(NodePtr.LEAF, 0, 0, 0)));
+        // LEAF_INLINE (7) is not inner
+        assertFalse(NodePtr.isInnerNode(NodePtr.pack(NodePtr.LEAF_INLINE, 0, 0, 0)));
+    }
+
+    // ---- isPrefix negative cases ----
+
+    @Test
+    void isPrefixNegativeCases() {
+        assertFalse(NodePtr.isPrefix(NodePtr.EMPTY_PTR));
+        assertFalse(NodePtr.isPrefix(NodePtr.pack(NodePtr.NODE_4, 0, 0, 0)));
+        assertFalse(NodePtr.isPrefix(NodePtr.pack(NodePtr.LEAF, 0, 0, 0)));
+    }
+
+    // ---- Pack round-trip with extreme values ----
+
+    @Test
+    void packRoundTripLargeOffset() {
+        // Large unsigned offset
+        long ptr = NodePtr.pack(NodePtr.LEAF, 255, 65535, -1);
+        assertEquals(NodePtr.LEAF, NodePtr.nodeType(ptr));
+        assertEquals(255, NodePtr.slabClassId(ptr));
+        assertEquals(65535, NodePtr.slabId(ptr));
+        assertEquals(-1, NodePtr.offset(ptr)); // -1 as int = 0xFFFFFFFF
+    }
 }
