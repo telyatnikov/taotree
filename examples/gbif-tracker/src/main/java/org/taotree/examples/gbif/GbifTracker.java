@@ -133,6 +133,8 @@ public class GbifTracker {
                     try (ParquetFileReader fileReader = ParquetFileReader.open(InputFile.of(file.toPath()));
                          RowReader rows = fileReader.createRowReader()) {
 
+                        var w = tree.write();
+                        try {
                         while (rows.hasNext()) {
                             rows.next();
                             totalRows++;
@@ -154,13 +156,34 @@ public class GbifTracker {
                             double lon  = safeDouble(rows, "decimallongitude");
                             double elev = safeDouble(rows, "elevation");
 
-                            try (var w = tree.write()) {
-                                var leaf = w.getOrCreate(kb);
+                            var leaf = w.getOrCreate(kb);
 
-                                int existingCount = leaf.get(COUNT);
-                                if (existingCount == 0) {
-                                    leaf.set(COUNT, 1)
-                                        .set(YEAR, year)
+                            int existingCount = leaf.get(COUNT);
+                            if (existingCount == 0) {
+                                leaf.set(COUNT, 1)
+                                    .set(YEAR, year)
+                                    .set(MONTH, month)
+                                    .set(DAY, day)
+                                    .set(LAT, lat)
+                                    .set(LON, lon)
+                                    .set(ELEV, elev)
+                                    .set(IND_CNT, safeInt(rows, "individualcount"))
+                                    .set(TAXON_K, safeInt(rows, "taxonkey"))
+                                    .set(SPECIES_K, safeInt(rows, "specieskey"));
+
+                                String locality = nullSafe(rows, "locality");
+                                if (locality != null) leaf.set(LOCALITY, locality);
+                                String recordedBy = nullSafe(rows, "recordedby");
+                                if (recordedBy != null) leaf.set(RECORDED, recordedBy);
+                                String extras = buildExtras(rows);
+                                if (extras != null) leaf.set(EXTRAS, extras);
+                                forwarded++;
+                            } else {
+                                // Existing entry: increment count, update all fields if newer
+                                leaf.set(COUNT, existingCount + 1);
+                                if (year > leaf.get(YEAR)
+                                    || (year == leaf.get(YEAR) && month > leaf.get(MONTH))) {
+                                    leaf.set(YEAR, year)
                                         .set(MONTH, month)
                                         .set(DAY, day)
                                         .set(LAT, lat)
@@ -178,40 +201,24 @@ public class GbifTracker {
                                     if (extras != null) leaf.set(EXTRAS, extras);
                                     forwarded++;
                                 } else {
-                                    // Existing entry: increment count, update all fields if newer
-                                    leaf.set(COUNT, existingCount + 1);
-                                    if (year > leaf.get(YEAR)
-                                        || (year == leaf.get(YEAR) && month > leaf.get(MONTH))) {
-                                        leaf.set(YEAR, year)
-                                            .set(MONTH, month)
-                                            .set(DAY, day)
-                                            .set(LAT, lat)
-                                            .set(LON, lon)
-                                            .set(ELEV, elev)
-                                            .set(IND_CNT, safeInt(rows, "individualcount"))
-                                            .set(TAXON_K, safeInt(rows, "taxonkey"))
-                                            .set(SPECIES_K, safeInt(rows, "specieskey"));
-
-                                        String locality = nullSafe(rows, "locality");
-                                        if (locality != null) leaf.set(LOCALITY, locality);
-                                        String recordedBy = nullSafe(rows, "recordedby");
-                                        if (recordedBy != null) leaf.set(RECORDED, recordedBy);
-                                        String extras = buildExtras(rows);
-                                        if (extras != null) leaf.set(EXTRAS, extras);
-                                        forwarded++;
-                                    } else {
-                                        suppressed++;
-                                    }
+                                    suppressed++;
                                 }
                             }
 
                             if (totalRows % 100_000 == 0) {
+                                // Close scope, sync, reopen for progress reporting
+                                w.close();
+                                tree.sync();
                                 double elapsedSec = (System.nanoTime() - startNs) / 1e9;
                                 try (var r = tree.read()) {
                                     System.out.printf("  %,d rows | %,d entries | %.1f rows/sec%n",
                                         totalRows, r.size(), totalRows / elapsedSec);
                                 }
+                                w = tree.write();
                             }
+                        }
+                        } finally {
+                            w.close();
                         }
                     }
                 }
