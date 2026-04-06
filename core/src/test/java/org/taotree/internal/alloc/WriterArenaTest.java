@@ -140,20 +140,15 @@ class WriterArenaTest {
             var result = wa.alloc(64, NodePtr.NODE_16, 3);
             long ptr = result.nodePtr();
 
-            // Verify sentinel slabId
-            assertEquals(WriterArena.ARENA_SLAB_ID, NodePtr.slabId(ptr));
+            // Verify arena flag in metadata
             assertTrue(WriterArena.isArenaAllocated(ptr));
+            assertTrue((NodePtr.metadata(ptr) & NodePtr.ARENA_FLAG) != 0);
 
             // Verify node type is preserved
             assertEquals(NodePtr.NODE_16, NodePtr.nodeType(ptr));
 
-            // Verify we can decode the page+offset from the packed field
-            int packed = NodePtr.offset(ptr);
-            int page = packed >>> 12;
-            int off = packed & 0xFFF;
-            assertTrue(page >= 0);
-            assertTrue(off >= 0);
-            assertTrue(off < ChunkStore.PAGE_SIZE);
+            // Verify slab class is preserved
+            assertEquals(3, NodePtr.slabClassId(ptr));
 
             // Write and read back through resolve
             result.segment().set(ValueLayout.JAVA_LONG, 0, 0xABCD_1234_5678_9ABCL);
@@ -275,19 +270,29 @@ class WriterArenaTest {
     }
 
     @Test
-    void pageEncodingLimitBoundary() {
-        long ptr = WriterArena.encodeArenaPtr(
-            NodePtr.LEAF, 7, WriterArena.MAX_ADDRESSABLE_PAGES - 1, ChunkStore.PAGE_SIZE - 8);
+    void pageEncodingLargePageNumber() {
+        // Test with a page number that uses all 36 bits of the new encoding:
+        // page = (0x7FF << 20) | 0xFFFFF = 0x7FFFFFFFL (max positive int, ~2B pages)
+        int page = Integer.MAX_VALUE;
+        int byteOff = ChunkStore.PAGE_SIZE - 8;
+        long ptr = WriterArena.encodeArenaPtr(NodePtr.LEAF, 7, page, byteOff);
 
-        assertEquals(WriterArena.ARENA_SLAB_ID, NodePtr.slabId(ptr));
-        assertEquals(WriterArena.MAX_ADDRESSABLE_PAGES - 1, NodePtr.offset(ptr) >>> 12);
-        assertEquals(ChunkStore.PAGE_SIZE - 8, NodePtr.offset(ptr) & 0xFFF);
+        assertTrue(WriterArena.isArenaAllocated(ptr));
+        assertEquals(NodePtr.LEAF, NodePtr.nodeType(ptr));
+        assertEquals(7, NodePtr.slabClassId(ptr));
+
+        // Decode and verify the page number survives the round-trip
+        int pageHigh = NodePtr.slabId(ptr);
+        int offsetField = NodePtr.offset(ptr);
+        int decodedPage = (pageHigh << 20) | ((offsetField >>> 12) & 0xFFFFF);
+        int decodedByte = offsetField & 0xFFF;
+        assertEquals(page, decodedPage);
+        assertEquals(byteOff, decodedByte);
     }
 
     @Test
-    void pageEncodingOverflowThrows() {
-        var ex = assertThrows(IllegalStateException.class,
-            () -> WriterArena.encodeArenaPtr(NodePtr.LEAF, 0, WriterArena.MAX_ADDRESSABLE_PAGES, 0));
-        assertTrue(ex.getMessage().contains("20-bit arena NodePtr limit"));
+    void pageEncodingNegativePageThrows() {
+        assertThrows(IllegalStateException.class,
+            () -> WriterArena.encodeArenaPtr(NodePtr.LEAF, 0, -1, 0));
     }
 }

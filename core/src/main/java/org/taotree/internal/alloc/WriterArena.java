@@ -14,17 +14,21 @@ import org.taotree.internal.art.NodePtr;
  * produces contiguous page ranges per writer per scope, which is critical for the
  * shadow-paging durability model (one contiguous {@code force()} call per scope).
  *
- * <p>Arena-allocated nodes are encoded as standard {@link NodePtr} values with a
- * sentinel {@code slabId} of {@code 0xFFFF}. The 32-bit offset field packs the
- * ChunkStore page number (bits 31-12) and byte offset within the page (bits 11-0):
+ * <p>Arena-allocated nodes are encoded as standard {@link NodePtr} values with
+ * the {@link NodePtr#ARENA_FLAG} set in the metadata byte. The ChunkStore page
+ * number is spread across the 16-bit slabId field (high bits) and the upper 20
+ * bits of the 32-bit offset field (low bits), giving a 36-bit page number. The
+ * lower 12 bits of the offset field hold the byte offset within the page:
  * <pre>
- *   slabId  = 0xFFFF                          (arena sentinel)
- *   offset  = (page &lt;&lt; 12) | (offsetInPage &amp; 0xFFF)
+ *   metadata  = nodeType | 0x80            (arena flag set)
+ *   slabId    = page &gt;&gt;&gt; 20               (high 16 bits of page)
+ *   offset    = (page &amp; 0xFFFFF) &lt;&lt; 12 | byteOffset  (low 20 + 12)
  * </pre>
  *
- * <p>Resolution uses {@link ChunkStore#resolveBytes} to map the packed offset back
- * to a {@link MemorySegment}. With 20 bits for the page number, the addressable
- * range is 2^20 pages = 4 GB of file space.
+ * <p>With 36 bits for the page number and 4 KB pages, the addressable range
+ * is 2^36 × 4 KB = 256 TB (in practice limited to ~8 TB by ChunkStore's
+ * {@code int} page counter). This replaces the previous encoding that used a
+ * sentinel slabId of 0xFFFF and only 20 bits for the page number (4 GB limit).
  *
  * <p><b>Thread safety:</b> a {@code WriterArena} is used by exactly one writer
  * thread at a time. No internal synchronization. The only external synchronization
@@ -33,15 +37,14 @@ import org.taotree.internal.art.NodePtr;
  */
 public final class WriterArena {
 
-    /** Sentinel slabId marking arena-allocated nodes. */
-    public static final int ARENA_SLAB_ID = 0xFFFF;
-
     private static final int PAGE_SIZE = ChunkStore.PAGE_SIZE;
     private static final int PAGE_SHIFT = 12;
     private static final int PAGE_MASK = PAGE_SIZE - 1;
+    /** Lower 20 bits of the page number stored in the offset field. */
+    private static final int PAGE_LOW_BITS = Integer.SIZE - PAGE_SHIFT; // 20
+    private static final int PAGE_LOW_MASK = (1 << PAGE_LOW_BITS) - 1;  // 0xFFFFF
     private static final int INITIAL_BATCH_PAGES = 16;  // 64 KB
     private static final int MAX_BATCH_PAGES = 256;     // 1 MB
-    static final int MAX_ADDRESSABLE_PAGES = 1 << (Integer.SIZE - PAGE_SHIFT);
 
     private final ChunkStore chunkStore;
 
@@ -172,29 +175,28 @@ public final class WriterArena {
     /**
      * Encode an arena allocation as a {@link NodePtr}.
      *
-     * <p>Uses {@link #ARENA_SLAB_ID} as the slabId sentinel. The 32-bit offset
-     * field packs the page number (bits 31-12) and byte offset (bits 11-0).
+     * <p>Sets {@link NodePtr#ARENA_FLAG} in the metadata byte. The page number
+     * is split across the slabId field (high 16 bits) and the upper 20 bits of
+     * the offset field (low 20 bits). The lower 12 bits of the offset hold the
+     * byte offset within the page.
      */
     static long encodeArenaPtr(int nodeType, int slabClassId, int page, int offsetInPage) {
-        if (page < 0 || page >= MAX_ADDRESSABLE_PAGES) {
-            throw new IllegalStateException(
-                "WriterArena page " + Integer.toUnsignedString(page)
-                    + " exceeds 20-bit arena NodePtr limit (max="
-                    + Integer.toUnsignedString(MAX_ADDRESSABLE_PAGES - 1)
-                    + ", addressableBytes=" + ((long) MAX_ADDRESSABLE_PAGES * PAGE_SIZE)
-                    + "); arena pointers would alias older file pages");
+        if (page < 0) {
+            throw new IllegalStateException("Negative page number: " + page);
         }
         if (offsetInPage < 0 || offsetInPage >= PAGE_SIZE) {
             throw new IllegalArgumentException(
                 "offsetInPage out of range: " + offsetInPage + " (pageSize=" + PAGE_SIZE + ")");
         }
-        int packed = (page << PAGE_SHIFT) | (offsetInPage & PAGE_MASK);
-        return NodePtr.pack(nodeType, slabClassId, ARENA_SLAB_ID, packed);
+        int metadata = (nodeType & 0x0F) | NodePtr.ARENA_FLAG;
+        int pageHigh = (page >>> PAGE_LOW_BITS) & 0xFFFF;
+        int packedOffset = ((page & PAGE_LOW_MASK) << PAGE_SHIFT) | (offsetInPage & PAGE_MASK);
+        return NodePtr.packWithMetadata(metadata, slabClassId, pageHigh, packedOffset);
     }
 
     /** Test whether a {@link NodePtr} was allocated by an arena. */
     public static boolean isArenaAllocated(long ptr) {
-        return NodePtr.slabId(ptr) == ARENA_SLAB_ID;
+        return (NodePtr.metadata(ptr) & NodePtr.ARENA_FLAG) != 0;
     }
 
     /**
@@ -216,9 +218,10 @@ public final class WriterArena {
      * @param size the segment size in bytes
      */
     public static MemorySegment resolve(ChunkStore cs, long ptr, int size) {
-        int packed = NodePtr.offset(ptr);
-        int page = packed >>> PAGE_SHIFT;
-        int off = packed & PAGE_MASK;
+        int pageHigh = NodePtr.slabId(ptr);
+        int offsetField = NodePtr.offset(ptr);
+        int page = (pageHigh << PAGE_LOW_BITS) | ((offsetField >>> PAGE_SHIFT) & PAGE_LOW_MASK);
+        int off = offsetField & PAGE_MASK;
         return cs.resolveBytes(page, off, size);
     }
 

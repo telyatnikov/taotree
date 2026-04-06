@@ -15,7 +15,7 @@ import org.taotree.TaoTree;
  *
  * <p>Metadata byte:
  * <pre>
- *  bit 7:    gate flag (reserved)
+ *  bit 7:    arena flag (1 = arena-allocated, 0 = slab-allocated)
  *  bits 6-4: reserved
  *  bits 3-0: node type tag
  * </pre>
@@ -36,6 +36,13 @@ public final class NodePtr {
     public static final int NODE_256    = 5;
     public static final int LEAF        = 6;
     public static final int LEAF_INLINE = 7;
+
+    /**
+     * Metadata flag marking arena-allocated nodes ({@link org.taotree.internal.alloc.WriterArena}).
+     * When set, the slabId and offset fields encode a ChunkStore page number + byte offset
+     * instead of a slab index + slab-relative offset.
+     */
+    public static final int ARENA_FLAG = 0x80;
 
     /** The null / absent pointer. Metadata and payload are all zeros. */
     public static final long EMPTY_PTR = 0L;
