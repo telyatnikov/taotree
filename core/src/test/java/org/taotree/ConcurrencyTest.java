@@ -158,13 +158,31 @@ class ConcurrencyTest {
     }
 
     @Test
-    void readToWriteUpgradeFailsFast() {
+    void readAndWriteScopesCoexistOnSameThread() {
         try (var tree = TaoTree.open(KEY_LEN, new int[]{VALUE_SIZE})) {
 
-            // Acquire read lock
+            // With lock-free readers, a write scope can coexist with a read scope
+            // on the same thread. The read scope sees a consistent snapshot of the
+            // older generation; the write scope works on a private copy.
             try (var read = tree.read()) {
-                // Attempting to acquire write lock should throw, not deadlock
-                assertThrows(IllegalStateException.class, () -> tree.write());
+                assertEquals(0, read.size());
+
+                // Write scope succeeds — readers are lock-free, no deadlock
+                try (var w = tree.write()) {
+                    byte[] key = new byte[KEY_LEN];
+                    key[0] = 1;
+                    w.getOrCreate(key, 0);
+                    assertEquals(1, w.size());
+                }
+
+                // Read scope still sees the old snapshot (size 0 at epoch entry)
+                // Note: the read scope captured its root at construction time,
+                // so writes published after that are not visible.
+            }
+
+            // A new read scope sees the updated state
+            try (var r = tree.read()) {
+                assertEquals(1, r.size());
             }
         }
     }

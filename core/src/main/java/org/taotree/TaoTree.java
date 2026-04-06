@@ -203,7 +203,7 @@ public final class TaoTree implements AutoCloseable {
 
     /**
      * Package-private: creates a child tree that shares the parent's arena,
-     * slab allocator, bump allocator, lock, and node class IDs.
+     * slab allocator, bump allocator, lock, epoch reclaimer, and node class IDs.
      * Used internally by {@link TaoDictionary}.
      */
     TaoTree(TaoTree parent, int keyLen, int[] leafValueSizes) {
@@ -219,6 +219,9 @@ public final class TaoTree implements AutoCloseable {
         this.lock = parent.lock;
         this.ownsArena = false;
         this.chunkStore = null; // child trees don't own the chunk store
+
+        // Share parent's epoch reclaimer (all trees sharing a slab should share reclamation)
+        this.reclaimer = parent.reclaimer;
 
         // Copy node class IDs
         this.prefixClassId  = parent.prefixClassId;
@@ -933,7 +936,7 @@ public final class TaoTree implements AutoCloseable {
 
     /**
      * Package-private: restore a child tree from a superblock descriptor.
-     * Shares the parent's arena, slab, bump, and lock.
+     * Shares the parent's arena, slab, bump, lock, and epoch reclaimer.
      * Used to reconstruct TaoDictionary child trees on reopen.
      */
     TaoTree(TaoTree parent, Superblock.TreeDescriptor desc) {
@@ -943,6 +946,9 @@ public final class TaoTree implements AutoCloseable {
         this.lock = parent.lock;
         this.ownsArena = false;
         this.chunkStore = null;
+
+        // Share parent's epoch reclaimer (all trees sharing a slab should share reclamation)
+        this.reclaimer = parent.reclaimer;
 
         this.prefixClassId  = desc.prefixClassId;
         this.node4ClassId   = desc.node4ClassId;
@@ -1249,8 +1255,10 @@ public final class TaoTree implements AutoCloseable {
     // -----------------------------------------------------------------------
 
     /**
-     * Acquire a read scope. Holds the read lock until closed.
-     * Multiple readers can be active simultaneously.
+     * Acquire a read scope. Lock-free: captures a snapshot of the current root
+     * via acquire semantics and enters an epoch to protect against premature
+     * node reclamation. Multiple readers can be active simultaneously without
+     * blocking writers.
      *
      * <p>Use within try-with-resources:
      * <pre>{@code
@@ -1261,7 +1269,6 @@ public final class TaoTree implements AutoCloseable {
      * }</pre>
      */
     public ReadScope read() {
-        lock.readLock().lock();
         return new ReadScope();
     }
 
@@ -1275,16 +1282,8 @@ public final class TaoTree implements AutoCloseable {
      *     w.leafValue(leaf).set(ValueLayout.JAVA_LONG, 0, value);
      * }
      * }</pre>
-     *
-     * @throws IllegalStateException if the current thread holds a read scope but not
-     *                               a write scope (read→write upgrade is not supported)
      */
     public WriteScope write() {
-        if (lock.getReadHoldCount() > 0 && !lock.isWriteLockedByCurrentThread()) {
-            throw new IllegalStateException(
-                "Cannot acquire write scope while holding only a read scope. "
-                + "Release the read scope first, or use a write scope from the start.");
-        }
         lock.writeLock().lock();
         ensureCowEngine();
         return new WriteScope();
@@ -1306,7 +1305,9 @@ public final class TaoTree implements AutoCloseable {
     // -----------------------------------------------------------------------
 
     /**
-     * Read-only scope of the TaoTree. Holds the read lock.
+     * Read-only scope of the TaoTree. Lock-free: holds a snapshot of the root
+     * pointer (captured via acquire semantics) and an epoch slot that protects
+     * referenced nodes from premature reclamation.
      *
      * <p>All returned leaf references and {@link MemorySegment} slices are
      * valid only while this scope is open.
@@ -1315,8 +1316,13 @@ public final class TaoTree implements AutoCloseable {
 
         private boolean closed;
         private final Thread ownerThread = Thread.currentThread();
+        private final long snapshotRoot;
+        private final int epochSlot;
 
-        private ReadScope() {}
+        private ReadScope() {
+            this.epochSlot = reclaimer.enterEpoch();
+            this.snapshotRoot = (long) ROOT_HANDLE.getAcquire(TaoTree.this);
+        }
 
         /**
          * Point lookup.
@@ -1325,19 +1331,19 @@ public final class TaoTree implements AutoCloseable {
         public long lookup(MemorySegment key, int keyLen) {
             checkAccess();
             validateKeyLen(keyLen);
-            return lookupImpl(key, keyLen);
+            return lookupFrom(snapshotRoot, key, keyLen);
         }
 
         /** Point lookup (uses the tree's key length). */
         public long lookup(MemorySegment key) {
             checkAccess();
-            return lookupImpl(key, TaoTree.this.keyLen);
+            return lookupFrom(snapshotRoot, key, TaoTree.this.keyLen);
         }
 
         public long lookup(byte[] key) {
             checkAccess();
             validateKeyLen(key.length);
-            return lookupImpl(MemorySegment.ofArray(key), key.length);
+            return lookupFrom(snapshotRoot, MemorySegment.ofArray(key), key.length);
         }
 
         /**
@@ -1353,11 +1359,11 @@ public final class TaoTree implements AutoCloseable {
 
         public long size() {
             checkAccess();
-            return TaoTree.this.size;
+            return atomicSize.get();
         }
         public boolean isEmpty() {
             checkAccess();
-            return TaoTree.this.size == 0;
+            return atomicSize.get() == 0;
         }
 
         /**
@@ -1380,7 +1386,7 @@ public final class TaoTree implements AutoCloseable {
          */
         public LeafAccessor lookup(MemorySegment key, LeafLayout layout) {
             checkAccess();
-            long ptr = lookupImpl(key, TaoTree.this.keyLen);
+            long ptr = lookupFrom(snapshotRoot, key, TaoTree.this.keyLen);
             if (ptr == NOT_FOUND) return null;
             return new LeafAccessor(leafValueImpl(ptr).asReadOnly(), layout, TaoTree.this);
         }
@@ -1420,7 +1426,7 @@ public final class TaoTree implements AutoCloseable {
         public boolean forEach(LeafVisitor visitor) {
             checkAccess();
             var accessor = new LeafAccessor(null, boundLeafLayout, TaoTree.this);
-            return walkLeaves(root, leafPtr -> {
+            return walkLeaves(snapshotRoot, leafPtr -> {
                 accessor.rebind(leafValueImpl(leafPtr).asReadOnly());
                 return visitor.visit(accessor);
             });
@@ -1443,7 +1449,7 @@ public final class TaoTree implements AutoCloseable {
             if (!qb.isSatisfiable(upTo)) return true; // unsatisfiable → empty
             int prefixLen = qb.prefixLength(upTo);
             var accessor = new LeafAccessor(null, boundLeafLayout, TaoTree.this);
-            return walkPrefixed(qb.key(), prefixLen, leafPtr -> {
+            return walkPrefixed(snapshotRoot, qb.key(), prefixLen, leafPtr -> {
                 accessor.rebind(leafValueImpl(leafPtr).asReadOnly());
                 return visitor.visit(accessor);
             });
@@ -1460,7 +1466,7 @@ public final class TaoTree implements AutoCloseable {
         public boolean scan(MemorySegment prefix, int prefixLen, LeafVisitor visitor) {
             checkAccess();
             var accessor = new LeafAccessor(null, boundLeafLayout, TaoTree.this);
-            return walkPrefixed(prefix, prefixLen, leafPtr -> {
+            return walkPrefixed(snapshotRoot, prefix, prefixLen, leafPtr -> {
                 accessor.rebind(leafValueImpl(leafPtr).asReadOnly());
                 return visitor.visit(accessor);
             });
@@ -1474,7 +1480,7 @@ public final class TaoTree implements AutoCloseable {
             if (!closed) {
                 checkThread();
                 closed = true;
-                lock.readLock().unlock();
+                reclaimer.exitEpoch(epochSlot);
             }
         }
 
@@ -1755,17 +1761,18 @@ public final class TaoTree implements AutoCloseable {
      * <p>Handles prefix-compressed nodes: if the prefix bytes span across or end inside
      * a compressed prefix node, the walker correctly finds the subtree.
      *
+     * @param startRoot the root pointer to start traversal from
      * @param prefix    the prefix bytes to match
      * @param prefixLen number of prefix bytes
      * @param visitor   receives raw leaf pointers; return false to stop early
      * @return true if all matching leaves were visited, false if stopped early
      */
-    private boolean walkPrefixed(MemorySegment prefix, int prefixLen,
+    private boolean walkPrefixed(long startRoot, MemorySegment prefix, int prefixLen,
                                  java.util.function.LongPredicate visitor) {
-        if (NodePtr.isEmpty(root)) return true;
-        if (prefixLen == 0) return walkLeaves(root, visitor);
+        if (NodePtr.isEmpty(startRoot)) return true;
+        if (prefixLen == 0) return walkLeaves(startRoot, visitor);
 
-        long node = root;
+        long node = startRoot;
         int depth = 0;
 
         while (depth < prefixLen) {

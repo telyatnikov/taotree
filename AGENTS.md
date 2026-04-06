@@ -34,7 +34,9 @@
 
 - `TaoTree.open(KeyLayout, LeafLayout)` — auto-creates dicts for `KeyField.dict16/dict32`
 - `TaoTree.open(Path, KeyLayout, LeafLayout)` — reopens file-backed tree, rebinds dicts by order
-- Threading: multiple concurrent readers (read lock), one writer at a time (write lock), deferred COW path-copy for mutations
+- Threading: ROWEX model — lock-free readers (epoch-based snapshot), one writer at a time (write lock), deferred COW path-copy for mutations
+- `ReadScope` captures root via VarHandle acquire + enters epoch; never blocks on writers
+- Child trees (dictionaries) share the parent's `EpochReclaimer` for unified reclamation
 - `tree.compact()` — post-order compaction: arena→slab migration, checkpoint, epoch reclamation
 - `tree.keyDict16("name")` / `tree.leafInt32("name")` — derive typed handles from the tree
 - `tree.newKeyBuilder(arena)` — for writes (uses `intern()`, needs dict lock for dict fields)
