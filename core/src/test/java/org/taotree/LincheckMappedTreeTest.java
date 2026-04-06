@@ -11,6 +11,9 @@ import java.io.UncheckedIOException;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import org.taotree.internal.alloc.BumpAllocator;
+import org.taotree.internal.alloc.ChunkStore;
+import org.taotree.internal.alloc.SlabAllocator;
 
 /**
  * Lincheck linearizability test for file-backed TaoTree.

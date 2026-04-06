@@ -2,6 +2,9 @@ package org.taotree;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import org.taotree.layout.LeafField;
+import org.taotree.layout.LeafHandle;
+import org.taotree.layout.LeafLayout;
 
 /**
  * Typed, named accessor for leaf values structured by a {@link LeafLayout}.

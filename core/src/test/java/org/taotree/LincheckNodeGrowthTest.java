@@ -9,6 +9,10 @@ import org.junit.jupiter.api.Test;
 import java.lang.foreign.ValueLayout;
 import java.util.HashMap;
 import java.util.Map;
+import org.taotree.internal.art.Node16;
+import org.taotree.internal.art.Node256;
+import org.taotree.internal.art.Node48;
+import org.taotree.internal.art.Node4;
 
 /**
  * Lincheck test targeting ART node growth and shrink under concurrency.

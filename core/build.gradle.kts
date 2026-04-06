@@ -23,8 +23,8 @@ tasks.jacocoTestReport {
 
 pitest {
     junit5PluginVersion = "1.2.1"
-    targetClasses = setOf("org.taotree.*", "org.taotree.internal.*")
-    targetTests = setOf("org.taotree.*", "org.taotree.internal.*")
+    targetClasses = setOf("org.taotree.*")
+    targetTests = setOf("org.taotree.*")
     threads = Runtime.getRuntime().availableProcessors()
     outputFormats = setOf("HTML", "XML")
     timestampedReports = false
@@ -33,7 +33,7 @@ pitest {
 
     // Exclude Preallocator (platform-specific native calls, not meaningfully mutable)
     excludedClasses = setOf(
-        "org.taotree.internal.Preallocator"
+        "org.taotree.internal.alloc.Preallocator"
     )
 
     // Exclude Lincheck stress tests — they test concurrency, not code paths,

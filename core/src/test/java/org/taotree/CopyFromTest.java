@@ -38,9 +38,7 @@ class CopyFromTest {
     void copyEmptySource() {
         try (var src = TaoTree.open(KEY_LEN, VALUE_SIZE);
              var tgt = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            try (var w = tgt.write()) {
-                tgt.copyFrom(src);
-            }
+            tgt.copyFrom(src);
             try (var r = tgt.read()) {
                 assertEquals(0, r.size());
             }
@@ -59,9 +57,7 @@ class CopyFromTest {
                 }
             }
 
-            try (var w = tgt.write()) {
-                tgt.copyFrom(src);
-            }
+            tgt.copyFrom(src);
 
             try (var r = tgt.read()) {
                 assertEquals(100, r.size());
@@ -94,9 +90,7 @@ class CopyFromTest {
             }
 
             // Copy only live entries
-            try (var w = tgt.write()) {
-                tgt.copyFrom(src);
-            }
+            tgt.copyFrom(src);
 
             try (var r = tgt.read()) {
                 assertEquals(100, r.size());
@@ -138,9 +132,7 @@ class CopyFromTest {
                 }
             }
 
-            try (var w = tgt.write()) {
-                tgt.copyFrom(src);
-            }
+            tgt.copyFrom(src);
 
             // Verify all strings readable from target
             try (var r = tgt.read()) {
@@ -173,9 +165,7 @@ class CopyFromTest {
                 }
             }
 
-            try (var w = tgt.write()) {
-                tgt.copyFrom(src);
-            }
+            tgt.copyFrom(src);
 
             // Target has only live overflow data (20 strings).
             // At small scale both fit in 1 bump page, so committed bytes may be equal.
@@ -214,9 +204,7 @@ class CopyFromTest {
         // Compact: reopen source read-only, copy to fresh target
         try (var src = TaoTree.open(srcFile);
              var tgt = TaoTree.create(tgtFile, KEY_LEN, VALUE_SIZE)) {
-            try (var w = tgt.write()) {
-                tgt.copyFrom(src);
-            }
+            tgt.copyFrom(src);
         }
 
         // Verify compacted file
@@ -246,9 +234,7 @@ class CopyFromTest {
                 }
             }
 
-            try (var w = tgt.write()) {
-                tgt.copyFrom(src);
-            }
+            tgt.copyFrom(src);
 
             try (var r = tgt.read()) {
                 assertEquals(10_000, r.size());
@@ -295,11 +281,11 @@ class CopyFromTest {
     }
 
     @Test
-    void copyFromWithoutWriteLockThrows() {
+    void copyFromSelfLocking() {
         try (var src = TaoTree.open(KEY_LEN, VALUE_SIZE);
              var tgt = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            // No write scope — should throw
-            assertThrows(IllegalStateException.class, () -> tgt.copyFrom(src));
+            // copyFrom acquires its own lock — no need for external write scope
+            tgt.copyFrom(src); // empty → empty, should not throw
         }
     }
 
@@ -327,9 +313,7 @@ class CopyFromTest {
             }
 
             // Copy source into target
-            try (var w = tgt.write()) {
-                tgt.copyFrom(src);
-            }
+            tgt.copyFrom(src);
 
             try (var r = tgt.read()) {
                 assertEquals(75, r.size()); // union of 0-74
@@ -371,10 +355,8 @@ class CopyFromTest {
             var tgtDict = TaoDictionary.u16(tgt);
 
             // Copy data tree + dictionary
-            try (var w = tgt.write()) {
-                tgt.copyFrom(src);
-                tgtDict.copyFrom(srcDict);
-            }
+            tgt.copyFrom(src);
+            tgtDict.copyFrom(srcDict);
 
             // Verify data
             try (var r = tgt.read()) {
@@ -423,10 +405,8 @@ class CopyFromTest {
              var tgt = TaoTree.create(tgtFile, KEY_LEN, VALUE_SIZE)) {
             var tgtDict = TaoDictionary.u16(tgt);
 
-            try (var w = tgt.write()) {
-                tgt.copyFrom(src);
-                tgtDict.copyFrom(src.dictionary(0));
-            }
+            tgt.copyFrom(src);
+            tgtDict.copyFrom(src.dictionary(0));
         }
 
         // Reopen compacted and verify

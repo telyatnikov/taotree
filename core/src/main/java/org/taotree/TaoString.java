@@ -1,6 +1,6 @@
 package org.taotree;
 
-import org.taotree.internal.BumpAllocator;
+import org.taotree.internal.alloc.BumpAllocator;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -44,12 +44,32 @@ public final class TaoString {
     public static final int SHORT_THRESHOLD = 12;
 
     /**
+     * Describes the layout of a string header within a leaf value.
+     *
+     * <p>Strings use a dual representation inspired by
+     * <a href="https://cedardb.com/blog/strings_deep_dive/">Umbra/CedarDB "German Strings"</a>:
+     * short strings are stored <b>inline</b> in the fixed-size leaf header, while longer
+     * strings store a prefix and a pointer to the <b>out-of-line</b> body in the bump allocator.
+     *
+     * <p>This descriptor tells {@link TaoTree#copyFrom} where the length field and
+     * out-of-line pointer are located, so it can copy the string body from the source
+     * tree's bump allocator to the target's.
+     *
+     * <p>Register via {@link TaoTree#registerStringLayout(int, Layout)}.
+     *
+     * @param lenOffset       byte offset of the 4-byte int length field within the leaf value
+     * @param ptrOffset       byte offset of the 8-byte out-of-line pointer within the leaf value
+     * @param inlineThreshold if length &le; this value, the string is inline (no out-of-line pointer)
+     */
+    public record Layout(int lenOffset, int ptrOffset, int inlineThreshold) {}
+
+    /**
      * String layout descriptor for {@link TaoTree#copyFrom}.
-     * Register with {@link TaoTree#registerStringLayout(int, StringLayout)}
+     * Register with {@link TaoTree#registerStringLayout(int, Layout)}
      * for leaf classes that store TaoString values.
      */
-    public static final StringLayout STRING_LAYOUT =
-        new StringLayout(0, 8, SHORT_THRESHOLD);
+    public static final Layout STRING_LAYOUT =
+        new Layout(0, 8, SHORT_THRESHOLD);
 
     private static final long OFF_LEN     = 0;
     private static final long OFF_PAYLOAD = 4;

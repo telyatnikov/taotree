@@ -1,26 +1,27 @@
 package org.taotree;
 
-import org.taotree.internal.NodePtr;
+import org.taotree.internal.art.NodePtr;
 
-import org.taotree.internal.Node4;
-import org.taotree.internal.Node16;
-import org.taotree.internal.Node48;
-import org.taotree.internal.Node256;
-import org.taotree.internal.NodeConstants;
-import org.taotree.internal.BumpAllocator;
-import org.taotree.internal.CheckpointIO;
-import org.taotree.internal.CheckpointV2;
-import org.taotree.internal.ChunkStore;
-import org.taotree.internal.CommitRecord;
-import org.taotree.internal.Compactor;
-import org.taotree.internal.CowEngine;
-import org.taotree.internal.EpochReclaimer;
-import org.taotree.internal.Preallocator;
-import org.taotree.internal.PrefixNode;
-import org.taotree.internal.ShadowPagingRecovery;
-import org.taotree.internal.SlabAllocator;
-import org.taotree.internal.Superblock;
-import org.taotree.internal.WriterArena;
+import org.taotree.internal.art.Node4;
+import org.taotree.internal.art.Node16;
+import org.taotree.internal.art.Node48;
+import org.taotree.internal.art.Node256;
+import org.taotree.internal.art.NodeConstants;
+import org.taotree.internal.alloc.BumpAllocator;
+import org.taotree.internal.alloc.ChunkStore;
+import org.taotree.internal.cow.Compactor;
+import org.taotree.internal.cow.CowEngine;
+import org.taotree.internal.cow.EpochReclaimer;
+import org.taotree.internal.alloc.Preallocator;
+import org.taotree.internal.art.PrefixNode;
+import org.taotree.internal.persist.CheckpointIO;
+import org.taotree.internal.persist.CheckpointV2;
+import org.taotree.internal.persist.CommitRecord;
+import org.taotree.internal.persist.PersistenceManager;
+import org.taotree.internal.persist.ShadowPagingRecovery;
+import org.taotree.internal.alloc.SlabAllocator;
+import org.taotree.internal.persist.Superblock;
+import org.taotree.internal.alloc.WriterArena;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -35,6 +36,14 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import org.taotree.layout.KeyBuilder;
+import org.taotree.layout.KeyField;
+import org.taotree.layout.KeyHandle;
+import org.taotree.layout.KeyLayout;
+import org.taotree.layout.LeafField;
+import org.taotree.layout.LeafHandle;
+import org.taotree.layout.LeafLayout;
+import org.taotree.layout.QueryBuilder;
 
 /**
  * Off-heap key-value tree backed by an Adaptive Radix Tree.
@@ -64,7 +73,10 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * }</pre>
  *
  * <h3>Threading model:</h3>
- * <p>Safe for one writer + many readers across threads, protected by a fair RW lock.
+ * <p>Multiple concurrent readers, one writer at a time. Readers hold the
+ * read lock; writers hold the write lock. Structural mutations use COW
+ * (copy-on-write) path-copy via {@link CowEngine} with deferred publication —
+ * the new tree root is published atomically when the write scope closes.
  * Use {@link #read()} / {@link #write()} for scoped access.
  *
  * <p><b>Important:</b> Leaf references ({@code long} values) and {@link MemorySegment}
@@ -87,17 +99,8 @@ public final class TaoTree implements AutoCloseable {
     private final boolean ownsArena;
     private final ChunkStore chunkStore; // null for in-memory mode
 
-    // -- V2 checkpoint state (file-backed mode) --
-    private long checkpointGeneration;  // monotonically increasing generation (shared by checkpoints + commits)
-    private int activeSlotPage = CheckpointV2.SLOT_A_PAGE; // which checkpoint slot was last written
-
-    // -- V2 commit record state (shadow paging) --
-    private int nextCommitPage = -1;    // pre-reserved page for the next commit record (-1 = none)
-    private int prevCommitPage;         // page of the previous commit record (for backward linkage)
-    private int commitsSinceCheckpoint; // count since last full checkpoint
-
-    /** How many commit records between full checkpoints. */
-    private static final int COMMITS_PER_CHECKPOINT = 64;
+    // -- Persistence coordination (file-backed mode) --
+    private PersistenceManager persistence; // null for in-memory mode
 
     /** Package-private: provides overflow storage for {@link TaoString}. */
     BumpAllocator bump() { return bump; }
@@ -119,10 +122,11 @@ public final class TaoTree implements AutoCloseable {
     private long root = NodePtr.EMPTY_PTR;
     long size = 0; // package-private for TaoDictionary
 
-    // -- COW infrastructure (v2) --
-    // Volatile root pointer for lock-free reader access via VarHandle CAS.
-    // Writers CAS this when the root itself changes (growth, shrink).
-    // Per-subtree CAS on Node256 children bypasses this.
+    // -- COW infrastructure --
+    // Volatile root pointer for lock-free dictionary resolve via VarHandle.
+    // Writers update root (non-volatile) during mutations, then publish to
+    // rootPtr via setRelease in commitWrite(). Dict resolvers read rootPtr
+    // via getAcquire in lookupLockFree().
     @SuppressWarnings("unused") // accessed via ROOT_HANDLE VarHandle
     private volatile long rootPtr = NodePtr.EMPTY_PTR;
 
@@ -136,17 +140,14 @@ public final class TaoTree implements AutoCloseable {
         }
     }
 
-    // Atomic size counter for concurrent writers
+    // Atomic size counter for lock-free dictionary size queries
     private final AtomicLong atomicSize = new AtomicLong(0);
 
-    // Epoch-based reclaimer: deferred node freeing for lock-free readers
-    private EpochReclaimer reclaimer; // null until COW mode is activated
+    // Epoch-based reclaimer: deferred node freeing after COW path-copy
+    private EpochReclaimer reclaimer;
 
-    // COW engine: performs structural mutations via path-copy + CAS
-    private CowEngine cowEngine; // null until COW mode is activated
-
-    // True when COW mode is active (v2). False for legacy RW-lock mode.
-    private volatile boolean cowMode = false;
+    // COW engine: performs structural mutations via deferred path-copy
+    private CowEngine cowEngine;
 
     // Tracked dictionaries (for persistence)
     private final List<TaoDictionary> dicts = new ArrayList<>();
@@ -158,7 +159,7 @@ public final class TaoTree implements AutoCloseable {
     private LeafLayout boundLeafLayout;
 
     // String layouts per slab class ID (for copyFrom out-of-line string handling)
-    private final java.util.Map<Integer, StringLayout> stringLayouts = new java.util.HashMap<>();
+    private final java.util.Map<Integer, TaoString.Layout> stringLayouts = new java.util.HashMap<>();
 
     // -----------------------------------------------------------------------
     // Root tree constructor (owns arena)
@@ -188,6 +189,12 @@ public final class TaoTree implements AutoCloseable {
         for (int i = 0; i < leafClassCount; i++) {
             leafClassIds[i] = slab.registerClass(keySlotSize + this.leafValueSizes[i]);
         }
+
+        // Init epoch reclaimer + COW engine
+        this.reclaimer = new EpochReclaimer(slab);
+        this.cowEngine = new CowEngine(slab, reclaimer,
+            prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
+            keyLen, keySlotSize, leafClassIds);
     }
 
     // -----------------------------------------------------------------------
@@ -315,7 +322,7 @@ public final class TaoTree implements AutoCloseable {
      * Create a data tree from a key layout and leaf layout.
      *
      * <p>Derives the key length from the key layout and the leaf value size from the
-     * leaf layout. Automatically registers {@link StringLayout}s for any
+     * leaf layout. Automatically registers {@link TaoString.Layout}s for any
      * {@link LeafField.Str} or {@link LeafField.Json} fields so that
      * {@link #copyFrom} handles out-of-line strings correctly.
      *
@@ -416,62 +423,16 @@ public final class TaoTree implements AutoCloseable {
      * Used when reopening a file-backed tree — dicts already exist, we just connect them.
      */
     private static KeyLayout rebindDicts(TaoTree tree, KeyLayout keyLayout) {
-        var fields = new KeyField[keyLayout.fieldCount()];
-        int dictIdx = 0;
-        boolean changed = false;
-        for (int i = 0; i < fields.length; i++) {
-            var f = keyLayout.field(i);
-            if (f instanceof KeyField.DictU16 d && d.dict() == null) {
-                if (dictIdx >= tree.dicts.size()) {
-                    throw new IllegalArgumentException(
-                        "Key layout has more dict fields than restored dictionaries ("
-                        + tree.dicts.size() + ")");
-                }
-                fields[i] = KeyField.dict16(d.name(), tree.dicts.get(dictIdx++));
-                changed = true;
-            } else if (f instanceof KeyField.DictU32 d && d.dict() == null) {
-                if (dictIdx >= tree.dicts.size()) {
-                    throw new IllegalArgumentException(
-                        "Key layout has more dict fields than restored dictionaries ("
-                        + tree.dicts.size() + ")");
-                }
-                fields[i] = KeyField.dict32(d.name(), tree.dicts.get(dictIdx++));
-                changed = true;
-            } else {
-                fields[i] = f;
-            }
-        }
-        return changed ? KeyLayout.of(fields) : keyLayout;
+        return Binding.rebindDicts(tree, keyLayout);
     }
 
-    /** Auto-register string layouts for TaoString/JSON fields in the leaf layout. */
     private static void registerStringLayouts(TaoTree tree, LeafLayout leafLayout,
                                               int leafClassIndex) {
-        for (var sl : leafLayout.stringLayouts()) {
-            tree.registerStringLayout(leafClassIndex, sl);
-        }
+        Binding.registerStringLayouts(tree, leafLayout, leafClassIndex);
     }
 
-    /**
-     * Create dictionaries for any unbound dict fields in the key layout and return
-     * a new layout with the dict references filled in.
-     */
     private static KeyLayout bindDicts(TaoTree tree, KeyLayout keyLayout) {
-        var fields = new KeyField[keyLayout.fieldCount()];
-        boolean changed = false;
-        for (int i = 0; i < fields.length; i++) {
-            var f = keyLayout.field(i);
-            if (f instanceof KeyField.DictU16 d && d.dict() == null) {
-                fields[i] = KeyField.dict16(d.name(), TaoDictionary.u16(tree));
-                changed = true;
-            } else if (f instanceof KeyField.DictU32 d && d.dict() == null) {
-                fields[i] = KeyField.dict32(d.name(), TaoDictionary.u32(tree));
-                changed = true;
-            } else {
-                fields[i] = f;
-            }
-        }
-        return changed ? KeyLayout.of(fields) : keyLayout;
+        return Binding.bindDicts(tree, keyLayout);
     }
 
     // -----------------------------------------------------------------------
@@ -650,7 +611,7 @@ public final class TaoTree implements AutoCloseable {
      * @param leafClassIndex the leaf class index (0-based)
      * @param layout         the string layout descriptor
      */
-    public void registerStringLayout(int leafClassIndex, StringLayout layout) {
+    public void registerStringLayout(int leafClassIndex, TaoString.Layout layout) {
         stringLayouts.put(leafClassIds[leafClassIndex], layout);
     }
 
@@ -662,7 +623,7 @@ public final class TaoTree implements AutoCloseable {
      * Copy all live entries from the source tree into this tree.
      *
      * <p>Walks the source tree and re-inserts every leaf into this tree. For leaves
-     * with registered {@link StringLayout}s, out-of-line string data is copied from
+     * with registered {@link TaoString.Layout}s, out-of-line string data is copied from
      * the source's bump allocator to this tree's bump allocator and the pointer is
      * patched in the target leaf.
      *
@@ -674,162 +635,44 @@ public final class TaoTree implements AutoCloseable {
      * // Compact a file-backed tree into a fresh file
      * try (var compacted = TaoTree.create(newPath, tree.keyLen(), valueSize)) {
      *     compacted.registerStringLayout(0, TaoString.STRING_LAYOUT);
-     *     try (var w = compacted.write()) {
-     *         compacted.copyFrom(tree);
-     *     }
+     *     compacted.copyFrom(tree);
      * }
      * }</pre>
      *
-     * <p><b>Threading:</b> The caller must hold a write scope on this tree
-     * (enforced — throws {@link IllegalStateException} if not held).
+     * <p><b>Threading:</b> Self-locking — acquires the write lock internally.
      * The source tree should not be concurrently modified (hold a read scope on
      * it, or ensure exclusive access).
      *
      * @param source the source tree to copy from
      * @throws IllegalArgumentException if key lengths, leaf class counts, or leaf value sizes don't match
-     * @throws IllegalStateException if the target write lock is not held
      */
     public void copyFrom(TaoTree source) {
-        if (!lock.isWriteLockedByCurrentThread()) {
-            throw new IllegalStateException(
-                "copyFrom() requires the target tree's write lock. "
-                + "Use WriteScope.copyFrom(ReadScope) for the scope-safe API.");
+        lock.writeLock().lock();
+        try {
+            var ws = beginWrite();
+            copyFromImpl(source, ws);
+            commitWrite(ws);
+        } finally {
+            lock.writeLock().unlock();
         }
-        copyFromImpl(source);
     }
 
     /**
-     * Package-private implementation of copyFrom. Assumes locks are already held.
+     * Package-private implementation of copyFrom with explicit WriteState.
+     */
+    void copyFromImpl(TaoTree source, WriteState ws) {
+        var copier = new Copier(source, this, ws);
+        copier.validate();
+        copier.copy();
+    }
+
+    /**
+     * Package-private implementation of copyFrom. Creates own WriteState.
      */
     void copyFromImpl(TaoTree source) {
-        if (source.keyLen != this.keyLen) {
-            throw new IllegalArgumentException(
-                "Key length mismatch: source=" + source.keyLen + " target=" + this.keyLen);
-        }
-        if (source.leafClassCount != this.leafClassCount) {
-            throw new IllegalArgumentException(
-                "Leaf class count mismatch: source=" + source.leafClassCount
-                + " target=" + this.leafClassCount);
-        }
-        for (int i = 0; i < source.leafClassCount; i++) {
-            if (source.leafValueSizes[i] != this.leafValueSizes[i]) {
-                throw new IllegalArgumentException(
-                    "Leaf value size mismatch at class " + i + ": source="
-                    + source.leafValueSizes[i] + " target=" + this.leafValueSizes[i]);
-            }
-        }
-        if (NodePtr.isEmpty(source.root)) return;
-        copyNode(source, source.root);
-    }
-
-    /**
-     * Recursively walk the source tree and re-insert every leaf into this tree.
-     */
-    private void copyNode(TaoTree source, long nodePtr) {
-        if (NodePtr.isEmpty(nodePtr)) return;
-
-        int type = NodePtr.nodeType(nodePtr);
-
-        if (type == NodePtr.LEAF) {
-            copyLeaf(source, nodePtr);
-            return;
-        }
-
-        if (type == NodePtr.PREFIX) {
-            MemorySegment prefSeg = source.slab.resolve(nodePtr);
-            copyNode(source, PrefixNode.child(prefSeg));
-            return;
-        }
-
-        // Inner node: recurse into all children
-        MemorySegment seg = source.slab.resolve(nodePtr);
-        switch (type) {
-            case NodePtr.NODE_4 -> {
-                int n = Node4.count(seg);
-                for (int i = 0; i < n; i++) {
-                    copyNode(source, Node4.childAt(seg, i));
-                }
-            }
-            case NodePtr.NODE_16 -> {
-                int n = Node16.count(seg);
-                for (int i = 0; i < n; i++) {
-                    copyNode(source, Node16.childAt(seg, i));
-                }
-            }
-            case NodePtr.NODE_48 ->
-                Node48.forEach(seg, (k, child) -> copyNode(source, child));
-            case NodePtr.NODE_256 ->
-                Node256.forEach(seg, (k, child) -> copyNode(source, child));
-        }
-    }
-
-    /**
-     * Copy a single leaf from source to this tree.
-     * Extracts the key, inserts into this tree, copies the value,
-     * and handles out-of-line string data if a StringLayout is registered.
-     */
-    private void copyLeaf(TaoTree source, long srcLeafPtr) {
-        // Extract key from source leaf
-        MemorySegment srcFull = source.slab.resolve(srcLeafPtr);
-        MemorySegment srcKey = srcFull.asSlice(0, keyLen);
-
-        // Determine the leaf class index in source
-        int srcSlabClassId = NodePtr.slabClassId(srcLeafPtr);
-        int leafClassIdx = -1;
-        for (int i = 0; i < source.leafClassCount; i++) {
-            if (source.leafClassIds[i] == srcSlabClassId) {
-                leafClassIdx = i;
-                break;
-            }
-        }
-        if (leafClassIdx < 0 || leafClassIdx >= this.leafClassCount) {
-            throw new IllegalStateException(
-                "Source leaf class index " + leafClassIdx + " not compatible with target tree");
-        }
-
-        // Insert into this tree
-        long tgtLeafPtr = getOrCreateImpl(srcKey, keyLen, leafClassIdx);
-
-        // Verify the target leaf's slab class matches the requested class.
-        // If the key already existed in a different leaf class, the slab class
-        // will differ and raw byte copy would be unsafe.
-        int tgtSlabClassId = NodePtr.slabClassId(tgtLeafPtr);
-        if (tgtSlabClassId != this.leafClassIds[leafClassIdx]) {
-            throw new IllegalStateException(
-                "Leaf class conflict for existing key: target slab class " + tgtSlabClassId
-                + " != expected " + this.leafClassIds[leafClassIdx]
-                + " (leaf class index " + leafClassIdx + ")."
-                + " Cannot copy into a non-empty target where the same key exists with a different leaf class.");
-        }
-
-        // Copy value portion, handling out-of-line string data if registered.
-        // Order matters: allocate overflow first, then write the final value with
-        // the patched pointer. This avoids a window where the target leaf contains
-        // a dangling source overflow pointer if allocation fails mid-copy.
-        MemorySegment srcValue = srcFull.asSlice(source.keySlotSize);
-        MemorySegment tgtValue = leafValueImpl(tgtLeafPtr);
-
-        StringLayout layout = stringLayouts.get(this.leafClassIds[leafClassIdx]);
-        if (layout != null) {
-            int len = srcValue.get(ValueLayout.JAVA_INT_UNALIGNED, layout.lenOffset());
-            if (len > layout.inlineThreshold()) {
-                // Allocate and copy overflow BEFORE writing the leaf value
-                long srcRef = srcValue.get(ValueLayout.JAVA_LONG_UNALIGNED, layout.ptrOffset());
-                MemorySegment srcData = source.bump.resolve(srcRef, len);
-
-                long tgtRef = this.bump.allocate(len);
-                MemorySegment tgtData = this.bump.resolve(tgtRef, len);
-                MemorySegment.copy(srcData, 0, tgtData, 0, len);
-
-                // Copy the full value, then patch with the target pointer
-                MemorySegment.copy(srcValue, 0, tgtValue, 0, srcValue.byteSize());
-                tgtValue.set(ValueLayout.JAVA_LONG_UNALIGNED, layout.ptrOffset(), tgtRef);
-                return;
-            }
-        }
-
-        // No overflow (or no layout registered): straight byte copy
-        MemorySegment.copy(srcValue, 0, tgtValue, 0, srcValue.byteSize());
+        var ws = beginWrite();
+        copyFromImpl(source, ws);
+        commitWrite(ws);
     }
 
     // -----------------------------------------------------------------------
@@ -900,10 +743,11 @@ public final class TaoTree implements AutoCloseable {
         var bump = new BumpAllocator(arena, cs, BumpAllocator.DEFAULT_PAGE_SIZE);
 
         var tree = new TaoTree(arena, slab, bump, cs, keyLen, leafValueSizes);
+        tree.persistence = new PersistenceManager(cs);
         // Write initial v2 checkpoint to slot A
-        tree.writeCheckpointV2();
+        tree.persistence.writeCheckpoint(tree.gatherMetadata());
         // Reserve a page for the first commit record (at nextPage, so recovery finds it)
-        tree.reserveNextCommitPage();
+        tree.persistence.reserveNextCommitPage();
         return tree;
     }
 
@@ -944,9 +788,9 @@ public final class TaoTree implements AutoCloseable {
             data.trees.length > 0 ? data.trees[0].root : NodePtr.EMPTY_PTR,
             data.trees.length > 0 ? data.trees[0].size : 0,
             data.dicts.length,
-            dictRootsFromData(data),
-            dictNextCodesFromData(data),
-            dictSizesFromData(data),
+            PersistenceManager.dictRootsFromData(data),
+            PersistenceManager.dictNextCodesFromData(data),
+            PersistenceManager.dictSizesFromData(data),
             data.nextPage,
             totalPages);
 
@@ -991,8 +835,7 @@ public final class TaoTree implements AutoCloseable {
         }
         var treeDesc = data.trees[0];
         var tree = new TaoTree(arena, slab, bump, cs, treeDesc);
-        tree.checkpointGeneration = cpGeneration;
-        tree.activeSlotPage = cpActiveSlot;
+        tree.persistence = new PersistenceManager(cs, cpGeneration, cpActiveSlot);
 
         // Restore dictionaries
         for (var dictDesc : data.dicts) {
@@ -1003,42 +846,9 @@ public final class TaoTree implements AutoCloseable {
         }
 
         // Reserve the next commit record page for shadow paging
-        tree.reserveNextCommitPage();
+        tree.persistence.reserveNextCommitPage();
 
         return tree;
-    }
-
-    // -----------------------------------------------------------------------
-    // Recovery helpers
-    // -----------------------------------------------------------------------
-
-    /** Extract dict roots from superblock data for recovery. */
-    private static long[] dictRootsFromData(Superblock.SuperblockData data) {
-        long[] roots = new long[data.dicts.length];
-        for (int i = 0; i < data.dicts.length; i++) {
-            int treeIdx = data.dicts[i].treeIndex;
-            roots[i] = treeIdx < data.trees.length ? data.trees[treeIdx].root : 0;
-        }
-        return roots;
-    }
-
-    /** Extract dict next codes from superblock data for recovery. */
-    private static long[] dictNextCodesFromData(Superblock.SuperblockData data) {
-        long[] codes = new long[data.dicts.length];
-        for (int i = 0; i < data.dicts.length; i++) {
-            codes[i] = data.dicts[i].nextCode;
-        }
-        return codes;
-    }
-
-    /** Extract dict sizes from superblock data for recovery. */
-    private static long[] dictSizesFromData(Superblock.SuperblockData data) {
-        long[] sizes = new long[data.dicts.length];
-        for (int i = 0; i < data.dicts.length; i++) {
-            int treeIdx = data.dicts[i].treeIndex;
-            sizes[i] = treeIdx < data.trees.length ? data.trees[treeIdx].size : 0;
-        }
-        return sizes;
     }
 
     // -----------------------------------------------------------------------
@@ -1070,6 +880,13 @@ public final class TaoTree implements AutoCloseable {
         for (int i = 0; i < leafClassCount; i++) {
             leafClassIds[i] = slab.registerClass(keySlotSize + this.leafValueSizes[i]);
         }
+
+        // COW always active: init epoch reclaimer + COW engine
+        this.reclaimer = new EpochReclaimer(slab);
+        var writerArena = new WriterArena(chunkStore);
+        this.cowEngine = new CowEngine(slab, reclaimer, writerArena, chunkStore,
+            prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
+            keyLen, keySlotSize, leafClassIds);
     }
 
     // -----------------------------------------------------------------------
@@ -1099,6 +916,15 @@ public final class TaoTree implements AutoCloseable {
 
         this.root = desc.root;
         this.size = desc.size;
+
+        // COW always active: init epoch reclaimer + COW engine
+        this.reclaimer = new EpochReclaimer(slab);
+        var writerArena = new WriterArena(chunkStore);
+        this.cowEngine = new CowEngine(slab, reclaimer, writerArena, chunkStore,
+            prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
+            keyLen, keySlotSize, leafClassIds);
+        ROOT_HANDLE.setRelease(this, root);
+        atomicSize.set(size);
     }
 
     // -----------------------------------------------------------------------
@@ -1132,50 +958,23 @@ public final class TaoTree implements AutoCloseable {
 
         this.root = desc.root;
         this.size = desc.size;
-    }
-
-    // -----------------------------------------------------------------------
-    // COW mode activation
-    // -----------------------------------------------------------------------
-
-    /**
-     * Activate ROWEX-hybrid COW mode (v2 concurrency model).
-     *
-     * <p>After activation:
-     * <ul>
-     *   <li>Readers are completely lock-free (one acquire, then plain loads)
-     *   <li>Writers use COW path-copy + per-subtree CAS
-     *   <li>Nodes are retired (deferred free) instead of immediately freed
-     * </ul>
-     *
-     * <p>This is a one-way transition. Cannot be deactivated.
-     */
-    public void activateCowMode() {
-        if (cowMode) return;
-        reclaimer = new EpochReclaimer(slab);
-        if (chunkStore != null) {
-            // File-backed: use WriterArena for contiguous COW allocations
-            var writerArena = new WriterArena(chunkStore);
-            cowEngine = new CowEngine(slab, reclaimer, writerArena, chunkStore,
-                prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
-                keyLen, keySlotSize, leafClassIds);
-        } else {
-            // In-memory: allocate from slab (no arena needed)
-            cowEngine = new CowEngine(slab, reclaimer,
-                prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
-                keyLen, keySlotSize, leafClassIds);
-        }
-        // Sync root and size to the atomic versions
+        // Publish root for dict resolve (lock-free via rootPtr acquire)
         ROOT_HANDLE.setRelease(this, root);
         atomicSize.set(size);
-        cowMode = true;
     }
 
-    /** Returns true if COW mode is active. */
-    public boolean isCowMode() { return cowMode; }
+    // -----------------------------------------------------------------------
+    // COW mode
+    // -----------------------------------------------------------------------
 
-    /** Returns the epoch reclaimer (null if COW mode not active). */
+    /** Returns the epoch reclaimer. */
     EpochReclaimer reclaimer() { return reclaimer; }
+
+    /** Package-private: publish root and size for dict resolvers (via rootPtr/atomicSize). */
+    void publishRoot() {
+        ROOT_HANDLE.setRelease(this, root);
+        atomicSize.set(size);
+    }
 
     // -----------------------------------------------------------------------
     // Lock-free lookup (COW mode)
@@ -1216,80 +1015,6 @@ public final class TaoTree implements AutoCloseable {
         return NodePtr.EMPTY_PTR;
     }
 
-    /**
-     * COW insert with retry. Uses CowEngine for structural mutation
-     * and per-subtree CAS for publication. Retries on CAS failure.
-     */
-    long cowGetOrCreateWithRetry(MemorySegment key, int keyLen, int leafClass) {
-        while (true) {
-            long currentRoot = (long) ROOT_HANDLE.getAcquire(this);
-            var result = cowEngine.cowGetOrCreate(currentRoot, key, keyLen, leafClass);
-
-            if (!result.created()) {
-                return result.leafPtr(); // key already existed
-            }
-
-            if (result.published()) {
-                // Per-subtree CAS succeeded
-                atomicSize.incrementAndGet();
-                reclaimer.advanceGeneration();
-                // Sync legacy fields for backward compat
-                root = (long) ROOT_HANDLE.getAcquire(this);
-                size = atomicSize.get();
-                return result.leafPtr();
-            }
-
-            // Need root-level CAS (no Node256 ancestor or root changed)
-            if (!NodePtr.isEmpty(result.newRoot())) {
-                boolean success = ROOT_HANDLE.compareAndSet(this, currentRoot, result.newRoot());
-                if (success) {
-                    atomicSize.incrementAndGet();
-                    reclaimer.advanceGeneration();
-                    root = result.newRoot();
-                    size = atomicSize.get();
-                    return result.leafPtr();
-                }
-                // CAS failed — another writer changed the root
-                cowEngine.retireSpeculative(result.newRoot());
-            }
-            // Retry from scratch
-        }
-    }
-
-    /**
-     * COW delete with retry.
-     */
-    boolean cowDeleteWithRetry(MemorySegment key, int keyLen) {
-        while (true) {
-            long currentRoot = (long) ROOT_HANDLE.getAcquire(this);
-            var result = cowEngine.cowDelete(currentRoot, key, keyLen);
-
-            if (!result.deleted()) {
-                return false;
-            }
-
-            if (result.published()) {
-                atomicSize.decrementAndGet();
-                reclaimer.advanceGeneration();
-                root = (long) ROOT_HANDLE.getAcquire(this);
-                size = atomicSize.get();
-                return true;
-            }
-
-            // Root-level CAS
-            long newRoot = result.newRoot();
-            boolean success = ROOT_HANDLE.compareAndSet(this, currentRoot, newRoot);
-            if (success) {
-                atomicSize.decrementAndGet();
-                reclaimer.advanceGeneration();
-                root = newRoot;
-                size = atomicSize.get();
-                return true;
-            }
-            // CAS failed — retry
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Stats (public, self-locking)
     // -----------------------------------------------------------------------
@@ -1327,17 +1052,15 @@ public final class TaoTree implements AutoCloseable {
      * slab layout, publish the new root, write a full checkpoint, and advance
      * {@code durableGeneration} to enable reclamation of old arena pages.
      *
-     * <p>This is a blocking operation that acquires the write lock. In COW mode,
-     * readers remain lock-free during compaction — they see the old tree until
-     * the new root is published.
+     * <p>This is a blocking operation that acquires the write lock.
      *
      * @throws IOException if an I/O error occurs during checkpoint write
      */
     public void compact() throws IOException {
-        if (chunkStore == null) return;
+        if (persistence == null) return;
         lock.writeLock().lock();
         try {
-            long currentRoot = cowMode ? (long) ROOT_HANDLE.getAcquire(this) : root;
+            long currentRoot = root;
             if (NodePtr.isEmpty(currentRoot)) return;
 
             var compactor = new Compactor(slab, bump, reclaimer, chunkStore,
@@ -1347,22 +1070,17 @@ public final class TaoTree implements AutoCloseable {
             var result = compactor.compact(currentRoot);
 
             // Publish the compacted root
-            long oldRoot = currentRoot;
-            if (cowMode) {
-                ROOT_HANDLE.setRelease(this, result.newRoot());
-                root = result.newRoot();
-            } else {
-                root = result.newRoot();
-            }
+            root = result.newRoot();
+            publishRoot();
 
             // Write a full checkpoint with the compacted state
-            writeCheckpointV2();
-            commitsSinceCheckpoint = 0;
+            persistence.writeCheckpoint(gatherMetadata());
+            persistence.resetCommitCount();
             chunkStore.sync();
 
             // Advance durable generation — retired nodes older than this can now be freed
             if (reclaimer != null) {
-                reclaimer.advanceDurableGeneration(checkpointGeneration);
+                reclaimer.advanceDurableGeneration(persistence.generation());
                 reclaimer.reclaim();
             }
         } finally {
@@ -1373,35 +1091,6 @@ public final class TaoTree implements AutoCloseable {
     // -----------------------------------------------------------------------
     // Lock operations (package-private, used by TaoDictionary)
     // -----------------------------------------------------------------------
-
-    /**
-     * Fail fast if the current thread holds a read lock but not the write lock.
-     * Prevents read→write upgrade deadlocks.
-     */
-    void checkCanAcquireWriteLock() {
-        if (lock.getReadHoldCount() > 0 && !lock.isWriteLockedByCurrentThread()) {
-            throw new IllegalStateException(
-                "Cannot acquire write scope while holding only a read scope. " +
-                "Release the read scope first, or use a write scope from the start.");
-        }
-    }
-
-    void acquireReadLock() {
-        lock.readLock().lock();
-    }
-
-    void releaseReadLock() {
-        lock.readLock().unlock();
-    }
-
-    void acquireWriteLock() {
-        checkCanAcquireWriteLock();
-        lock.writeLock().lock();
-    }
-
-    void releaseWriteLock() {
-        lock.writeLock().unlock();
-    }
 
     boolean isWriteLockedByCurrentThread() {
         return lock.isWriteLockedByCurrentThread();
@@ -1422,18 +1111,16 @@ public final class TaoTree implements AutoCloseable {
      * @throws IOException if an I/O error occurs during sync
      */
     public void sync() throws IOException {
-        if (chunkStore == null) return;
+        if (persistence == null) return;
         lock.writeLock().lock();
         try {
-            writeCommitRecord();
-            commitsSinceCheckpoint++;
-            if (commitsSinceCheckpoint >= COMMITS_PER_CHECKPOINT) {
-                writeCheckpointV2();
-                commitsSinceCheckpoint = 0;
+            persistence.writeCommitRecord(buildCommitData());
+            if (persistence.shouldCheckpoint()) {
+                persistence.writeCheckpoint(gatherMetadata());
+                persistence.resetCommitCount();
                 chunkStore.sync();
-                // Full checkpoint is now durable — advance durableGeneration
                 if (reclaimer != null) {
-                    reclaimer.advanceDurableGeneration(checkpointGeneration);
+                    reclaimer.advanceDurableGeneration(persistence.generation());
                     reclaimer.reclaim();
                 }
             } else {
@@ -1452,12 +1139,12 @@ public final class TaoTree implements AutoCloseable {
     @Override
     public void close() {
         if (ownsArena) {
-            if (chunkStore != null) {
+            if (persistence != null) {
                 try {
-                    writeCheckpointV2();
+                    persistence.writeCheckpoint(gatherMetadata());
                     chunkStore.sync();
                     if (reclaimer != null) {
-                        reclaimer.advanceDurableGeneration(checkpointGeneration);
+                        reclaimer.advanceDurableGeneration(persistence.generation());
                         reclaimer.reclaim();
                     }
                     chunkStore.close();
@@ -1493,32 +1180,8 @@ public final class TaoTree implements AutoCloseable {
     }
 
     /**
-     * Write a v2 checkpoint to the inactive slot (mirrored A/B).
-     * Each call toggles between slot A and slot B, so a torn write
-     * to the new slot never corrupts the previous valid checkpoint.
-     */
-    private void writeCheckpointV2() {
-        if (chunkStore == null) return;
-
-        // Gather metadata into SuperblockData (reuse existing collector)
-        var sbData = gatherMetadata();
-
-        // Write to the INACTIVE slot (the one NOT written last time)
-        int targetSlotPage = CheckpointV2.inactiveSlotPage(activeSlotPage);
-        long targetSlotId = (targetSlotPage == CheckpointV2.SLOT_A_PAGE) ? 0 : 1;
-        checkpointGeneration++;
-
-        var cpData = CheckpointIO.toCheckpoint(sbData, checkpointGeneration, targetSlotId);
-        MemorySegment slot = chunkStore.resolve(targetSlotPage, CheckpointV2.SLOT_SIZE_PAGES);
-        slot.fill((byte) 0);
-        CheckpointV2.write(slot, cpData);
-
-        activeSlotPage = targetSlotPage;
-    }
-
-    /**
      * Gather all tree metadata into a {@link Superblock.SuperblockData} structure.
-     * Used by writeCheckpointV2 for v2 checkpoint serialization.
+     * Called by {@link PersistenceManager#writeCheckpoint}.
      */
     private Superblock.SuperblockData gatherMetadata() {
         var data = new Superblock.SuperblockData();
@@ -1560,68 +1223,25 @@ public final class TaoTree implements AutoCloseable {
     }
 
     /**
-     * Write a lightweight commit record to the pre-reserved page.
-     *
-     * <p>The commit record captures the current tree root, size, and dictionary
-     * state in a single 4 KB page. Recovery scans these records forward from
-     * the last checkpoint to reconstruct the latest state.
-     *
-     * <p>Crash safety: the commit record page was pre-reserved (zeroed) at the
-     * position where recovery expects it. If we crash before writing, recovery
-     * reads the zeroed page, finds no valid commit record, and stops — state
-     * reverts to the last valid commit or checkpoint. If we crash after writing
-     * but before forcing, the commit record may or may not be durable, which
-     * is the expected trade-off for non-forced syncs.
+     * Build a commit record data snapshot from current tree + dict state.
+     * The {@link PersistenceManager} fills in generation, prev-page, and arena pages.
      */
-    private void writeCommitRecord() {
-        if (chunkStore == null || nextCommitPage < 0) return;
-
-        checkpointGeneration++;
-
-        var commitData = new CommitRecord.CommitData();
-        commitData.generation = checkpointGeneration;
-        commitData.prevCommitPage = prevCommitPage;
-        commitData.primaryRoot = cowMode ? (long) ROOT_HANDLE.getAcquire(this) : root;
-        commitData.primarySize = cowMode ? atomicSize.get() : size;
-        commitData.arenaStartPage = nextCommitPage;
-        // arenaEndPage = everything allocated so far, including the commit page itself
-        commitData.arenaEndPage = chunkStore.nextPage();
-
-        // Dictionary state
-        commitData.dictionaryCount = dicts.size();
-        commitData.dictRoots = new long[dicts.size()];
-        commitData.dictNextCodes = new long[dicts.size()];
-        commitData.dictSizes = new long[dicts.size()];
+    private CommitRecord.CommitData buildCommitData() {
+        var cd = new CommitRecord.CommitData();
+        cd.primaryRoot = root;
+        cd.primarySize = size;
+        cd.dictionaryCount = dicts.size();
+        cd.dictRoots = new long[dicts.size()];
+        cd.dictNextCodes = new long[dicts.size()];
+        cd.dictSizes = new long[dicts.size()];
         for (int i = 0; i < dicts.size(); i++) {
             var dict = dicts.get(i);
             var childTree = dict.childTree();
-            commitData.dictRoots[i] = childTree.root;
-            commitData.dictNextCodes[i] = dict.nextCode();
-            commitData.dictSizes[i] = childTree.size;
+            cd.dictRoots[i] = childTree.root;
+            cd.dictNextCodes[i] = dict.nextCode();
+            cd.dictSizes[i] = childTree.size;
         }
-
-        // Write to the pre-reserved page
-        MemorySegment page = chunkStore.resolvePage(nextCommitPage);
-        CommitRecord.write(page, commitData);
-
-        prevCommitPage = nextCommitPage;
-        // Reserve the next commit record page for the next sync
-        reserveNextCommitPage();
-    }
-
-    /**
-     * Pre-reserve one ChunkStore page for the next commit record.
-     * This ensures the commit record is at the exact page position
-     * where {@link ShadowPagingRecovery} expects to find it.
-     */
-    private void reserveNextCommitPage() {
-        try {
-            nextCommitPage = chunkStore.allocPages(1);
-            // Zero the page so it reads as "no valid commit record" until written
-            chunkStore.resolvePage(nextCommitPage).fill((byte) 0);
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to reserve commit record page", e);
-        }
+        return cd;
     }
 
     // -----------------------------------------------------------------------
@@ -1629,8 +1249,8 @@ public final class TaoTree implements AutoCloseable {
     // -----------------------------------------------------------------------
 
     /**
-     * Acquire a read scope. In COW mode, this is lock-free (epoch-based).
-     * In legacy mode, holds the read lock until closed.
+     * Acquire a read scope. Holds the read lock until closed.
+     * Multiple readers can be active simultaneously.
      *
      * <p>Use within try-with-resources:
      * <pre>{@code
@@ -1641,18 +1261,12 @@ public final class TaoTree implements AutoCloseable {
      * }</pre>
      */
     public ReadScope read() {
-        if (cowMode) {
-            int slot = reclaimer.enterEpoch();
-            return new ReadScope(slot);
-        }
-        acquireReadLock();
-        return new ReadScope(-1);
+        lock.readLock().lock();
+        return new ReadScope();
     }
 
     /**
-     * Acquire a write scope. In COW mode, no global lock is held —
-     * individual mutations use per-subtree CAS.
-     * In legacy mode, holds the write lock until closed.
+     * Acquire a write scope. Acquires the write lock (serializes writers).
      *
      * <p>Use within try-with-resources:
      * <pre>{@code
@@ -1666,11 +1280,25 @@ public final class TaoTree implements AutoCloseable {
      *                               a write scope (read→write upgrade is not supported)
      */
     public WriteScope write() {
-        if (cowMode) {
-            return new WriteScope(true);
+        if (lock.getReadHoldCount() > 0 && !lock.isWriteLockedByCurrentThread()) {
+            throw new IllegalStateException(
+                "Cannot acquire write scope while holding only a read scope. "
+                + "Release the read scope first, or use a write scope from the start.");
         }
-        acquireWriteLock();
-        return new WriteScope(false);
+        lock.writeLock().lock();
+        ensureCowEngine();
+        return new WriteScope();
+    }
+
+    /** Lazy-init CowEngine + reclaimer for child trees on first write(). */
+    private void ensureCowEngine() {
+        if (cowEngine != null) return;
+        if (reclaimer == null) {
+            reclaimer = new EpochReclaimer(slab);
+        }
+        cowEngine = new CowEngine(slab, reclaimer,
+            prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
+            keyLen, keySlotSize, leafClassIds);
     }
 
     // -----------------------------------------------------------------------
@@ -1687,11 +1315,8 @@ public final class TaoTree implements AutoCloseable {
 
         private boolean closed;
         private final Thread ownerThread = Thread.currentThread();
-        private final int epochSlot; // -1 for legacy lock mode
 
-        private ReadScope(int epochSlot) {
-            this.epochSlot = epochSlot;
-        }
+        private ReadScope() {}
 
         /**
          * Point lookup.
@@ -1700,21 +1325,19 @@ public final class TaoTree implements AutoCloseable {
         public long lookup(MemorySegment key, int keyLen) {
             checkAccess();
             validateKeyLen(keyLen);
-            return cowMode ? lookupLockFree(key, keyLen) : lookupImpl(key, keyLen);
+            return lookupImpl(key, keyLen);
         }
 
         /** Point lookup (uses the tree's key length). */
         public long lookup(MemorySegment key) {
             checkAccess();
-            return cowMode ? lookupLockFree(key, TaoTree.this.keyLen)
-                           : lookupImpl(key, TaoTree.this.keyLen);
+            return lookupImpl(key, TaoTree.this.keyLen);
         }
 
         public long lookup(byte[] key) {
             checkAccess();
             validateKeyLen(key.length);
-            var seg = MemorySegment.ofArray(key);
-            return cowMode ? lookupLockFree(seg, key.length) : lookupImpl(seg, key.length);
+            return lookupImpl(MemorySegment.ofArray(key), key.length);
         }
 
         /**
@@ -1730,11 +1353,11 @@ public final class TaoTree implements AutoCloseable {
 
         public long size() {
             checkAccess();
-            return cowMode ? atomicSize.get() : TaoTree.this.size;
+            return TaoTree.this.size;
         }
         public boolean isEmpty() {
             checkAccess();
-            return cowMode ? atomicSize.get() == 0 : TaoTree.this.size == 0;
+            return TaoTree.this.size == 0;
         }
 
         /**
@@ -1757,8 +1380,7 @@ public final class TaoTree implements AutoCloseable {
          */
         public LeafAccessor lookup(MemorySegment key, LeafLayout layout) {
             checkAccess();
-            long ptr = cowMode ? lookupLockFree(key, TaoTree.this.keyLen)
-                               : lookupImpl(key, TaoTree.this.keyLen);
+            long ptr = lookupImpl(key, TaoTree.this.keyLen);
             if (ptr == NOT_FOUND) return null;
             return new LeafAccessor(leafValueImpl(ptr).asReadOnly(), layout, TaoTree.this);
         }
@@ -1852,11 +1474,7 @@ public final class TaoTree implements AutoCloseable {
             if (!closed) {
                 checkThread();
                 closed = true;
-                if (epochSlot >= 0) {
-                    reclaimer.exitEpoch(epochSlot);
-                } else {
-                    releaseReadLock();
-                }
+                lock.readLock().unlock();
             }
         }
 
@@ -1879,7 +1497,9 @@ public final class TaoTree implements AutoCloseable {
     // -----------------------------------------------------------------------
 
     /**
-     * Read-write scope of the TaoTree. Holds the write lock.
+     * Read-write scope of the TaoTree. Holds the write lock to serialize
+     * writers. Mutations operate on a private {@link WriteState} snapshot;
+     * the final root is committed back and published to readers on close.
      *
      * <p>All returned leaf references and {@link MemorySegment} slices are
      * valid only while this scope is open.
@@ -1888,32 +1508,30 @@ public final class TaoTree implements AutoCloseable {
 
         private boolean closed;
         private final Thread ownerThread = Thread.currentThread();
-        private final boolean cowModeScope; // true if using COW, false for legacy lock
+        private final WriteState ws;
 
-        private WriteScope(boolean cowModeScope) {
-            this.cowModeScope = cowModeScope;
+        private WriteScope() {
+            this.ws = new WriteState(root, size);
         }
 
-        // -- Read operations (also available under write lock) --
+        // -- Read operations (writer sees its own writes via workingRoot) --
 
         public long lookup(MemorySegment key, int keyLen) {
             checkAccess();
             validateKeyLen(keyLen);
-            return cowModeScope ? lookupLockFree(key, keyLen) : lookupImpl(key, keyLen);
+            return lookupFrom(ws.root, key, keyLen);
         }
 
         /** Point lookup (uses the tree's key length). */
         public long lookup(MemorySegment key) {
             checkAccess();
-            return cowModeScope ? lookupLockFree(key, TaoTree.this.keyLen)
-                                : lookupImpl(key, TaoTree.this.keyLen);
+            return lookupFrom(ws.root, key, TaoTree.this.keyLen);
         }
 
         public long lookup(byte[] key) {
             checkAccess();
             validateKeyLen(key.length);
-            var seg = MemorySegment.ofArray(key);
-            return cowModeScope ? lookupLockFree(seg, key.length) : lookupImpl(seg, key.length);
+            return lookupFrom(ws.root, MemorySegment.ofArray(key), key.length);
         }
 
         /**
@@ -1928,11 +1546,11 @@ public final class TaoTree implements AutoCloseable {
 
         public long size() {
             checkAccess();
-            return cowModeScope ? atomicSize.get() : TaoTree.this.size;
+            return ws.size;
         }
         public boolean isEmpty() {
             checkAccess();
-            return cowModeScope ? atomicSize.get() == 0 : TaoTree.this.size == 0;
+            return ws.size == 0;
         }
 
         /**
@@ -1957,9 +1575,7 @@ public final class TaoTree implements AutoCloseable {
          */
         public LeafAccessor getOrCreate(MemorySegment key, LeafLayout layout) {
             checkAccess();
-            long ptr = cowModeScope
-                ? cowGetOrCreateWithRetry(key, TaoTree.this.keyLen, 0)
-                : getOrCreateImpl(key, TaoTree.this.keyLen, 0);
+            long ptr = getOrCreateWith(ws, key, TaoTree.this.keyLen, 0);
             return new LeafAccessor(leafValueImpl(ptr), layout, TaoTree.this);
         }
 
@@ -1998,37 +1614,27 @@ public final class TaoTree implements AutoCloseable {
             checkAccess();
             validateKeyLen(keyLen);
             validateLeafClass(leafClass);
-            return cowModeScope
-                ? cowGetOrCreateWithRetry(key, keyLen, leafClass)
-                : getOrCreateImpl(key, keyLen, leafClass);
+            return getOrCreateWith(ws, key, keyLen, leafClass);
         }
 
         /** Insert or lookup using the tree's key length and the default leaf class (0). */
         public long getOrCreate(MemorySegment key) {
             checkAccess();
-            return cowModeScope
-                ? cowGetOrCreateWithRetry(key, TaoTree.this.keyLen, 0)
-                : getOrCreateImpl(key, TaoTree.this.keyLen, 0);
+            return getOrCreateWith(ws, key, TaoTree.this.keyLen, 0);
         }
 
         public long getOrCreate(byte[] key, int leafClass) {
             checkAccess();
             validateKeyLen(key.length);
             validateLeafClass(leafClass);
-            var seg = MemorySegment.ofArray(key);
-            return cowModeScope
-                ? cowGetOrCreateWithRetry(seg, key.length, leafClass)
-                : getOrCreateImpl(seg, key.length, leafClass);
+            return getOrCreateWith(ws, MemorySegment.ofArray(key), key.length, leafClass);
         }
 
         /** Insert or lookup using the default leaf class (0). */
         public long getOrCreate(byte[] key) {
             checkAccess();
             validateKeyLen(key.length);
-            var seg = MemorySegment.ofArray(key);
-            return cowModeScope
-                ? cowGetOrCreateWithRetry(seg, key.length, 0)
-                : getOrCreateImpl(seg, key.length, 0);
+            return getOrCreateWith(ws, MemorySegment.ofArray(key), key.length, 0);
         }
 
         /**
@@ -2038,25 +1644,17 @@ public final class TaoTree implements AutoCloseable {
         public boolean delete(MemorySegment key, int keyLen) {
             checkAccess();
             validateKeyLen(keyLen);
-            return cowModeScope
-                ? cowDeleteWithRetry(key, keyLen)
-                : deleteImpl(key, keyLen);
+            return deleteWith(ws, key, keyLen);
         }
 
         public boolean delete(byte[] key) {
             checkAccess();
             validateKeyLen(key.length);
-            var seg = MemorySegment.ofArray(key);
-            return cowModeScope
-                ? cowDeleteWithRetry(seg, key.length)
-                : deleteImpl(seg, key.length);
+            return deleteWith(ws, MemorySegment.ofArray(key), key.length);
         }
 
         /**
          * Copy all live entries from the source tree (held by a read scope) into this tree.
-         *
-         * <p>Both locks are enforced: this tree's write lock (via this scope) and the
-         * source tree's read lock (via the source scope).
          *
          * @param sourceScope a read scope on the source tree
          * @see TaoTree#copyFrom(TaoTree)
@@ -2064,7 +1662,7 @@ public final class TaoTree implements AutoCloseable {
         public void copyFrom(ReadScope sourceScope) {
             checkAccess();
             sourceScope.checkAccess();
-            TaoTree.this.copyFromImpl(sourceScope.tree());
+            TaoTree.this.copyFromImpl(sourceScope.tree(), ws);
         }
 
         @Override
@@ -2072,11 +1670,8 @@ public final class TaoTree implements AutoCloseable {
             if (!closed) {
                 checkThread();
                 closed = true;
-                if (!cowModeScope) {
-                    releaseWriteLock();
-                }
-                // In COW mode, no lock to release. Individual mutations
-                // were already published via CAS.
+                commitWrite(ws);
+                lock.writeLock().unlock();
             }
         }
 
@@ -2262,11 +1857,77 @@ public final class TaoTree implements AutoCloseable {
     }
 
     // =======================================================================
-    // Package-private implementation — no locking, called by views and TaoDictionary
+    // WriteState — writer-private root + size, separate from published state
     // =======================================================================
 
-    long lookupImpl(MemorySegment key, int keyLen) {
-        long node = root;
+    /**
+     * Mutable holder for the writer-private tree root and size.
+     *
+     * <p>Created by {@link WriteScope} at open time (snapshot of published state).
+     * All mutations operate on these fields. On {@link WriteScope#close()}, the
+     * final values are committed back to the published {@code root}/{@code size}
+     * fields and made visible to readers via {@link #publishRoot()}.
+     *
+     * <p>Retirees are nodes from the published tree that were replaced by COW
+     * path-copies. They are retired via the epoch reclaimer after publication
+     * so that readers still traversing the old tree see consistent state.
+     */
+    static final class WriteState {
+        long root;
+        long size;
+        final List<Long> retirees = new ArrayList<>();
+
+        WriteState(long root, long size) {
+            this.root = root;
+            this.size = size;
+        }
+    }
+
+    // =======================================================================
+    // WriteState-aware mutation methods (deferred COW)
+    // =======================================================================
+
+    /** Create a detached WriteState from current published root/size. Requires CowEngine. */
+    WriteState beginWrite() {
+        ensureCowEngine();
+        return new WriteState(root, size);
+    }
+
+    /** Commit a detached WriteState: publish root, retire old nodes. */
+    void commitWrite(WriteState ws) {
+        root = ws.root;
+        size = ws.size;
+        publishRoot();
+        if (reclaimer != null) {
+            for (long old : ws.retirees) {
+                reclaimer.retire(old);
+            }
+            reclaimer.advanceGeneration();
+        }
+    }
+
+    long getOrCreateWith(WriteState ws, MemorySegment key, int keyLen, int leafClass) {
+        var result = cowEngine.deferredGetOrCreate(ws.root, key, keyLen, leafClass);
+        if (result.mutated()) {
+            ws.root = result.newRoot();
+            ws.size += result.sizeDelta();
+            ws.retirees.addAll(result.retirees());
+        }
+        return result.leafPtr();
+    }
+
+    boolean deleteWith(WriteState ws, MemorySegment key, int keyLen) {
+        var result = cowEngine.deferredDelete(ws.root, key, keyLen);
+        if (result.mutated()) {
+            ws.root = result.newRoot();
+            ws.size += result.sizeDelta();
+            ws.retirees.addAll(result.retirees());
+        }
+        return result.mutated();
+    }
+
+    private long lookupFrom(long startRoot, MemorySegment key, int keyLen) {
+        long node = startRoot;
         int depth = 0;
 
         while (!NodePtr.isEmpty(node)) {
@@ -2296,22 +1957,12 @@ public final class TaoTree implements AutoCloseable {
         return NodePtr.EMPTY_PTR;
     }
 
-    long getOrCreateImpl(MemorySegment key, int keyLen, int leafClass) {
-        if (NodePtr.isEmpty(root)) {
-            long leafPtr = allocateLeaf(key, keyLen, leafClass);
-            root = wrapInPrefix(key, 0, keyLen, leafPtr);
-            size++;
-            return leafPtr;
-        }
-        return doInsert(key, keyLen, leafClass);
-    }
+    // =======================================================================
+    // Package-private implementation — no locking, called by TaoDictionary and copy
+    // =======================================================================
 
-    private boolean deleteImpl(MemorySegment key, int keyLen) {
-        if (NodePtr.isEmpty(root)) return false;
-        boolean[] deleted = {false};
-        root = doDelete(root, key, keyLen, 0, deleted);
-        if (deleted[0]) size--;
-        return deleted[0];
+    long lookupImpl(MemorySegment key, int keyLen) {
+        return lookupFrom(root, key, keyLen);
     }
 
     MemorySegment leafValueImpl(long leafPtr) {
@@ -2321,7 +1972,7 @@ public final class TaoTree implements AutoCloseable {
 
     /**
      * Resolve a NodePtr to a MemorySegment, handling both slab-allocated and
-     * arena-allocated pointers. Used by readers and internal methods.
+     * arena-allocated pointers.
      */
     private MemorySegment resolveNode(long ptr) {
         if (chunkStore != null && WriterArena.isArenaAllocated(ptr)) {
@@ -2342,361 +1993,6 @@ public final class TaoTree implements AutoCloseable {
     }
 
     // =======================================================================
-    // Internal: Insert
-    // =======================================================================
-
-    private long doInsert(MemorySegment key, int keyLen, int leafClass) {
-        long nodePtr = root;
-        MemorySegment parentSeg = null;
-        long parentOff = 0;
-        int depth = 0;
-
-        while (true) {
-            int type = NodePtr.nodeType(nodePtr);
-
-            if (type == NodePtr.LEAF) {
-                if (leafKeyMatches(nodePtr, key, keyLen)) {
-                    return nodePtr;
-                }
-                long newNode = expandLeaf(nodePtr, key, keyLen, depth, leafClass);
-                writeBack(parentSeg, parentOff, newNode);
-                return findInsertedLeaf(newNode, key, keyLen, depth);
-            }
-
-            if (type == NodePtr.PREFIX) {
-                MemorySegment prefSeg = resolveNode(nodePtr);
-                int prefLen = PrefixNode.count(prefSeg);
-                int matched = PrefixNode.matchKey(prefSeg, key, keyLen, depth);
-
-                if (matched < prefLen) {
-                    long newNode = splitPrefix(nodePtr, prefSeg, key, keyLen,
-                                               depth, matched, leafClass);
-                    writeBack(parentSeg, parentOff, newNode);
-                    size++;
-                    return findInsertedLeaf(newNode, key, keyLen, depth);
-                }
-
-                depth += prefLen;
-                parentSeg = prefSeg;
-                parentOff = PrefixNode.OFF_CHILD;
-                nodePtr = PrefixNode.child(prefSeg);
-                continue;
-            }
-
-            if (depth >= keyLen) {
-                throw new IllegalStateException("Key exhausted at inner node (depth=" + depth + ")");
-            }
-            byte keyByte = key.get(ValueLayout.JAVA_BYTE, depth);
-            long child = findChild(nodePtr, type, keyByte);
-
-            if (NodePtr.isEmpty(child)) {
-                long leafPtr = allocateLeaf(key, keyLen, leafClass);
-                long wrappedLeaf = wrapInPrefix(key, depth + 1, keyLen, leafPtr);
-                insertChildIntoNode(nodePtr, type, keyByte, wrappedLeaf, parentSeg, parentOff);
-                size++;
-                return leafPtr;
-            }
-
-            MemorySegment nodeSeg = resolveNode(nodePtr);
-            parentSeg = nodeSeg;
-            parentOff = childOffset(type, nodeSeg, keyByte);
-            nodePtr = child;
-            depth++;
-        }
-    }
-
-    private long expandLeaf(long existingLeafPtr, MemorySegment newKey, int newKeyLen,
-                            int depth, int leafClass) {
-        MemorySegment existingKey = resolveNode(existingLeafPtr, keyLen);
-
-        int mismatch = depth;
-        while (mismatch < newKeyLen &&
-               existingKey.get(ValueLayout.JAVA_BYTE, mismatch) ==
-               newKey.get(ValueLayout.JAVA_BYTE, mismatch)) {
-            mismatch++;
-        }
-
-        if (mismatch >= newKeyLen) {
-            throw new IllegalStateException("Duplicate key in expandLeaf");
-        }
-
-        long newLeafPtr = allocateLeaf(newKey, newKeyLen, leafClass);
-        size++;
-
-        long n4Ptr = slab.allocate(node4ClassId, NodePtr.NODE_4);
-        MemorySegment n4Seg = resolveNode(n4Ptr);
-        Node4.init(n4Seg);
-
-        byte existingByte = existingKey.get(ValueLayout.JAVA_BYTE, mismatch);
-        byte newByte = newKey.get(ValueLayout.JAVA_BYTE, mismatch);
-
-        long existingWrapped = wrapInPrefix(existingKey, mismatch + 1, keyLen, existingLeafPtr);
-        long newWrapped = wrapInPrefix(newKey, mismatch + 1, newKeyLen, newLeafPtr);
-
-        Node4.insertChild(n4Seg, existingByte, existingWrapped);
-        Node4.insertChild(n4Seg, newByte, newWrapped);
-
-        return wrapInPrefix(newKey, depth, mismatch, n4Ptr);
-    }
-
-    private long splitPrefix(long prefixPtr, MemorySegment prefSeg,
-                             MemorySegment key, int keyLen,
-                             int depth, int matchedCount, int leafClass) {
-        int prefLen = PrefixNode.count(prefSeg);
-        long prefChild = PrefixNode.child(prefSeg);
-
-        long newLeafPtr = allocateLeaf(key, keyLen, leafClass);
-
-        long n4Ptr = slab.allocate(node4ClassId, NodePtr.NODE_4);
-        MemorySegment n4Seg = resolveNode(n4Ptr);
-        Node4.init(n4Seg);
-
-        byte existingByte = PrefixNode.keyAt(prefSeg, matchedCount);
-        byte newByte = key.get(ValueLayout.JAVA_BYTE, depth + matchedCount);
-
-        long existingChild;
-        int remainingPrefixLen = prefLen - matchedCount - 1;
-        if (remainingPrefixLen > 0) {
-            long newPrefPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-            MemorySegment newPrefSeg = resolveNode(newPrefPtr);
-            byte[] remaining = new byte[remainingPrefixLen];
-            for (int i = 0; i < remainingPrefixLen; i++) {
-                remaining[i] = PrefixNode.keyAt(prefSeg, matchedCount + 1 + i);
-            }
-            PrefixNode.init(newPrefSeg, remaining, 0, remainingPrefixLen, prefChild);
-            existingChild = newPrefPtr;
-        } else {
-            existingChild = prefChild;
-        }
-
-        long newWrapped = wrapInPrefix(key, depth + matchedCount + 1, keyLen, newLeafPtr);
-
-        Node4.insertChild(n4Seg, existingByte, existingChild);
-        Node4.insertChild(n4Seg, newByte, newWrapped);
-
-        slab.free(prefixPtr);
-
-        if (matchedCount > 0) {
-            long wrapPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-            MemorySegment wrapSeg = resolveNode(wrapPtr);
-            byte[] shared = new byte[matchedCount];
-            for (int i = 0; i < matchedCount; i++) {
-                shared[i] = key.get(ValueLayout.JAVA_BYTE, depth + i);
-            }
-            PrefixNode.init(wrapSeg, shared, 0, matchedCount, n4Ptr);
-            return wrapPtr;
-        }
-        return n4Ptr;
-    }
-
-    private void insertChildIntoNode(long nodePtr, int type, byte keyByte, long childPtr,
-                                     MemorySegment parentSeg, long parentOff) {
-        MemorySegment seg = resolveNode(nodePtr);
-
-        switch (type) {
-            case NodePtr.NODE_4 -> {
-                if (Node4.isFull(seg)) {
-                    long n16Ptr = slab.allocate(node16ClassId, NodePtr.NODE_16);
-                    MemorySegment n16Seg = resolveNode(n16Ptr);
-                    Node16.init(n16Seg);
-                    Node16.copyFromNode4(n16Seg, seg);
-                    Node16.insertChild(n16Seg, keyByte, childPtr);
-                    slab.free(nodePtr);
-                    writeBack(parentSeg, parentOff, n16Ptr);
-                } else {
-                    Node4.insertChild(seg, keyByte, childPtr);
-                }
-            }
-            case NodePtr.NODE_16 -> {
-                if (Node16.isFull(seg)) {
-                    long n48Ptr = slab.allocate(node48ClassId, NodePtr.NODE_48);
-                    MemorySegment n48Seg = resolveNode(n48Ptr);
-                    Node48.init(n48Seg);
-                    Node48.copyFromNode16(n48Seg, seg);
-                    Node48.insertChild(n48Seg, keyByte, childPtr);
-                    slab.free(nodePtr);
-                    writeBack(parentSeg, parentOff, n48Ptr);
-                } else {
-                    Node16.insertChild(seg, keyByte, childPtr);
-                }
-            }
-            case NodePtr.NODE_48 -> {
-                if (Node48.isFull(seg)) {
-                    long n256Ptr = slab.allocate(node256ClassId, NodePtr.NODE_256);
-                    MemorySegment n256Seg = resolveNode(n256Ptr);
-                    Node256.init(n256Seg);
-                    Node256.copyFromNode48(n256Seg, seg);
-                    Node256.insertChild(n256Seg, keyByte, childPtr);
-                    slab.free(nodePtr);
-                    writeBack(parentSeg, parentOff, n256Ptr);
-                } else {
-                    Node48.insertChild(seg, keyByte, childPtr);
-                }
-            }
-            case NodePtr.NODE_256 -> {
-                Node256.insertChild(seg, keyByte, childPtr);
-            }
-            default -> throw new IllegalStateException("Not an inner node: " + type);
-        }
-    }
-
-    // =======================================================================
-    // Internal: Delete (recursive)
-    // =======================================================================
-
-    private long doDelete(long nodePtr, MemorySegment key, int keyLen,
-                          int depth, boolean[] deleted) {
-        if (NodePtr.isEmpty(nodePtr)) return NodePtr.EMPTY_PTR;
-
-        int type = NodePtr.nodeType(nodePtr);
-
-        if (type == NodePtr.LEAF) {
-            if (leafKeyMatches(nodePtr, key, keyLen)) {
-                slab.free(nodePtr);
-                deleted[0] = true;
-                return NodePtr.EMPTY_PTR;
-            }
-            return nodePtr;
-        }
-
-        if (type == NodePtr.PREFIX) {
-            MemorySegment prefSeg = resolveNode(nodePtr);
-            int prefLen = PrefixNode.count(prefSeg);
-            int matched = PrefixNode.matchKey(prefSeg, key, keyLen, depth);
-            if (matched < prefLen) return nodePtr;
-
-            long child = PrefixNode.child(prefSeg);
-            long newChild = doDelete(child, key, keyLen, depth + prefLen, deleted);
-            if (!deleted[0]) return nodePtr;
-
-            if (NodePtr.isEmpty(newChild)) {
-                slab.free(nodePtr);
-                return NodePtr.EMPTY_PTR;
-            }
-
-            if (NodePtr.nodeType(newChild) == NodePtr.PREFIX) {
-                return mergePrefixes(nodePtr, prefSeg, newChild);
-            }
-
-            PrefixNode.setChild(prefSeg, newChild);
-            return nodePtr;
-        }
-
-        if (depth >= keyLen) return nodePtr;
-        byte keyByte = key.get(ValueLayout.JAVA_BYTE, depth);
-        long child = findChild(nodePtr, type, keyByte);
-        if (NodePtr.isEmpty(child)) return nodePtr;
-
-        long newChild = doDelete(child, key, keyLen, depth + 1, deleted);
-        if (!deleted[0]) return nodePtr;
-
-        MemorySegment seg = resolveNode(nodePtr);
-
-        if (NodePtr.isEmpty(newChild)) {
-            removeChildFromNode(seg, type, keyByte);
-            int count = nodeCount(seg, type);
-
-            if (count == 0) {
-                slab.free(nodePtr);
-                return NodePtr.EMPTY_PTR;
-            }
-            if (count == 1) {
-                return collapseSingleChild(nodePtr, seg, type);
-            }
-            return maybeShrink(nodePtr, seg, type, count);
-        }
-
-        updateChildInNode(seg, type, keyByte, newChild);
-        return nodePtr;
-    }
-
-    private long mergePrefixes(long outerPtr, MemorySegment outerSeg, long innerPtr) {
-        MemorySegment innerSeg = resolveNode(innerPtr);
-        int outerLen = PrefixNode.count(outerSeg);
-        int innerLen = PrefixNode.count(innerSeg);
-        long innerChild = PrefixNode.child(innerSeg);
-
-        int totalLen = outerLen + innerLen;
-        byte[] merged = new byte[totalLen];
-        for (int i = 0; i < outerLen; i++) merged[i] = PrefixNode.keyAt(outerSeg, i);
-        for (int i = 0; i < innerLen; i++) merged[outerLen + i] = PrefixNode.keyAt(innerSeg, i);
-
-        slab.free(outerPtr);
-        slab.free(innerPtr);
-
-        return wrapInPrefix(merged, 0, totalLen, innerChild);
-    }
-
-    private long collapseSingleChild(long nodePtr, MemorySegment seg, int type) {
-        byte[] singleKey = {0};
-        long[] singleChild = {0};
-        findSingleChild(seg, type, singleKey, singleChild);
-
-        slab.free(nodePtr);
-
-        byte[] prefixByte = {singleKey[0]};
-        long child = singleChild[0];
-
-        if (NodePtr.nodeType(child) == NodePtr.PREFIX) {
-            MemorySegment childPrefSeg = resolveNode(child);
-            int childPrefLen = PrefixNode.count(childPrefSeg);
-            byte[] m = new byte[1 + childPrefLen];
-            m[0] = prefixByte[0];
-            for (int i = 0; i < childPrefLen; i++) m[1 + i] = PrefixNode.keyAt(childPrefSeg, i);
-            long grandChild = PrefixNode.child(childPrefSeg);
-            slab.free(child);
-            return wrapInPrefix(m, 0, m.length, grandChild);
-        }
-
-        long prefPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-        MemorySegment prefSeg = resolveNode(prefPtr);
-        PrefixNode.init(prefSeg, prefixByte, 0, 1, child);
-        return prefPtr;
-    }
-
-    private long maybeShrink(long nodePtr, MemorySegment seg, int type, int count) {
-        return switch (type) {
-            case NodePtr.NODE_256 -> count <= NodeConstants.NODE256_SHRINK_THRESHOLD
-                ? shrinkNode256ToNode48(nodePtr, seg) : nodePtr;
-            case NodePtr.NODE_48 -> count <= NodeConstants.NODE48_SHRINK_THRESHOLD
-                ? shrinkNode48ToNode16(nodePtr, seg) : nodePtr;
-            case NodePtr.NODE_16 -> count <= NodeConstants.NODE16_SHRINK_THRESHOLD
-                ? shrinkNode16ToNode4(nodePtr, seg) : nodePtr;
-            default -> nodePtr;
-        };
-    }
-
-    private long shrinkNode256ToNode48(long oldPtr, MemorySegment oldSeg) {
-        long n48Ptr = slab.allocate(node48ClassId, NodePtr.NODE_48);
-        MemorySegment n48Seg = resolveNode(n48Ptr);
-        Node48.init(n48Seg);
-        Node256.forEach(oldSeg, (k, c) -> Node48.insertChild(n48Seg, k, c));
-        slab.free(oldPtr);
-        return n48Ptr;
-    }
-
-    private long shrinkNode48ToNode16(long oldPtr, MemorySegment oldSeg) {
-        long n16Ptr = slab.allocate(node16ClassId, NodePtr.NODE_16);
-        MemorySegment n16Seg = resolveNode(n16Ptr);
-        Node16.init(n16Seg);
-        Node48.forEach(oldSeg, (k, c) -> Node16.insertChild(n16Seg, k, c));
-        slab.free(oldPtr);
-        return n16Ptr;
-    }
-
-    private long shrinkNode16ToNode4(long oldPtr, MemorySegment oldSeg) {
-        long n4Ptr = slab.allocate(node4ClassId, NodePtr.NODE_4);
-        MemorySegment n4Seg = resolveNode(n4Ptr);
-        Node4.init(n4Seg);
-        int n = Node16.count(oldSeg);
-        for (int i = 0; i < n; i++) {
-            Node4.insertChild(n4Seg, Node16.keyAt(oldSeg, i), Node16.childAt(oldSeg, i));
-        }
-        slab.free(oldPtr);
-        return n4Ptr;
-    }
-
-    // =======================================================================
     // Internal: helpers
     // =======================================================================
 
@@ -2711,132 +2007,184 @@ public final class TaoTree implements AutoCloseable {
         };
     }
 
-    private long childOffset(int type, MemorySegment seg, byte keyByte) {
-        return switch (type) {
-            case NodePtr.NODE_4 -> Node4.OFF_CHILDREN + (long) Node4.findPos(seg, keyByte) * 8;
-            case NodePtr.NODE_16 -> Node16.OFF_CHILDREN + (long) Node16.findPos(seg, keyByte) * 8;
-            case NodePtr.NODE_48 -> {
-                int slot = Byte.toUnsignedInt(seg.get(ValueLayout.JAVA_BYTE,
-                    Node48.OFF_CHILD_IDX + Byte.toUnsignedInt(keyByte)));
-                yield Node48.OFF_CHILDREN + (long) slot * 8;
-            }
-            case NodePtr.NODE_256 -> Node256.OFF_CHILDREN + (long) Byte.toUnsignedInt(keyByte) * 8;
-            default -> throw new IllegalStateException("Not an inner node");
-        };
-    }
-
-    private int nodeCount(MemorySegment seg, int type) {
-        return switch (type) {
-            case NodePtr.NODE_4   -> Node4.count(seg);
-            case NodePtr.NODE_16  -> Node16.count(seg);
-            case NodePtr.NODE_48  -> Node48.count(seg);
-            case NodePtr.NODE_256 -> Node256.count(seg);
-            default -> 0;
-        };
-    }
-
-    private void removeChildFromNode(MemorySegment seg, int type, byte keyByte) {
-        switch (type) {
-            case NodePtr.NODE_4   -> Node4.removeChild(seg, keyByte);
-            case NodePtr.NODE_16  -> Node16.removeChild(seg, keyByte);
-            case NodePtr.NODE_48  -> Node48.removeChild(seg, keyByte);
-            case NodePtr.NODE_256 -> Node256.removeChild(seg, keyByte);
-        }
-    }
-
-    private void updateChildInNode(MemorySegment seg, int type, byte keyByte, long newChild) {
-        switch (type) {
-            case NodePtr.NODE_4  -> Node4.setChildAt(seg, Node4.findPos(seg, keyByte), newChild);
-            case NodePtr.NODE_16 -> Node16.setChildAt(seg, Node16.findPos(seg, keyByte), newChild);
-            case NodePtr.NODE_48  -> Node48.updateChild(seg, keyByte, newChild);
-            case NodePtr.NODE_256 -> Node256.updateChild(seg, keyByte, newChild);
-        }
-    }
-
-    private void findSingleChild(MemorySegment seg, int type, byte[] outKey, long[] outChild) {
-        switch (type) {
-            case NodePtr.NODE_4 -> { outKey[0] = Node4.keyAt(seg, 0); outChild[0] = Node4.childAt(seg, 0); }
-            case NodePtr.NODE_16 -> { outKey[0] = Node16.keyAt(seg, 0); outChild[0] = Node16.childAt(seg, 0); }
-            case NodePtr.NODE_48 -> Node48.forEach(seg, (k, c) -> { outKey[0] = k; outChild[0] = c; });
-            case NodePtr.NODE_256 -> Node256.forEach(seg, (k, c) -> { outKey[0] = k; outChild[0] = c; });
-        }
-    }
-
     private boolean leafKeyMatches(long leafPtr, MemorySegment key, int keyLen) {
         if (keyLen != this.keyLen) return false;
         MemorySegment leafKey = resolveNode(leafPtr, this.keyLen);
         return leafKey.mismatch(key.asSlice(0, this.keyLen)) == -1;
     }
 
-    private long allocateLeaf(MemorySegment key, int keyLen, int leafClass) {
-        long ptr = slab.allocate(leafClassIds[leafClass]);
-        MemorySegment seg = resolveNode(ptr);
-        // Copy key into the first keyLen bytes
-        MemorySegment.copy(key, 0, seg, 0, this.keyLen);
-        // Zero everything after the key (padding + value) so callers never see stale bytes
-        seg.asSlice(this.keyLen).fill((byte) 0);
-        return ptr;
-    }
+    // =======================================================================
+    // Private nested helpers
+    // =======================================================================
 
-    private long wrapInPrefix(MemorySegment key, int from, int to, long child) {
-        int remaining = to - from;
-        if (remaining <= 0) return child;
+    /**
+     * Walks a source tree and re-inserts every leaf into a target tree.
+     * Handles out-of-line string data migration (overflow copy + pointer patching).
+     */
+    private static final class Copier {
 
-        long current = child;
-        int pos = to;
-        while (pos > from) {
-            int chunkLen = Math.min(pos - from, NodeConstants.PREFIX_CAPACITY);
-            int chunkStart = pos - chunkLen;
-            long prefPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-            MemorySegment prefSeg = resolveNode(prefPtr);
-            PrefixNode.init(prefSeg, key, chunkStart, chunkLen, current);
-            current = prefPtr;
-            pos = chunkStart;
+        private final TaoTree source;
+        private final TaoTree target;
+        private final WriteState ws;
+
+        Copier(TaoTree source, TaoTree target, WriteState ws) {
+            this.source = source;
+            this.target = target;
+            this.ws = ws;
         }
-        return current;
-    }
 
-    private long wrapInPrefix(byte[] key, int from, int to, long child) {
-        int remaining = to - from;
-        if (remaining <= 0) return child;
-
-        long current = child;
-        int pos = to;
-        while (pos > from) {
-            int chunkLen = Math.min(pos - from, NodeConstants.PREFIX_CAPACITY);
-            int chunkStart = pos - chunkLen;
-            long prefPtr = slab.allocate(prefixClassId, NodePtr.PREFIX);
-            MemorySegment prefSeg = resolveNode(prefPtr);
-            PrefixNode.init(prefSeg, key, chunkStart, chunkLen, current);
-            current = prefPtr;
-            pos = chunkStart;
+        void validate() {
+            if (source.keyLen != target.keyLen)
+                throw new IllegalArgumentException(
+                    "Key length mismatch: source=" + source.keyLen + " target=" + target.keyLen);
+            if (source.leafClassCount != target.leafClassCount)
+                throw new IllegalArgumentException(
+                    "Leaf class count mismatch: source=" + source.leafClassCount
+                    + " target=" + target.leafClassCount);
+            for (int i = 0; i < source.leafClassCount; i++)
+                if (source.leafValueSizes[i] != target.leafValueSizes[i])
+                    throw new IllegalArgumentException(
+                        "Leaf value size mismatch at class " + i + ": source="
+                        + source.leafValueSizes[i] + " target=" + target.leafValueSizes[i]);
         }
-        return current;
-    }
 
-    private void writeBack(MemorySegment parentSeg, long parentOff, long newPtr) {
-        if (parentSeg == null) {
-            root = newPtr;
-        } else {
-            parentSeg.set(ValueLayout.JAVA_LONG, parentOff, newPtr);
+        void copy() {
+            if (NodePtr.isEmpty(source.root)) return;
+            copyNode(source.root);
         }
-    }
 
-    private long findInsertedLeaf(long node, MemorySegment key, int keyLen, int depth) {
-        while (!NodePtr.isEmpty(node)) {
-            int type = NodePtr.nodeType(node);
-            if (type == NodePtr.LEAF) return node;
+        private void copyNode(long nodePtr) {
+            if (NodePtr.isEmpty(nodePtr)) return;
+            int type = NodePtr.nodeType(nodePtr);
+
+            if (type == NodePtr.LEAF) { copyLeaf(nodePtr); return; }
+
             if (type == NodePtr.PREFIX) {
-                MemorySegment seg = resolveNode(node);
-                depth += PrefixNode.count(seg);
-                node = PrefixNode.child(seg);
-                continue;
+                MemorySegment prefSeg = source.resolveNode(nodePtr);
+                copyNode(PrefixNode.child(prefSeg));
+                return;
             }
-            if (depth >= keyLen) break;
-            byte b = key.get(ValueLayout.JAVA_BYTE, depth);
-            node = findChild(node, type, b);
-            depth++;
+
+            MemorySegment seg = source.resolveNode(nodePtr);
+            switch (type) {
+                case NodePtr.NODE_4 -> {
+                    int n = Node4.count(seg);
+                    for (int i = 0; i < n; i++) copyNode(Node4.childAt(seg, i));
+                }
+                case NodePtr.NODE_16 -> {
+                    int n = Node16.count(seg);
+                    for (int i = 0; i < n; i++) copyNode(Node16.childAt(seg, i));
+                }
+                case NodePtr.NODE_48 ->
+                    Node48.forEach(seg, (k, child) -> copyNode(child));
+                case NodePtr.NODE_256 ->
+                    Node256.forEach(seg, (k, child) -> copyNode(child));
+            }
         }
-        throw new IllegalStateException("Could not find inserted leaf");
+
+        private void copyLeaf(long srcLeafPtr) {
+            MemorySegment srcFull = source.resolveNode(srcLeafPtr);
+            MemorySegment srcKey = srcFull.asSlice(0, source.keyLen);
+
+            int srcSlabClassId = NodePtr.slabClassId(srcLeafPtr);
+            int leafClassIdx = -1;
+            for (int i = 0; i < source.leafClassCount; i++) {
+                if (source.leafClassIds[i] == srcSlabClassId) { leafClassIdx = i; break; }
+            }
+            if (leafClassIdx < 0 || leafClassIdx >= target.leafClassCount)
+                throw new IllegalStateException(
+                    "Source leaf class index " + leafClassIdx + " not compatible with target tree");
+
+            long tgtLeafPtr = target.getOrCreateWith(ws, srcKey, source.keyLen, leafClassIdx);
+
+            int tgtSlabClassId = NodePtr.slabClassId(tgtLeafPtr);
+            if (tgtSlabClassId != target.leafClassIds[leafClassIdx])
+                throw new IllegalStateException(
+                    "Leaf class conflict for existing key: target slab class " + tgtSlabClassId
+                    + " != expected " + target.leafClassIds[leafClassIdx]
+                    + " (leaf class index " + leafClassIdx + ").");
+
+            MemorySegment srcValue = srcFull.asSlice(source.keySlotSize);
+            MemorySegment tgtValue = target.leafValueImpl(tgtLeafPtr);
+
+            TaoString.Layout layout = target.stringLayouts.get(target.leafClassIds[leafClassIdx]);
+            if (layout != null) {
+                int len = srcValue.get(ValueLayout.JAVA_INT_UNALIGNED, layout.lenOffset());
+                if (len > layout.inlineThreshold()) {
+                    long srcRef = srcValue.get(ValueLayout.JAVA_LONG_UNALIGNED, layout.ptrOffset());
+                    MemorySegment srcData = source.bump.resolve(srcRef, len);
+
+                    long tgtRef = target.bump.allocate(len);
+                    MemorySegment tgtData = target.bump.resolve(tgtRef, len);
+                    MemorySegment.copy(srcData, 0, tgtData, 0, len);
+
+                    MemorySegment.copy(srcValue, 0, tgtValue, 0, srcValue.byteSize());
+                    tgtValue.set(ValueLayout.JAVA_LONG_UNALIGNED, layout.ptrOffset(), tgtRef);
+                    return;
+                }
+            }
+            MemorySegment.copy(srcValue, 0, tgtValue, 0, srcValue.byteSize());
+        }
+    }
+
+    /**
+     * Static helpers for binding key/leaf layouts to a tree.
+     * Handles dictionary creation, rebinding, and string-layout registration.
+     */
+    private static final class Binding {
+
+        private Binding() {}
+
+        static KeyLayout bindDicts(TaoTree tree, KeyLayout keyLayout) {
+            var fields = new KeyField[keyLayout.fieldCount()];
+            boolean changed = false;
+            for (int i = 0; i < fields.length; i++) {
+                var f = keyLayout.field(i);
+                if (f instanceof KeyField.DictU16 d && d.dict() == null) {
+                    fields[i] = KeyField.dict16(d.name(), TaoDictionary.u16(tree));
+                    changed = true;
+                } else if (f instanceof KeyField.DictU32 d && d.dict() == null) {
+                    fields[i] = KeyField.dict32(d.name(), TaoDictionary.u32(tree));
+                    changed = true;
+                } else {
+                    fields[i] = f;
+                }
+            }
+            return changed ? KeyLayout.of(fields) : keyLayout;
+        }
+
+        static KeyLayout rebindDicts(TaoTree tree, KeyLayout keyLayout) {
+            var fields = new KeyField[keyLayout.fieldCount()];
+            int dictIdx = 0;
+            boolean changed = false;
+            for (int i = 0; i < fields.length; i++) {
+                var f = keyLayout.field(i);
+                if (f instanceof KeyField.DictU16 d && d.dict() == null) {
+                    if (dictIdx >= tree.dicts.size())
+                        throw new IllegalArgumentException(
+                            "Key layout has more dict fields than restored dictionaries ("
+                            + tree.dicts.size() + ")");
+                    fields[i] = KeyField.dict16(d.name(), tree.dicts.get(dictIdx++));
+                    changed = true;
+                } else if (f instanceof KeyField.DictU32 d && d.dict() == null) {
+                    if (dictIdx >= tree.dicts.size())
+                        throw new IllegalArgumentException(
+                            "Key layout has more dict fields than restored dictionaries ("
+                            + tree.dicts.size() + ")");
+                    fields[i] = KeyField.dict32(d.name(), tree.dicts.get(dictIdx++));
+                    changed = true;
+                } else {
+                    fields[i] = f;
+                }
+            }
+            return changed ? KeyLayout.of(fields) : keyLayout;
+        }
+
+        static void registerStringLayouts(TaoTree tree, LeafLayout leafLayout,
+                                          int leafClassIndex) {
+            for (var sl : leafLayout.stringLayouts()) {
+                tree.registerStringLayout(leafClassIndex, sl);
+            }
+        }
     }
 }

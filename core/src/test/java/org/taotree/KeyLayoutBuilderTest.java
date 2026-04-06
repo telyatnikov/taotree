@@ -5,6 +5,9 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.ValueLayout;
 
 import static org.junit.jupiter.api.Assertions.*;
+import org.taotree.layout.KeyBuilder;
+import org.taotree.layout.KeyField;
+import org.taotree.layout.KeyLayout;
 
 class KeyLayoutBuilderTest {
 

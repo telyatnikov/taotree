@@ -5,6 +5,11 @@ import org.junit.jupiter.api.Test;
 import java.lang.foreign.Arena;
 
 import static org.junit.jupiter.api.Assertions.*;
+import org.taotree.layout.KeyBuilder;
+import org.taotree.layout.KeyField;
+import org.taotree.layout.KeyLayout;
+import org.taotree.layout.LeafField;
+import org.taotree.layout.LeafLayout;
 
 /**
  * Tests for {@link LeafField}, {@link LeafLayout}, and {@link LeafAccessor}.

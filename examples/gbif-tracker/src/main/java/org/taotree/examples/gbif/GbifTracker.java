@@ -10,6 +10,12 @@ import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
+import org.taotree.TaoTree;
+import org.taotree.layout.KeyField;
+import org.taotree.layout.KeyLayout;
+import org.taotree.layout.LeafField;
+import org.taotree.layout.LeafHandle;
+import org.taotree.layout.LeafLayout;
 
 /**
  * GBIF Species Observation Tracker — demonstrates TaoTree with real biodiversity data.
@@ -103,13 +109,7 @@ public class GbifTracker {
         // Create a fresh persistent store
         try (var tree = createFresh(storePath)) {
 
-            // Activate COW mode if requested (lock-free readers, concurrent writers)
-            boolean cowMode = Arrays.stream(args).anyMatch("--cow"::equals);
-            if (cowMode) {
-                tree.activateCowMode();
-                System.out.println("COW mode: ACTIVE (lock-free readers, concurrent writers)");
-                System.out.println();
-            }
+            // COW mode is always active (lock-free readers, concurrent writers)
 
             var KINGDOM = tree.keyDict16("kingdom");
             var PHYLUM  = tree.keyDict16("phylum");
@@ -252,10 +252,10 @@ public class GbifTracker {
                 }
                 System.out.println();
                 System.out.println("=== Memory ===");
-                System.out.printf("  SlabAllocator: %,.1f MB (%,d segments in use)%n",
+                System.out.printf("  Slab:     %,.1f MB (%,d segments in use)%n",
                     tree.totalSlabBytes() / (1024.0 * 1024),
                     tree.totalSegmentsInUse());
-                System.out.printf("  BumpAllocator: %,.1f MB (%,d pages)%n",
+                System.out.printf("  Overflow: %,.1f MB (%,d pages)%n",
                     tree.totalOverflowBytes() / (1024.0 * 1024),
                     tree.overflowPageCount());
             }

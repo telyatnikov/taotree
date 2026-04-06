@@ -170,15 +170,14 @@ class ConcurrencyTest {
     }
 
     @Test
-    void readToWriteUpgradeViaDict() {
+    void readAndDictWriteCoexist() {
         try (var tree = TaoTree.open(KEY_LEN, new int[]{VALUE_SIZE})) {
             var dict = TaoDictionary.u16(tree);
 
-            // Acquire read lock
+            // Dict lock is independent of tree read lock — intern uses dictLock
             try (var read = tree.read()) {
-                // Attempting intern (which needs write lock) should throw
-                assertThrows(IllegalStateException.class,
-                    () -> dict.intern("test"));
+                int code = dict.intern("test");
+                assertTrue(code > 0);
             }
         }
     }

@@ -10,6 +10,13 @@ import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import org.taotree.LeafAccessor;
+import org.taotree.TaoTree;
+import org.taotree.layout.KeyField;
+import org.taotree.layout.KeyLayout;
+import org.taotree.layout.LeafField;
+import org.taotree.layout.LeafHandle;
+import org.taotree.layout.LeafLayout;
 
 /**
  * Independent verification of gbif-tracker.taotree against Parquet source.

@@ -13,10 +13,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.*;
+import org.taotree.internal.art.Node16;
+import org.taotree.internal.art.Node256;
+import org.taotree.internal.art.Node48;
+import org.taotree.internal.art.Node4;
 
 /**
- * Tests for COW (copy-on-write) mode: ROWEX-hybrid lock-free readers
- * and per-subtree CAS concurrent writers.
+ * Tests for COW (copy-on-write) concurrency: ROWEX-hybrid lock-free readers
+ * and per-subtree CAS concurrent writers. COW is always active.
  */
 class CowModeTest {
 
@@ -32,21 +36,11 @@ class CowModeTest {
         return key;
     }
 
-    // ---- Basic COW mode operations ----
+    // ---- Basic COW operations ----
 
     @Test
-    void cowModeActivation() {
+    void insertAndLookup() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            assertFalse(tree.isCowMode());
-            tree.activateCowMode();
-            assertTrue(tree.isCowMode());
-        }
-    }
-
-    @Test
-    void cowModeInsertAndLookup() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
 
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(intKey(42), 0);
@@ -63,9 +57,9 @@ class CowModeTest {
     }
 
     @Test
-    void cowModeInsertMultipleKeys() {
+    void insertMultipleKeys() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             try (var w = tree.write()) {
                 for (int i = 0; i < 100; i++) {
@@ -88,9 +82,9 @@ class CowModeTest {
     }
 
     @Test
-    void cowModeDuplicateInsert() {
+    void duplicateInsert() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             try (var w = tree.write()) {
                 long leaf1 = w.getOrCreate(intKey(42), 0);
@@ -102,9 +96,9 @@ class CowModeTest {
     }
 
     @Test
-    void cowModeDelete() {
+    void deleteKeys() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Insert
             try (var w = tree.write()) {
@@ -134,9 +128,9 @@ class CowModeTest {
     }
 
     @Test
-    void cowModeLargeInsert() {
+    void largeInsert() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             int count = 10_000;
             try (var w = tree.write()) {
@@ -163,7 +157,7 @@ class CowModeTest {
     @Test
     void lockFreeReadersDoNotBlock() throws InterruptedException {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Pre-populate
             try (var w = tree.write()) {
@@ -207,7 +201,7 @@ class CowModeTest {
     @Test
     void concurrentWritersDifferentKeys() throws Exception {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             int numWriters = 4;
             int keysPerWriter = 250;
@@ -252,7 +246,7 @@ class CowModeTest {
     @Test
     void concurrentReadersAndWriters() throws Exception {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Pre-populate
             try (var w = tree.write()) {
@@ -315,12 +309,12 @@ class CowModeTest {
         }
     }
 
-    // ---- Transition from legacy to COW mode ----
+    // ---- Multi-phase insert test ----
 
     @Test
-    void legacyToComModeTransition() {
+    void multiPhaseInsert() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            // Insert in legacy mode
+            // Phase 1: insert first batch
             try (var w = tree.write()) {
                 for (int i = 0; i < 50; i++) {
                     long leaf = w.getOrCreate(intKey(i), 0);
@@ -328,10 +322,7 @@ class CowModeTest {
                 }
             }
 
-            // Activate COW mode
-            tree.activateCowMode();
-
-            // Read existing data in COW mode
+            // Read existing data
             try (var r = tree.read()) {
                 assertEquals(50, r.size());
                 for (int i = 0; i < 50; i++) {
@@ -340,7 +331,7 @@ class CowModeTest {
                 }
             }
 
-            // Insert new data in COW mode
+            // Phase 2: insert more
             try (var w = tree.write()) {
                 for (int i = 50; i < 100; i++) {
                     long leaf = w.getOrCreate(intKey(i), 0);
@@ -360,12 +351,12 @@ class CowModeTest {
         }
     }
 
-    // ---- Node growth (triggers COW node type transitions) ----
+    // ---- Node growth (triggers node type transitions) ----
 
     @Test
-    void cowModeNodeGrowth() {
+    void nodeGrowth() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Insert enough keys to force Node4 → Node16 → Node48 → Node256 growth
             // Use intKey() to ensure unique 4-byte keys (big-endian encoding)
@@ -389,9 +380,9 @@ class CowModeTest {
     }
 
     @Test
-    void cowModeDeleteAndReinsert() {
+    void deleteAndReinsert() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Insert
             try (var w = tree.write()) {
@@ -428,9 +419,9 @@ class CowModeTest {
     }
 
     @Test
-    void cowModePrefixSplit() {
+    void prefixSplit() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Keys that share a long prefix then diverge
             byte[] key1 = {1, 2, 3, 10};
@@ -454,9 +445,9 @@ class CowModeTest {
     }
 
     @Test
-    void cowModeNodeShrink() {
+    void nodeShrink() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Insert enough to grow nodes, then delete to trigger shrink
             try (var w = tree.write()) {
@@ -485,9 +476,9 @@ class CowModeTest {
     }
 
     @Test
-    void cowModeEpochReclamation() {
+    void epochReclamation() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Insert, then delete → retired nodes
             try (var w = tree.write()) {
@@ -523,9 +514,9 @@ class CowModeTest {
     // ---- Delete edge cases (exercises cowNodeAfterRemoval, cowCollapseSingleChild) ----
 
     @Test
-    void cowModeDeleteSingleKey() {
+    void deleteSingleKey() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             try (var w = tree.write()) {
                 w.getOrCreate(intKey(42), 0);
@@ -545,9 +536,9 @@ class CowModeTest {
     }
 
     @Test
-    void cowModeDeleteFromEmptyTree() {
+    void deleteFromEmptyTree() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             try (var w = tree.write()) {
                 assertFalse(w.delete(intKey(42)));
@@ -557,9 +548,9 @@ class CowModeTest {
     }
 
     @Test
-    void cowModeDeleteNonExistentKeyFromPopulatedTree() {
+    void deleteNonExistentKey() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             try (var w = tree.write()) {
                 for (int i = 0; i < 10; i++) {
@@ -576,10 +567,10 @@ class CowModeTest {
     }
 
     @Test
-    void cowModeDeleteCollapseToSingleChild() {
+    void deleteCollapseToSingleChild() {
         // Delete from Node4 until 1 child remains → should collapse to prefix
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Insert 3 keys that share a prefix, diverging at byte 3
             byte[] key1 = {10, 20, 30, 1};
@@ -614,9 +605,9 @@ class CowModeTest {
     }
 
     @Test
-    void cowModeDeleteAllThenVerifyEmpty() {
+    void deleteAllThenVerifyEmpty() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             int count = 200; // exercises multiple node types
             try (var w = tree.write()) {
@@ -645,9 +636,9 @@ class CowModeTest {
     // ---- Node shrink through specific thresholds ----
 
     @Test
-    void cowModeNode48ShrinkToNode16() {
+    void node48ShrinkToNode16() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Insert 48 keys to fill a Node48 (keys at depth 1 diverge across 48 distinct bytes)
             // Use keys like {0, X, 0, 0} to force divergence at byte 1
@@ -682,9 +673,9 @@ class CowModeTest {
     }
 
     @Test
-    void cowModeNode256ShrinkToNode48() {
+    void node256ShrinkToNode48() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Insert 100 keys to create a Node256 (>48 distinct byte values at same depth)
             // Keys: {0, X, 0, 0} — diverge at byte 1 with X=0..99
@@ -719,9 +710,9 @@ class CowModeTest {
     }
 
     @Test
-    void cowModeNode16ShrinkToNode4() {
+    void node16ShrinkToNode4() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Insert 16 keys to fill a Node16
             int count = 16;
@@ -757,12 +748,12 @@ class CowModeTest {
     // ---- Long keys: exercise prefix chaining (>15 bytes) ----
 
     @Test
-    void cowModeLongKeysPrefixChaining() {
+    void longKeysPrefixChaining() {
         int longKeyLen = 20; // > PREFIX_CAPACITY (15) → prefix chain
         int valueSize = 8;
 
         try (var tree = TaoTree.open(longKeyLen, valueSize)) {
-            tree.activateCowMode();
+
 
             byte[] key1 = new byte[longKeyLen];
             byte[] key2 = new byte[longKeyLen];
@@ -795,12 +786,12 @@ class CowModeTest {
     }
 
     @Test
-    void cowModeLongKeysManyInserts() {
+    void longKeysManyInserts() {
         int longKeyLen = 24; // > 15 → chains multiple prefix nodes
         int valueSize = 8;
 
         try (var tree = TaoTree.open(longKeyLen, valueSize)) {
-            tree.activateCowMode();
+
 
             int count = 100;
             try (var w = tree.write()) {
@@ -833,12 +824,12 @@ class CowModeTest {
     }
 
     @Test
-    void cowModeLongKeysDeleteAndCollapse() {
+    void longKeysDeleteAndCollapse() {
         int longKeyLen = 20;
         int valueSize = 8;
 
         try (var tree = TaoTree.open(longKeyLen, valueSize)) {
-            tree.activateCowMode();
+
 
             byte[] key1 = new byte[longKeyLen];
             byte[] key2 = new byte[longKeyLen];
@@ -876,9 +867,9 @@ class CowModeTest {
     // ---- Prefix split at various positions ----
 
     @Test
-    void cowModePrefixSplitAtStart() {
+    void prefixSplitAtStart() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Keys diverge at first byte → prefix split at position 0
             byte[] key1 = {1, 0, 0, 0};
@@ -900,9 +891,9 @@ class CowModeTest {
     }
 
     @Test
-    void cowModePrefixSplitMidway() {
+    void prefixSplitMidway() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Keys share first 2 bytes, diverge at byte 2
             byte[] key1 = {10, 20, 1, 0};
@@ -932,12 +923,12 @@ class CowModeTest {
         }
     }
 
-    // ---- Scan operations in COW mode ----
+    // ---- Scan operations ----
 
     @Test
-    void cowModeForEachScan() {
+    void forEachScan() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             int count = 50;
             try (var w = tree.write()) {
@@ -961,9 +952,9 @@ class CowModeTest {
     }
 
     @Test
-    void cowModeForEachEarlyStop() {
+    void forEachEarlyStop() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             try (var w = tree.write()) {
                 for (int i = 0; i < 100; i++) {
@@ -988,7 +979,7 @@ class CowModeTest {
     @Test
     void concurrentWritersSameKeyRange() throws Exception {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             int numWriters = 4;
             int keysPerWriter = 100;
@@ -1035,7 +1026,7 @@ class CowModeTest {
     @Test
     void concurrentDeleteAndInsert() throws Exception {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Pre-populate with keys 0..199
             try (var w = tree.write()) {
@@ -1095,9 +1086,9 @@ class CowModeTest {
     // ---- Prefix merge edge case ----
 
     @Test
-    void cowModePrefixMergeOnDelete() {
+    void prefixMergeOnDelete() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Create a tree where deleting forces prefix merge:
             // Insert keys that create: PREFIX → NODE4 → PREFIX → LEAF
@@ -1129,9 +1120,9 @@ class CowModeTest {
     // ---- Incremental growth through all node type transitions ----
 
     @Test
-    void cowModeIncrementalGrowthAndShrink() {
+    void incrementalGrowthAndShrink() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             // Grow from empty → Node4 → Node16 → Node48 → Node256
             // then shrink back: Node256 → Node48 → Node16 → Node4 → prefix → empty
@@ -1182,9 +1173,9 @@ class CowModeTest {
     // ---- Delete with key exhaustion at inner node (cowDelete line 204-205) ----
 
     @Test
-    void cowModeDeleteKeyExhausted() {
+    void deleteKeyExhausted() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             try (var w = tree.write()) {
                 w.getOrCreate(intKey(0), 0);
@@ -1202,9 +1193,9 @@ class CowModeTest {
     // ---- Prefix mismatch during delete (cowDelete line 195-196) ----
 
     @Test
-    void cowModeDeletePrefixMismatch() {
+    void deletePrefixMismatch() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             byte[] key1 = {1, 2, 3, 4};
             byte[] key2 = {1, 2, 3, 5};
@@ -1226,9 +1217,9 @@ class CowModeTest {
     // ---- Repeated reclamation cycles ----
 
     @Test
-    void cowModeRepeatedInsertDeleteReclaim() {
+    void repeatedInsertDeleteReclaim() {
         try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            tree.activateCowMode();
+
 
             var reclaimer = tree.reclaimer();
             assertNotNull(reclaimer);

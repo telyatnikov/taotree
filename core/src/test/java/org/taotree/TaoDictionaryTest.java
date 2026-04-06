@@ -288,16 +288,16 @@ class TaoDictionaryTest {
     // ---- Mutation-killing: copyFrom requires write lock ----
 
     @Test
-    void copyFromWithoutWriteLockThrows() {
+    void copyFromSelfLocking() {
         try (var tree = TaoTree.forDictionaries()) {
             var source = TaoDictionary.u16(tree);
             source.intern("hello");
 
             var target = TaoDictionary.u16(tree);
 
-            // copyFrom without holding write lock should throw
-            assertThrows(IllegalStateException.class,
-                () -> target.copyFrom(source));
+            // copyFrom is self-locking — no external write scope needed
+            target.copyFrom(source);
+            assertEquals(1, target.size());
         }
     }
 }

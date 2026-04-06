@@ -9,6 +9,11 @@ import org.junit.jupiter.api.Test;
 import java.lang.foreign.Arena;
 import java.util.HashMap;
 import java.util.Map;
+import org.taotree.layout.KeyBuilder;
+import org.taotree.layout.KeyField;
+import org.taotree.layout.KeyLayout;
+import org.taotree.layout.LeafField;
+import org.taotree.layout.LeafLayout;
 
 /**
  * Lincheck linearizability test for TaoTree with dictionary-encoded compound keys

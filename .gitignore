@@ -14,3 +14,4 @@ build/
 
 # OS
 .DS_Store
+docs/file-format-v2-proposal.md

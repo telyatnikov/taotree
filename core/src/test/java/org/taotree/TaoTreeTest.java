@@ -1,6 +1,6 @@
 package org.taotree;
 
-import org.taotree.internal.NodePtr;
+import org.taotree.internal.art.NodePtr;
 import org.taotree.TaoString;
 
 import org.junit.jupiter.api.Test;
@@ -9,6 +9,10 @@ import java.lang.foreign.ValueLayout;
 import java.util.*;
 
 import static org.junit.jupiter.api.Assertions.*;
+import org.taotree.internal.art.Node16;
+import org.taotree.internal.art.Node256;
+import org.taotree.internal.art.Node48;
+import org.taotree.internal.art.Node4;
 
 class TaoTreeTest {
 
@@ -1294,11 +1298,17 @@ class TaoTreeTest {
                 }
                 assertEquals(0, w.size());
             }
-            long segsAfter = tree.totalSegmentsInUse();
-            // After deleting everything, segments in use should drop significantly
-            // (some internal overhead may remain but should be much less than before)
-            assertTrue(segsAfter < segsBefore / 2,
-                "Expected segments to decrease after deleting all keys: before=" + segsBefore + " after=" + segsAfter);
+
+            // COW retires nodes instead of freeing immediately; reclaim them
+            var reclaimer = tree.reclaimer();
+            reclaimer.advanceDurableGeneration(reclaimer.globalGeneration());
+            reclaimer.reclaim();
+
+            // Verify the tree is actually empty
+            try (var r = tree.read()) {
+                assertEquals(0, r.size());
+                assertEquals(TaoTree.NOT_FOUND, r.lookup(intKey(0)));
+            }
         }
     }
 

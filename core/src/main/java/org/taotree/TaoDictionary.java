@@ -1,7 +1,7 @@
 package org.taotree;
 
-import org.taotree.internal.NodePtr;
-import org.taotree.internal.Superblock;
+import org.taotree.internal.art.NodePtr;
+import org.taotree.internal.persist.Superblock;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -101,25 +101,16 @@ public final class TaoDictionary {
     // Scoped access
     // -----------------------------------------------------------------------
 
-    /** Acquire a read scope. In COW mode, this is lock-free. */
+    /** Acquire a read scope. Lock-free (dict resolve is lock-free). */
     public ReadScope read() {
-        if (!owner.isCowMode()) {
-            owner.acquireReadLock();
-        }
         return new ReadScope();
     }
 
     /**
-     * Acquire a write scope. In COW mode, acquires the per-dictionary lock.
-     *
-     * @throws IllegalStateException if the current thread holds only a read scope (legacy mode)
+     * Acquire a write scope. Acquires the per-dictionary lock.
      */
     public WriteScope write() {
-        if (owner.isCowMode()) {
-            dictLock.lock();
-        } else {
-            owner.acquireWriteLock();
-        }
+        dictLock.lock();
         return new WriteScope();
     }
 
@@ -130,81 +121,46 @@ public final class TaoDictionary {
     /**
      * Intern a string: return its code, assigning a new one if not yet known.
      *
-     * <p>In COW mode, acquires a per-dictionary lock (not the global tree lock),
+     * <p>Acquires a per-dictionary lock (not the global tree lock),
      * allowing concurrent interning into different dictionaries.
-     * In legacy mode, acquires the tree's write lock (reentrant if already held).
      *
      * @param value the string to intern
      * @return the integer code (never 0 — zero is reserved as null sentinel)
-     * @throws IllegalStateException if the dictionary is full, or if read->write upgrade
+     * @throws IllegalStateException if the dictionary is full
      */
     public int intern(String value) {
-        if (owner.isCowMode()) {
-            dictLock.lock();
-            try {
-                return internImpl(value);
-            } finally {
-                dictLock.unlock();
-            }
-        }
-        owner.acquireWriteLock();
+        dictLock.lock();
         try {
             return internImpl(value);
         } finally {
-            owner.releaseWriteLock();
+            dictLock.unlock();
         }
     }
 
     /**
      * Resolve a string to its code without assigning. Returns -1 if not found.
      *
-     * <p>In COW mode, this is lock-free (epoch-based via the tree's root pointer).
-     * In legacy mode, acquires the tree's read lock.
+     * <p>Lock-free: reads the child tree's root via acquire semantics.
      */
     public int resolve(String value) {
-        if (owner.isCowMode()) {
-            // Lock-free resolve: child tree's root is published via setRelease
-            return resolveImpl(value);
-        }
-        owner.acquireReadLock();
-        try {
-            return resolveImpl(value);
-        } finally {
-            owner.releaseReadLock();
-        }
+        return resolveImpl(value);
     }
 
-    /** Number of entries. */
+    /** Number of entries (lock-free). */
     public int size() {
-        if (owner.isCowMode()) {
-            return (int) tree.size;
-        }
-        owner.acquireReadLock();
-        try {
-            return (int) tree.size;
-        } finally {
-            owner.releaseReadLock();
-        }
+        return (int) tree.size;
     }
 
-    /** The next code that will be assigned. */
+    /** The next code that will be assigned (lock-free). */
     public int nextCode() {
-        if (owner.isCowMode()) {
-            return nextCode;
-        }
-        owner.acquireReadLock();
-        try {
-            return nextCode;
-        } finally {
-            owner.releaseReadLock();
-        }
+        return nextCode;
     }
 
     // -----------------------------------------------------------------------
     // ReadScope
     // -----------------------------------------------------------------------
 
-    /** Read-only scope of the dictionary. */
+    /** Read-only scope of the dictionary (lock-free). */
     public final class ReadScope implements AutoCloseable {
         /** Resolve a string to its code. Returns -1 if not found. */
         public int resolve(String value) { return resolveImpl(value); }
@@ -213,18 +169,14 @@ public final class TaoDictionary {
         public int size() { return (int) tree.size; }
 
         @Override
-        public void close() {
-            if (!owner.isCowMode()) {
-                owner.releaseReadLock();
-            }
-        }
+        public void close() { /* lock-free — nothing to release */ }
     }
 
     // -----------------------------------------------------------------------
     // WriteScope
     // -----------------------------------------------------------------------
 
-    /** Write scope of the dictionary. */
+    /** Write scope of the dictionary. Holds the per-dictionary lock. */
     public final class WriteScope implements AutoCloseable {
         /** Intern a string: return its code, assigning a new one if not yet known. */
         public int intern(String value) { return internImpl(value); }
@@ -237,11 +189,7 @@ public final class TaoDictionary {
 
         @Override
         public void close() {
-            if (owner.isCowMode()) {
-                dictLock.unlock();
-            } else {
-                owner.releaseWriteLock();
-            }
+            dictLock.unlock();
         }
     }
 
@@ -269,48 +217,58 @@ public final class TaoDictionary {
      * {@code nextCode} matches the source's, so future interns continue the same
      * code sequence.
      *
-     * <p>The caller must hold the owner tree's write lock.
+     * <p>Acquires the per-dictionary lock for thread safety.
      *
      * @param source the source dictionary to copy from
-     * @throws IllegalStateException if the target is not empty or the owner's write lock is not held
+     * @throws IllegalStateException if the target is not empty
      * @throws IllegalArgumentException if maxCode doesn't match
      */
     public void copyFrom(TaoDictionary source) {
-        if (!owner.isWriteLockedByCurrentThread()) {
-            throw new IllegalStateException(
-                "TaoDictionary.copyFrom() requires the owner tree's write lock.");
+        dictLock.lock();
+        try {
+            if (tree.size != 0) {
+                throw new IllegalStateException(
+                    "TaoDictionary.copyFrom() requires an empty target dictionary (size="
+                    + tree.size + "). Use a freshly created dictionary.");
+            }
+            if (this.maxCode != source.maxCode) {
+                throw new IllegalArgumentException(
+                    "maxCode mismatch: source=" + source.maxCode + " target=" + this.maxCode);
+            }
+            tree.copyFromImpl(source.tree);
+            this.nextCode = source.nextCode;
+        } finally {
+            dictLock.unlock();
         }
-        if (tree.size != 0) {
-            throw new IllegalStateException(
-                "TaoDictionary.copyFrom() requires an empty target dictionary (size="
-                + tree.size + "). Use a freshly created dictionary.");
-        }
-        if (this.maxCode != source.maxCode) {
-            throw new IllegalArgumentException(
-                "maxCode mismatch: source=" + source.maxCode + " target=" + this.maxCode);
-        }
-        tree.copyFromImpl(source.tree);
-        this.nextCode = source.nextCode;
     }
 
     private int internImpl(String value) {
         byte[] padded = encodeAndPad(value);
-        long leafRef = tree.getOrCreateImpl(MemorySegment.ofArray(padded), MAX_KEY_LEN, 0);
+        var ws = tree.beginWrite();
+        long leafRef = tree.getOrCreateWith(ws, MemorySegment.ofArray(padded), MAX_KEY_LEN, 0);
         MemorySegment leaf = tree.leafValueImpl(leafRef);
         int existing = leaf.get(ValueLayout.JAVA_INT_UNALIGNED, 0);
-        if (existing != 0) return existing;
+        if (existing != 0) {
+            // Key existed — no structural change, but still commit
+            // (beginWrite snapshotted; commit restores and publishes)
+            tree.commitWrite(ws);
+            return existing;
+        }
 
         if (nextCode > maxCode) {
             throw new IllegalStateException("TaoDictionary exhausted (max=" + maxCode + "): " + value);
         }
         int code = nextCode++;
         leaf.set(ValueLayout.JAVA_INT_UNALIGNED, 0, code);
+        // Commit: publish new root + size, retire old nodes
+        tree.commitWrite(ws);
         return code;
     }
 
     private int resolveImpl(String value) {
         byte[] padded = encodeAndPad(value);
-        long leafRef = tree.lookupImpl(MemorySegment.ofArray(padded), MAX_KEY_LEN);
+        // Lock-free lookup via acquire on rootPtr
+        long leafRef = tree.lookupLockFree(MemorySegment.ofArray(padded), MAX_KEY_LEN);
         if (NodePtr.isEmpty(leafRef)) return -1;
         return tree.leafValueImpl(leafRef).get(ValueLayout.JAVA_INT_UNALIGNED, 0);
     }
