@@ -34,6 +34,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.taotree.layout.KeyBuilder;
 import org.taotree.layout.KeyField;
@@ -95,6 +96,7 @@ public final class TaoTree implements AutoCloseable {
     private final SlabAllocator slab;
     private final BumpAllocator bump;
     private final ReentrantReadWriteLock lock;
+    private final ReentrantLock commitLock = new ReentrantLock();
     private final boolean ownsArena;
     private final ChunkStore chunkStore; // null for in-memory mode
 
@@ -1282,7 +1284,12 @@ public final class TaoTree implements AutoCloseable {
     }
 
     /**
-     * Acquire a write scope. Acquires the write lock (serializes writers).
+     * Acquire a write scope. Multiple write scopes can be open concurrently.
+     * Each mutation (getOrCreate / delete) independently performs optimistic
+     * COW against the current published root, then acquires the commit lock
+     * to publish. If another writer published in between, the mutation is
+     * redone against the new root (one tree-depth traversal). User code
+     * between mutations runs without any lock.
      *
      * <p>Use within try-with-resources:
      * <pre>{@code
@@ -1293,7 +1300,6 @@ public final class TaoTree implements AutoCloseable {
      * }</pre>
      */
     public WriteScope write() {
-        lock.writeLock().lock();
         ensureCowEngine();
         return new WriteScope();
     }
@@ -1515,9 +1521,12 @@ public final class TaoTree implements AutoCloseable {
     // -----------------------------------------------------------------------
 
     /**
-     * Read-write scope of the TaoTree. Holds the write lock to serialize
-     * writers. Mutations operate on a private {@link WriteState} snapshot;
-     * the final root is committed back and published to readers on close.
+     * Read-write scope of the TaoTree. Multiple write scopes can be open
+     * concurrently. The first mutation performs optimistic COW outside any
+     * lock, then acquires the commit lock to publish. The commit lock is
+     * held until close, serializing the value-write + publish sequence.
+     * Concurrent writers overlap on the first mutation's COW (the expensive
+     * part). User code before the first mutation runs with no lock.
      *
      * <p>All returned leaf references and {@link MemorySegment} slices are
      * valid only while this scope is open.
@@ -1526,30 +1535,35 @@ public final class TaoTree implements AutoCloseable {
 
         private boolean closed;
         private final Thread ownerThread = Thread.currentThread();
-        private final WriteState ws;
+        private final WriterArena scopeArena; // per-scope arena (file-backed) or null (in-memory)
+        private boolean commitLockHeld;
 
         private WriteScope() {
-            this.ws = new WriteState(root, size);
+            this.scopeArena = (chunkStore != null) ? new WriterArena(chunkStore) : null;
         }
 
-        // -- Read operations (writer sees its own writes via workingRoot) --
+        // -- Read operations --
 
         public long lookup(MemorySegment key, int keyLen) {
             checkAccess();
             validateKeyLen(keyLen);
-            return lookupFrom(ws.root, key, keyLen);
+            // If we hold the commit lock, read from the live root (our latest mutation)
+            long r = commitLockHeld ? root : publishedState().root();
+            return lookupFrom(r, key, keyLen);
         }
 
         /** Point lookup (uses the tree's key length). */
         public long lookup(MemorySegment key) {
             checkAccess();
-            return lookupFrom(ws.root, key, TaoTree.this.keyLen);
+            long r = commitLockHeld ? root : publishedState().root();
+            return lookupFrom(r, key, TaoTree.this.keyLen);
         }
 
         public long lookup(byte[] key) {
             checkAccess();
             validateKeyLen(key.length);
-            return lookupFrom(ws.root, MemorySegment.ofArray(key), key.length);
+            long r = commitLockHeld ? root : publishedState().root();
+            return lookupFrom(r, MemorySegment.ofArray(key), key.length);
         }
 
         /**
@@ -1564,19 +1578,15 @@ public final class TaoTree implements AutoCloseable {
 
         public long size() {
             checkAccess();
-            return ws.size;
+            return commitLockHeld ? size : publishedState().size();
         }
         public boolean isEmpty() {
             checkAccess();
-            return ws.size == 0;
+            return (commitLockHeld ? size : publishedState().size()) == 0;
         }
 
         /**
          * Get a typed, writable accessor for a leaf value.
-         *
-         * @param leafPtr the leaf pointer (from {@link #lookup} or {@link #getOrCreate})
-         * @param layout  the leaf value layout
-         * @return a writable {@link LeafAccessor}
          */
         public LeafAccessor leaf(long leafPtr, LeafLayout layout) {
             return new LeafAccessor(leafValue(leafPtr), layout, TaoTree.this);
@@ -1584,36 +1594,17 @@ public final class TaoTree implements AutoCloseable {
 
         /**
          * Insert or lookup, returning a typed, writable accessor.
-         *
-         * <p>Uses the tree's key length and the default leaf class (0).
-         *
-         * @param key    the key
-         * @param layout the leaf value layout
-         * @return a writable {@link LeafAccessor} (existing or newly created with zeroed fields)
          */
         public LeafAccessor getOrCreate(MemorySegment key, LeafLayout layout) {
             checkAccess();
-            long ptr = getOrCreateWith(ws, key, TaoTree.this.keyLen, 0);
+            long ptr = optimisticGetOrCreate(key, TaoTree.this.keyLen, 0);
             return new LeafAccessor(leafValueImpl(ptr), layout, TaoTree.this);
         }
 
-        /**
-         * Insert or lookup from a {@link KeyBuilder}, returning a typed, writable accessor.
-         *
-         * @param kb     the key builder (must have all fields set)
-         * @param layout the leaf value layout
-         * @return a writable {@link LeafAccessor} (existing or newly created with zeroed fields)
-         */
         public LeafAccessor getOrCreate(KeyBuilder kb, LeafLayout layout) {
             return getOrCreate(kb.key(), layout);
         }
 
-        /**
-         * Insert or lookup from a {@link KeyBuilder}, using the tree's bound leaf layout.
-         *
-         * @param kb the key builder (must have all fields set)
-         * @return a writable {@link LeafAccessor} (existing or newly created with zeroed fields)
-         */
         public LeafAccessor getOrCreate(KeyBuilder kb) {
             return getOrCreate(kb.key(), leafLayout());
         }
@@ -1622,37 +1613,30 @@ public final class TaoTree implements AutoCloseable {
 
         /**
          * Insert a key or return the existing leaf.
-         *
-         * @param key       the key (binary-comparable, length must equal this tree's keyLen)
-         * @param keyLen    key length in bytes
-         * @param leafClass the leaf class index (0-based)
-         * @return a leaf reference (existing or newly created with zeroed value)
          */
         public long getOrCreate(MemorySegment key, int keyLen, int leafClass) {
             checkAccess();
             validateKeyLen(keyLen);
             validateLeafClass(leafClass);
-            return getOrCreateWith(ws, key, keyLen, leafClass);
+            return optimisticGetOrCreate(key, keyLen, leafClass);
         }
 
-        /** Insert or lookup using the tree's key length and the default leaf class (0). */
         public long getOrCreate(MemorySegment key) {
             checkAccess();
-            return getOrCreateWith(ws, key, TaoTree.this.keyLen, 0);
+            return optimisticGetOrCreate(key, TaoTree.this.keyLen, 0);
         }
 
         public long getOrCreate(byte[] key, int leafClass) {
             checkAccess();
             validateKeyLen(key.length);
             validateLeafClass(leafClass);
-            return getOrCreateWith(ws, MemorySegment.ofArray(key), key.length, leafClass);
+            return optimisticGetOrCreate(MemorySegment.ofArray(key), key.length, leafClass);
         }
 
-        /** Insert or lookup using the default leaf class (0). */
         public long getOrCreate(byte[] key) {
             checkAccess();
             validateKeyLen(key.length);
-            return getOrCreateWith(ws, MemorySegment.ofArray(key), key.length, 0);
+            return optimisticGetOrCreate(MemorySegment.ofArray(key), key.length, 0);
         }
 
         /**
@@ -1662,25 +1646,149 @@ public final class TaoTree implements AutoCloseable {
         public boolean delete(MemorySegment key, int keyLen) {
             checkAccess();
             validateKeyLen(keyLen);
-            return deleteWith(ws, key, keyLen);
+            return optimisticDelete(key, keyLen);
         }
 
         public boolean delete(byte[] key) {
             checkAccess();
             validateKeyLen(key.length);
-            return deleteWith(ws, MemorySegment.ofArray(key), key.length);
+            return optimisticDelete(MemorySegment.ofArray(key), key.length);
         }
 
         /**
-         * Copy all live entries from the source tree (held by a read scope) into this tree.
-         *
-         * @param sourceScope a read scope on the source tree
-         * @see TaoTree#copyFrom(TaoTree)
+         * Copy all live entries from the source tree into this tree.
          */
         public void copyFrom(ReadScope sourceScope) {
             checkAccess();
             sourceScope.checkAccess();
+            ensureCommitLock();
+            var ws = new WriteState(root, size);
             TaoTree.this.copyFromImpl(sourceScope.tree(), ws);
+            root = ws.root;
+            size = ws.size;
+            publishRoot();
+            if (reclaimer != null) {
+                var retirees = ws.retirees;
+                for (int i = 0, n = retirees.size(); i < n; i++) {
+                    reclaimer.retire(retirees.get(i));
+                }
+                reclaimer.advanceGeneration();
+            }
+        }
+
+        // -- Per-mutation optimistic COW + commit --
+
+        /**
+         * First mutation: optimistic COW outside lock, then acquire commit lock
+         * to check for conflict and publish. Subsequent mutations: COW under
+         * commit lock (no conflict possible).
+         */
+        private long optimisticGetOrCreate(MemorySegment key, int keyLen, int leafClass) {
+            if (commitLockHeld) {
+                // Subsequent mutation: COW under commit lock, publish immediately
+                // Re-publish first to ensure prior leaf value writes are visible
+                publishRoot();
+                return lockedGetOrCreate(key, keyLen, leafClass);
+            }
+
+            // First mutation: optimistic COW outside the lock
+            var snapshot = publishedState();
+            CowEngine.DeferredResult result = doCow(key, keyLen, leafClass, snapshot.root());
+
+            // Acquire commit lock and publish
+            commitLock.lock();
+            commitLockHeld = true;
+            var current = publishedState();
+            if (current != snapshot && result.mutated()) {
+                // Conflict: redo one COW against the new root
+                // Don't retire stale retirees — they overlap with the winner's
+                result = doCow(key, keyLen, leafClass, current.root());
+            }
+            if (result.mutated()) {
+                applyResult(result);
+            }
+            return result.leafPtr();
+        }
+
+        private boolean optimisticDelete(MemorySegment key, int keyLen) {
+            if (commitLockHeld) {
+                publishRoot();
+                return lockedDelete(key, keyLen);
+            }
+
+            var snapshot = publishedState();
+            CowEngine.DeferredResult result = doDeleteCow(key, keyLen, snapshot.root());
+
+            commitLock.lock();
+            commitLockHeld = true;
+            var current = publishedState();
+            if (current != snapshot) {
+                result = doDeleteCow(key, keyLen, current.root());
+            }
+            if (result.mutated()) {
+                applyResult(result);
+            }
+            return result.mutated();
+        }
+
+        /** COW under commit lock (second+ mutation in scope). */
+        private long lockedGetOrCreate(MemorySegment key, int keyLen, int leafClass) {
+            var result = doCow(key, keyLen, leafClass, root);
+            if (result.mutated()) {
+                applyResult(result);
+            }
+            return result.leafPtr();
+        }
+
+        private boolean lockedDelete(MemorySegment key, int keyLen) {
+            var result = doDeleteCow(key, keyLen, root);
+            if (result.mutated()) {
+                applyResult(result);
+            }
+            return result.mutated();
+        }
+
+        private CowEngine.DeferredResult doCow(MemorySegment key, int keyLen,
+                                                int leafClass, long currentRoot) {
+            if (scopeArena != null) {
+                return cowEngine.deferredGetOrCreate(scopeArena, currentRoot,
+                    key, keyLen, leafClass);
+            }
+            return cowEngine.deferredGetOrCreate(currentRoot, key, keyLen, leafClass);
+        }
+
+        private CowEngine.DeferredResult doDeleteCow(MemorySegment key, int keyLen,
+                                                      long currentRoot) {
+            if (scopeArena != null) {
+                return cowEngine.deferredDelete(scopeArena, currentRoot, key, keyLen);
+            }
+            return cowEngine.deferredDelete(currentRoot, key, keyLen);
+        }
+
+        /** Apply a mutation result: update root/size, retire old nodes. */
+        private void applyResult(CowEngine.DeferredResult result) {
+            root = result.newRoot();
+            size += result.sizeDelta();
+            // Don't publish yet — caller may write leaf values first.
+            // Publication happens on next mutation (via publishRoot()) or close().
+            if (reclaimer != null) {
+                var retirees = result.retirees();
+                for (int i = 0, n = retirees.size(); i < n; i++) {
+                    reclaimer.retire(retirees.get(i));
+                }
+                reclaimer.advanceGeneration();
+            }
+        }
+
+        private void ensureCommitLock() {
+            if (!commitLockHeld) {
+                commitLock.lock();
+                commitLockHeld = true;
+                // Sync with latest published state
+                var pub = publishedState();
+                root = pub.root();
+                size = pub.size();
+            }
         }
 
         @Override
@@ -1688,8 +1796,12 @@ public final class TaoTree implements AutoCloseable {
             if (!closed) {
                 checkThread();
                 closed = true;
-                commitWrite(ws);
-                lock.writeLock().unlock();
+                if (commitLockHeld) {
+                    // Final publish: ensures all leaf value writes from the last
+                    // mutation are visible to readers via JMM setRelease transitivity
+                    publishRoot();
+                    commitLock.unlock();
+                }
             }
         }
 
@@ -1909,11 +2021,28 @@ public final class TaoTree implements AutoCloseable {
     /** Create a detached WriteState from current published root/size. Requires CowEngine. */
     WriteState beginWrite() {
         ensureCowEngine();
-        return new WriteState(root, size);
+        var pub = publishedState();
+        return new WriteState(pub.root(), pub.size());
     }
 
-    /** Commit a detached WriteState: publish root, retire old nodes. */
+    /**
+     * Commit a detached WriteState: publish root, retire old nodes.
+     * Used by {@link TaoDictionary#internImpl} for dictionary child tree mutations
+     * (serialized by the per-dict lock, so no rebase needed).
+     */
     void commitWrite(WriteState ws) {
+        commitLock.lock();
+        try {
+            directPublish(ws);
+        } finally {
+            commitLock.unlock();
+        }
+    }
+
+    /**
+     * Publish a WriteState directly (no conflict check). Caller must hold the commit lock.
+     */
+    private void directPublish(WriteState ws) {
         root = ws.root;
         size = ws.size;
         publishRoot();
