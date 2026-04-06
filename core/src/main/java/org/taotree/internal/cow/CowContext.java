@@ -23,8 +23,8 @@ import org.taotree.internal.art.PrefixNode;
 final class CowContext {
 
     final SlabAllocator slab;
-    final WriterArena arena;       // null for in-memory mode
-    final ChunkStore chunkStore;   // null for in-memory mode
+    final WriterArena arena;       // null for child tree mode
+    final ChunkStore chunkStore;   // null for child tree mode
 
     final int prefixClassId;
     final int node4ClassId;

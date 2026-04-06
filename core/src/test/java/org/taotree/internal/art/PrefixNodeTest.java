@@ -1,12 +1,15 @@
 package org.taotree.internal.art;
 
 import java.lang.foreign.Arena;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 import org.junit.jupiter.api.Test;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
 import static org.junit.jupiter.api.Assertions.*;
+import org.taotree.internal.alloc.ChunkStore;
 import org.taotree.internal.alloc.SlabAllocator;
 import org.taotree.internal.art.NodeConstants;
 import org.taotree.internal.art.NodePtr;
@@ -15,9 +18,13 @@ import org.taotree.internal.art.PrefixNode;
 class PrefixNodeTest {
 
     @Test
-    void initAndRead() {
+    void initAndRead() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 64 * 1024);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
             int node16ClassId = alloc.registerClass(NodeConstants.NODE16_SIZE);
@@ -39,9 +46,13 @@ class PrefixNodeTest {
     }
 
     @Test
-    void initFromMiddleOfKey() {
+    void initFromMiddleOfKey() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 64 * 1024);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
             int node16ClassId = alloc.registerClass(NodeConstants.NODE16_SIZE);
@@ -63,9 +74,13 @@ class PrefixNodeTest {
     }
 
     @Test
-    void matchKeyFullMatch() {
+    void matchKeyFullMatch() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 64 * 1024);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
             int node16ClassId = alloc.registerClass(NodeConstants.NODE16_SIZE);
@@ -85,9 +100,13 @@ class PrefixNodeTest {
     }
 
     @Test
-    void matchKeyPartialMatch() {
+    void matchKeyPartialMatch() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 64 * 1024);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
             int node16ClassId = alloc.registerClass(NodeConstants.NODE16_SIZE);
@@ -107,9 +126,13 @@ class PrefixNodeTest {
     }
 
     @Test
-    void matchKeyWithDepthOffset() {
+    void matchKeyWithDepthOffset() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 64 * 1024);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
             int node16ClassId = alloc.registerClass(NodeConstants.NODE16_SIZE);
@@ -129,9 +152,13 @@ class PrefixNodeTest {
     }
 
     @Test
-    void matchKeyNoMatch() {
+    void matchKeyNoMatch() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 64 * 1024);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
             int node16ClassId = alloc.registerClass(NodeConstants.NODE16_SIZE);
@@ -151,9 +178,13 @@ class PrefixNodeTest {
     }
 
     @Test
-    void matchKeyWithMemorySegment() {
+    void matchKeyWithMemorySegment() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 64 * 1024);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
 
             long ptr = alloc.allocate(prefixClassId);
@@ -175,9 +206,13 @@ class PrefixNodeTest {
     }
 
     @Test
-    void initFromMemorySegment() {
+    void initFromMemorySegment() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 64 * 1024);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
 
             long ptr = alloc.allocate(prefixClassId);
@@ -199,9 +234,13 @@ class PrefixNodeTest {
     }
 
     @Test
-    void setChild() {
+    void setChild() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 64 * 1024);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
             int node16ClassId = alloc.registerClass(NodeConstants.NODE16_SIZE);
@@ -220,9 +259,13 @@ class PrefixNodeTest {
     }
 
     @Test
-    void maxPrefixCapacity() {
+    void maxPrefixCapacity() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 64 * 1024);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
             int node16ClassId = alloc.registerClass(NodeConstants.NODE16_SIZE);
@@ -246,9 +289,13 @@ class PrefixNodeTest {
     // ---- Mutation-killing: matchKey boundary ----
 
     @Test
-    void matchKeyZeroMatch() {
+    void matchKeyZeroMatch() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, SlabAllocator.DEFAULT_SLAB_SIZE);
             int classId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             long ptr = alloc.allocate(classId);
             var seg = alloc.resolve(ptr);
@@ -263,9 +310,13 @@ class PrefixNodeTest {
     }
 
     @Test
-    void matchKeyExactBoundary() {
+    void matchKeyExactBoundary() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, SlabAllocator.DEFAULT_SLAB_SIZE);
             int classId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             long ptr = alloc.allocate(classId);
             var seg = alloc.resolve(ptr);
@@ -282,9 +333,13 @@ class PrefixNodeTest {
     // ---- STRONGER: matchKey when key is shorter than prefix ----
 
     @Test
-    void matchKeyKeyShorterThanPrefix() {
+    void matchKeyKeyShorterThanPrefix() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, SlabAllocator.DEFAULT_SLAB_SIZE);
             int classId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             long ptr = alloc.allocate(classId);
             var seg = alloc.resolve(ptr);
@@ -300,9 +355,13 @@ class PrefixNodeTest {
     }
 
     @Test
-    void matchKeyWithLargeDepthOffset() {
+    void matchKeyWithLargeDepthOffset() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, SlabAllocator.DEFAULT_SLAB_SIZE);
             int classId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             long ptr = alloc.allocate(classId);
             var seg = alloc.resolve(ptr);

@@ -33,7 +33,7 @@ public final class Compactor {
     private final SlabAllocator slab;
     private final BumpAllocator bump;
     private final EpochReclaimer reclaimer;
-    private final ChunkStore chunkStore; // null if no arena pointers to resolve
+    private final ChunkStore chunkStore; // for resolving arena-allocated pointers
 
     // Node slab class IDs (same as the tree's)
     private final int prefixClassId;
@@ -45,15 +45,6 @@ public final class Compactor {
     private final int keySlotSize;
     private final int[] leafClassIds;
     private final int[] leafValueSizes;
-
-    public Compactor(SlabAllocator slab, BumpAllocator bump, EpochReclaimer reclaimer,
-                     int prefixClassId, int node4ClassId, int node16ClassId,
-                     int node48ClassId, int node256ClassId,
-                     int keyLen, int keySlotSize, int[] leafClassIds, int[] leafValueSizes) {
-        this(slab, bump, reclaimer, null,
-             prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
-             keyLen, keySlotSize, leafClassIds, leafValueSizes);
-    }
 
     public Compactor(SlabAllocator slab, BumpAllocator bump, EpochReclaimer reclaimer,
                      ChunkStore chunkStore,

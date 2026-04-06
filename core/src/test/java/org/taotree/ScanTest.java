@@ -2,6 +2,10 @@ package org.taotree;
 
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
+import java.nio.file.Path;
+import org.junit.jupiter.api.io.TempDir;
+
 import java.lang.foreign.Arena;
 import java.util.ArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -21,13 +25,16 @@ import org.taotree.layout.QueryBuilder;
  */
 class ScanTest {
 
+    @TempDir Path tmp;
+    private int fc;
+
     // ---- Full scan ----
 
     @Test
-    void forEachEmptyTree() {
+    void forEachEmptyTree() throws IOException {
         var keyLayout = KeyLayout.of(KeyField.uint32("id"));
         var leafLayout = LeafLayout.of(LeafField.int32("value"));
-        try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), keyLayout, leafLayout)) {
             var count = new AtomicInteger();
             try (var r = tree.read()) {
                 r.forEach(leaf -> { count.incrementAndGet(); return true; });
@@ -37,12 +44,12 @@ class ScanTest {
     }
 
     @Test
-    void forEachAllEntries() {
+    void forEachAllEntries() throws IOException {
         var keyLayout = KeyLayout.of(KeyField.uint32("id"));
         var leafLayout = LeafLayout.of(LeafField.int32("value"));
         var VALUE = leafLayout.int32("value");
 
-        try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), keyLayout, leafLayout)) {
             var ID = tree.keyUint32("id");
             try (var arena = Arena.ofConfined()) {
                 var kb = tree.newKeyBuilder(arena);
@@ -68,12 +75,12 @@ class ScanTest {
     }
 
     @Test
-    void forEachEarlyTermination() {
+    void forEachEarlyTermination() throws IOException {
         var keyLayout = KeyLayout.of(KeyField.uint32("id"));
         var leafLayout = LeafLayout.of(LeafField.int32("value"));
         var VALUE = leafLayout.int32("value");
 
-        try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), keyLayout, leafLayout)) {
             var ID = tree.keyUint32("id");
             try (var arena = Arena.ofConfined()) {
                 var kb = tree.newKeyBuilder(arena);
@@ -100,7 +107,7 @@ class ScanTest {
     // ---- Prefix scan with dict-encoded keys ----
 
     @Test
-    void scanPrefixWithDicts() {
+    void scanPrefixWithDicts() throws IOException {
         var keyLayout = KeyLayout.of(
             KeyField.dict16("category"),
             KeyField.uint32("id")
@@ -108,7 +115,7 @@ class ScanTest {
         var leafLayout = LeafLayout.of(LeafField.int32("value"));
         var VALUE = leafLayout.int32("value");
 
-        try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), keyLayout, leafLayout)) {
             var CATEGORY = tree.keyDict16("category");
             var ID = tree.keyUint32("id");
 
@@ -144,14 +151,14 @@ class ScanTest {
     }
 
     @Test
-    void scanUnknownDictValueReturnsEmpty() {
+    void scanUnknownDictValueReturnsEmpty() throws IOException {
         var keyLayout = KeyLayout.of(
             KeyField.dict16("category"),
             KeyField.uint32("id")
         );
         var leafLayout = LeafLayout.of(LeafField.int32("value"));
 
-        try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), keyLayout, leafLayout)) {
             var CATEGORY = tree.keyDict16("category");
             var ID = tree.keyUint32("id");
 
@@ -182,7 +189,7 @@ class ScanTest {
     }
 
     @Test
-    void scanUnsatisfiablePrefixSkipsTraversal() {
+    void scanUnsatisfiablePrefixSkipsTraversal() throws IOException {
         var keyLayout = KeyLayout.of(
             KeyField.dict16("a"),
             KeyField.dict16("b"),
@@ -190,7 +197,7 @@ class ScanTest {
         );
         var leafLayout = LeafLayout.of(LeafField.int32("value"));
 
-        try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), keyLayout, leafLayout)) {
             var A = tree.keyDict16("a");
             var B = tree.keyDict16("b");
 
@@ -229,7 +236,7 @@ class ScanTest {
     // ---- Prefix scan with compressed prefix nodes ----
 
     @Test
-    void scanPrefixInsideCompressedPrefixNode() {
+    void scanPrefixInsideCompressedPrefixNode() throws IOException {
         // Use a key layout where the prefix bytes are likely compressed:
         // [a:2][b:2][c:4] = 8 bytes. With few entries, the ART may
         // compress most of the key into PrefixNodes.
@@ -241,7 +248,7 @@ class ScanTest {
         var leafLayout = LeafLayout.of(LeafField.int32("value"));
         var VALUE = leafLayout.int32("value");
 
-        try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), keyLayout, leafLayout)) {
             var A = tree.keyUint16("a");
             var B = tree.keyUint16("b");
             var C = tree.keyUint32("c");
@@ -310,14 +317,14 @@ class ScanTest {
     // ---- QueryBuilder state tracking ----
 
     @Test
-    void queryBuilderPerFieldState() {
+    void queryBuilderPerFieldState() throws IOException {
         var keyLayout = KeyLayout.of(
             KeyField.dict16("a"),
             KeyField.uint32("b")
         );
         var leafLayout = LeafLayout.of(LeafField.int32("v"));
 
-        try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), keyLayout, leafLayout)) {
             var A = tree.keyDict16("a");
             var B = tree.keyUint32("b");
 
@@ -352,11 +359,11 @@ class ScanTest {
     }
 
     @Test
-    void queryBuilderClearResetsState() {
+    void queryBuilderClearResetsState() throws IOException {
         var keyLayout = KeyLayout.of(KeyField.uint32("a"));
         var leafLayout = LeafLayout.of(LeafField.int32("v"));
 
-        try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), keyLayout, leafLayout)) {
             var A = tree.keyUint32("a");
             try (var arena = Arena.ofConfined()) {
                 var qb = tree.newQueryBuilder(arena);
@@ -372,13 +379,13 @@ class ScanTest {
     // ---- Node type coverage ----
 
     @Test
-    void scanCoveringMultipleNodeTypes() {
+    void scanCoveringMultipleNodeTypes() throws IOException {
         // Insert enough entries to trigger Node4→16→48→256 growth
         var keyLayout = KeyLayout.of(KeyField.uint32("id"));
         var leafLayout = LeafLayout.of(LeafField.int32("value"));
         var VALUE = leafLayout.int32("value");
 
-        try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), keyLayout, leafLayout)) {
             var ID = tree.keyUint32("id");
             try (var arena = Arena.ofConfined()) {
                 var kb = tree.newKeyBuilder(arena);
@@ -402,12 +409,12 @@ class ScanTest {
     // ---- Single entry scan ----
 
     @Test
-    void scanSingleEntry() {
+    void scanSingleEntry() throws IOException {
         var keyLayout = KeyLayout.of(KeyField.uint32("id"));
         var leafLayout = LeafLayout.of(LeafField.int32("value"));
         var VALUE = leafLayout.int32("value");
 
-        try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), keyLayout, leafLayout)) {
             var ID = tree.keyUint32("id");
             try (var arena = Arena.ofConfined()) {
                 var kb = tree.newKeyBuilder(arena);
@@ -448,7 +455,7 @@ class ScanTest {
     // ---- QueryBuilder: exercise all handle types ----
 
     @Test
-    void queryBuilderAllHandleTypes() {
+    void queryBuilderAllHandleTypes() throws IOException {
         var keyLayout = KeyLayout.of(
             KeyField.uint8("a"),
             KeyField.uint16("b"),
@@ -459,7 +466,7 @@ class ScanTest {
         var leafLayout = LeafLayout.of(LeafField.int32("v"));
         var VALUE = leafLayout.int32("v");
 
-        try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), keyLayout, leafLayout)) {
             var A = tree.keyUint8("a");
             var B = tree.keyUint16("b");
             var C = tree.keyUint32("c");
@@ -517,7 +524,7 @@ class ScanTest {
     // ---- Handle-based leaf access: exercise all types via scan ----
 
     @Test
-    void scanWithAllLeafHandleTypes() {
+    void scanWithAllLeafHandleTypes() throws IOException {
         var keyLayout = KeyLayout.of(KeyField.uint32("id"));
         var leafLayout = LeafLayout.of(
             LeafField.int8("a"),
@@ -530,7 +537,7 @@ class ScanTest {
             LeafField.json("h")
         );
 
-        try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), keyLayout, leafLayout)) {
             var ID = tree.keyUint32("id");
             var A = tree.leafInt8("a");
             var B = tree.leafInt16("b");
@@ -577,12 +584,12 @@ class ScanTest {
     // ---- Scan with raw prefix bytes ----
 
     @Test
-    void scanRawPrefix() {
+    void scanRawPrefix() throws IOException {
         var keyLayout = KeyLayout.of(KeyField.uint16("a"), KeyField.uint32("b"));
         var leafLayout = LeafLayout.of(LeafField.int32("v"));
         var VALUE = leafLayout.int32("v");
 
-        try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), keyLayout, leafLayout)) {
             var A = tree.keyUint16("a");
             var B = tree.keyUint32("b");
 
@@ -610,10 +617,10 @@ class ScanTest {
     // ---- KeyHandle: UInt8 factory ----
 
     @Test
-    void keyUint8Handle() {
+    void keyUint8Handle() throws IOException {
         var keyLayout = KeyLayout.of(KeyField.uint8("x"), KeyField.uint32("y"));
         var leafLayout = LeafLayout.of(LeafField.int32("v"));
-        try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), keyLayout, leafLayout)) {
             var X = tree.keyUint8("x");
             assertEquals("x", X.name());
             assertEquals(0, X.offset());

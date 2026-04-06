@@ -32,8 +32,11 @@
 
 ## API Patterns
 
-- `TaoTree.open(KeyLayout, LeafLayout)` — auto-creates dicts for `KeyField.dict16/dict32`
+- `TaoTree.create(Path, KeyLayout, LeafLayout)` — creates file-backed tree, auto-creates dicts for `KeyField.dict16/dict32`
+- `TaoTree.create(Path, int keyLen, int valueSize)` — creates file-backed tree with raw key/value sizes
+- `TaoTree.forDictionaries(Path)` — creates file-backed infrastructure-only tree (dictionaries without primary data)
 - `TaoTree.open(Path, KeyLayout, LeafLayout)` — reopens file-backed tree, rebinds dicts by order
+- All trees are file-backed (in-memory mode removed); `ChunkStore` required for all allocators
 - Threading: ROWEX model — lock-free readers (epoch-based snapshot), concurrent writers (optimistic COW + commit lock)
 - `ReadScope` captures `PublicationState` (root + size atomically) via VarHandle acquire + enters epoch; never blocks on writers
 - `WriteScope` performs optimistic COW outside any lock on the first mutation, then acquires a lightweight commit lock to publish; subsequent mutations run under the commit lock; no lock is held between `write()` and the first mutation

@@ -1,6 +1,10 @@
 package org.taotree;
 
 import org.junit.jupiter.api.Test;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import org.junit.jupiter.api.io.TempDir;
 import java.lang.foreign.ValueLayout;
 import java.util.ArrayList;
 import java.util.concurrent.*;
@@ -14,6 +18,9 @@ import static org.junit.jupiter.api.Assertions.*;
  * Uses Arena.ofShared() for cross-thread access.
  */
 class ConcurrencyTest {
+
+    @TempDir Path tmp;
+    private int fc;
 
     private static final int KEY_LEN = 4;
     private static final int VALUE_SIZE = 8;
@@ -29,7 +36,7 @@ class ConcurrencyTest {
 
     @Test
     void oneWriterMultipleReaders() throws Exception {
-        try (var tree = TaoTree.open(KEY_LEN, new int[]{VALUE_SIZE})) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, new int[]{VALUE_SIZE})) {
 
             int numEntries = 10_000;
             int numReaders = 4;
@@ -103,7 +110,7 @@ class ConcurrencyTest {
 
     @Test
     void dictionaryResolveNeverReturnsZero() throws Exception {
-        try (var tree = TaoTree.forDictionaries()) {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
 
             int numEntries = 1000;
@@ -158,8 +165,8 @@ class ConcurrencyTest {
     }
 
     @Test
-    void readAndWriteScopesCoexistOnSameThread() {
-        try (var tree = TaoTree.open(KEY_LEN, new int[]{VALUE_SIZE})) {
+    void readAndWriteScopesCoexistOnSameThread() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, new int[]{VALUE_SIZE})) {
 
             // With lock-free readers, a write scope can coexist with a read scope
             // on the same thread. The read scope sees a consistent snapshot of the
@@ -188,8 +195,8 @@ class ConcurrencyTest {
     }
 
     @Test
-    void readAndDictWriteCoexist() {
-        try (var tree = TaoTree.open(KEY_LEN, new int[]{VALUE_SIZE})) {
+    void readAndDictWriteCoexist() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, new int[]{VALUE_SIZE})) {
             var dict = TaoDictionary.u16(tree);
 
             // Dict lock is independent of tree read lock — intern uses dictLock
@@ -201,8 +208,8 @@ class ConcurrencyTest {
     }
 
     @Test
-    void writeReentrantWithDict() {
-        try (var tree = TaoTree.open(KEY_LEN, new int[]{VALUE_SIZE})) {
+    void writeReentrantWithDict() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, new int[]{VALUE_SIZE})) {
             var dict = TaoDictionary.u16(tree);
 
             // Write lock is reentrant — dict calls inside write scope should work
@@ -216,8 +223,8 @@ class ConcurrencyTest {
     }
 
     @Test
-    void readReentrantWithDict() {
-        try (var tree = TaoTree.open(KEY_LEN, new int[]{VALUE_SIZE})) {
+    void readReentrantWithDict() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, new int[]{VALUE_SIZE})) {
             var dict = TaoDictionary.u16(tree);
 
             // Populate

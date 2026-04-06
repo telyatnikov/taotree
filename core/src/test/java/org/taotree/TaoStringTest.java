@@ -1,15 +1,22 @@
 package org.taotree;
 
 import org.junit.jupiter.api.Test;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import org.junit.jupiter.api.io.TempDir;
 import java.nio.charset.StandardCharsets;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class TaoStringTest {
 
+    @TempDir Path tmp;
+    private int fc;
+
     @Test
-    void shortStringInline() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void shortStringInline() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
                 var slot = w.leafValue(leaf);
@@ -26,8 +33,8 @@ class TaoStringTest {
     }
 
     @Test
-    void shortStringExactly12Bytes() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void shortStringExactly12Bytes() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
                 var slot = w.leafValue(leaf);
@@ -43,8 +50,8 @@ class TaoStringTest {
     }
 
     @Test
-    void longStringOverflow() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void longStringOverflow() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
                 var slot = w.leafValue(leaf);
@@ -63,8 +70,8 @@ class TaoStringTest {
     }
 
     @Test
-    void longStringLocality() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void longStringLocality() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
                 var slot = w.leafValue(leaf);
@@ -78,8 +85,8 @@ class TaoStringTest {
     }
 
     @Test
-    void emptyString() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void emptyString() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
                 var slot = w.leafValue(leaf);
@@ -93,8 +100,8 @@ class TaoStringTest {
     }
 
     @Test
-    void equalsShortStrings() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void equalsShortStrings() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             byte[] keyA = new byte[TaoString.SIZE];
             byte[] keyB = new byte[TaoString.SIZE];
             keyA[0] = 1;
@@ -116,8 +123,8 @@ class TaoStringTest {
     }
 
     @Test
-    void equalsLongStrings() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void equalsLongStrings() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             byte[] keyA = new byte[TaoString.SIZE];
             byte[] keyB = new byte[TaoString.SIZE];
             keyA[0] = 1;
@@ -139,8 +146,8 @@ class TaoStringTest {
     }
 
     @Test
-    void notEqualsDifferentLength() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void notEqualsDifferentLength() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             byte[] keyA = new byte[TaoString.SIZE];
             byte[] keyB = new byte[TaoString.SIZE];
             keyA[0] = 1;
@@ -161,8 +168,8 @@ class TaoStringTest {
     }
 
     @Test
-    void notEqualsDifferentContent() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void notEqualsDifferentContent() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             byte[] keyA = new byte[TaoString.SIZE];
             byte[] keyB = new byte[TaoString.SIZE];
             keyA[0] = 1;
@@ -183,8 +190,8 @@ class TaoStringTest {
     }
 
     @Test
-    void equalsBytesShort() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void equalsBytesShort() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
                 var slot = w.leafValue(leaf);
@@ -199,8 +206,8 @@ class TaoStringTest {
     }
 
     @Test
-    void equalsBytesLong() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void equalsBytesLong() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
                 var slot = w.leafValue(leaf);
@@ -215,8 +222,8 @@ class TaoStringTest {
     }
 
     @Test
-    void writeStringOverload() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void writeStringOverload() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
                 var slot = w.leafValue(leaf);
@@ -230,8 +237,8 @@ class TaoStringTest {
     // ---- Mutation-killing: write length field ----
 
     @Test
-    void writeLengthFieldIsSet() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void writeLengthFieldIsSet() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
                 var slot = w.leafValue(leaf);
@@ -250,8 +257,8 @@ class TaoStringTest {
     }
 
     @Test
-    void writeLongStringLengthFieldIsSet() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void writeLongStringLengthFieldIsSet() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
                 var slot = w.leafValue(leaf);
@@ -267,8 +274,8 @@ class TaoStringTest {
     // ---- Mutation-killing: equals fast path ----
 
     @Test
-    void equalsReturnsFalseForDifferentShortInlineData() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void equalsReturnsFalseForDifferentShortInlineData() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             byte[] keyA = new byte[TaoString.SIZE];
             byte[] keyB = new byte[TaoString.SIZE];
             keyA[0] = 1; keyB[0] = 2;
@@ -289,8 +296,8 @@ class TaoStringTest {
     }
 
     @Test
-    void equalsLongStringSamePrefix() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void equalsLongStringSamePrefix() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             byte[] keyA = new byte[TaoString.SIZE];
             byte[] keyB = new byte[TaoString.SIZE];
             keyA[0] = 1; keyB[0] = 2;
@@ -313,8 +320,8 @@ class TaoStringTest {
     // ---- Mutation-killing: equalsBytes boundary conditions ----
 
     @Test
-    void equalsBytesBoundaryAt13Bytes() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void equalsBytesBoundaryAt13Bytes() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
                 var slot = w.leafValue(leaf);
@@ -332,8 +339,8 @@ class TaoStringTest {
     }
 
     @Test
-    void equalsBytesShortLastByteDiffers() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void equalsBytesShortLastByteDiffers() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
                 var slot = w.leafValue(leaf);
@@ -350,8 +357,8 @@ class TaoStringTest {
     }
 
     @Test
-    void equalsBytesLongPrefixDiffers() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void equalsBytesLongPrefixDiffers() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
                 var slot = w.leafValue(leaf);
@@ -370,8 +377,8 @@ class TaoStringTest {
     // ---- Round 2: zero-padding mutation ----
 
     @Test
-    void shortStringZeroPadded() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void shortStringZeroPadded() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 // Write a long string first to fill the slot with non-zero data
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
@@ -395,8 +402,8 @@ class TaoStringTest {
     // ---- Round 2: equals boundary at exactly 12 bytes ----
 
     @Test
-    void equalsExactly12ByteStrings() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void equalsExactly12ByteStrings() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             byte[] keyA = new byte[TaoString.SIZE];
             byte[] keyB = new byte[TaoString.SIZE];
             keyA[0] = 1; keyB[0] = 2;
@@ -422,8 +429,8 @@ class TaoStringTest {
     // ---- Round 2: equalsBytes long string with matching prefix ----
 
     @Test
-    void equalsBytesLongStringMatchingPrefixDifferentTail() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void equalsBytesLongStringMatchingPrefixDifferentTail() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
                 var slot = w.leafValue(leaf);
@@ -443,8 +450,8 @@ class TaoStringTest {
     // ---- STRONGER: equalsBytes length mismatch kills ----
 
     @Test
-    void equalsBytesRejectsDifferentLengths() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void equalsBytesRejectsDifferentLengths() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
                 var slot = w.leafValue(leaf);
@@ -460,8 +467,8 @@ class TaoStringTest {
     }
 
     @Test
-    void equalsBytesLongDifferentInFirstPrefixByte() {
-        try (var tree = TaoTree.open(TaoString.SIZE, TaoString.SIZE)) {
+    void equalsBytesLongDifferentInFirstPrefixByte() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
                 var slot = w.leafValue(leaf);

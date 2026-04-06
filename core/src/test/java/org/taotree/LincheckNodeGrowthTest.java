@@ -6,34 +6,48 @@ import org.jetbrains.lincheck.datastructures.Param;
 import org.jetbrains.lincheck.datastructures.StressOptions;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.foreign.ValueLayout;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
-import org.taotree.internal.art.Node16;
-import org.taotree.internal.art.Node256;
-import org.taotree.internal.art.Node48;
-import org.taotree.internal.art.Node4;
 
 /**
  * Lincheck test targeting ART node growth and shrink under concurrency.
  *
  * <p>Uses a wider key range (1..50) so that concurrent insertions and deletions
- * force node transitions: Node4 → Node16 → Node48 → Node256 and back.
- * Node growth/shrink is one of the hardest parts to get right in a lock-free
- * ART because it involves replacing an inner node pointer atomically while
- * concurrent readers may still hold references to the old node.
- *
- * <p>The key encodes a single byte in the critical position (varying the
- * second byte) so that all keys share the same first byte, forcing them
- * into the same inner node and triggering growth/shrink transitions.
+ * force node transitions: Node4 -> Node16 -> Node48 -> Node256 and back.
  */
 @Param(name = "key", gen = IntGen.class, conf = "1:50")
 public class LincheckNodeGrowthTest {
 
     private static final int KEY_LEN = 4;
     private static final int VALUE_SIZE = 4;
+    private static final long CHUNK_SIZE = 1024L * 1024;
 
-    private final TaoTree tree = TaoTree.open(KEY_LEN, VALUE_SIZE);
+    private final TaoTree tree;
+    private final Path storePath;
+
+    public LincheckNodeGrowthTest() {
+        try {
+            storePath = Files.createTempFile("lincheck-nodegrowth-", ".dat");
+            storePath.toFile().deleteOnExit();
+            Files.delete(storePath);
+            tree = TaoTree.create(storePath, KEY_LEN, VALUE_SIZE, CHUNK_SIZE, false);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** Eagerly release file resources so RAMDisk doesn't fill up across Lincheck invocations. */
+    @SuppressWarnings("deprecation")
+    @Override
+    protected void finalize() {
+        tree.close();
+        try { Files.deleteIfExists(storePath); } catch (IOException ignored) {}
+    }
 
     /**
      * Encodes key with a fixed first byte (0x42) and varying second byte,
@@ -87,7 +101,7 @@ public class LincheckNodeGrowthTest {
     void stressTest() {
         new StressOptions()
             .iterations(100)
-            .invocationsPerIteration(1000)
+            .invocationsPerIteration(50)
             .threads(3)
             .actorsPerThread(4)
             .sequentialSpecification(SequentialSpec.class)

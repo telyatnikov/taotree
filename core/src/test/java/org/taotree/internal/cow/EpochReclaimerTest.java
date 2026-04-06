@@ -1,6 +1,8 @@
 package org.taotree.internal.cow;
 
 import java.lang.foreign.Arena;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -9,6 +11,7 @@ import java.util.concurrent.CyclicBarrier;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
+import org.taotree.internal.alloc.ChunkStore;
 import org.taotree.internal.alloc.SlabAllocator;
 import org.taotree.internal.cow.EpochReclaimer;
 
@@ -21,9 +24,13 @@ class EpochReclaimerTest {
     // -----------------------------------------------------------------------
 
     @Test
-    void retireAndReclaim() {
+    void retireAndReclaim() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var slab = new SlabAllocator(arena, 1 << 20);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var slab = new SlabAllocator(arena, cs, 1 << 20);
             int classId = slab.registerClass(SEGMENT_SIZE);
 
             var reclaimer = new EpochReclaimer(slab);
@@ -52,9 +59,13 @@ class EpochReclaimerTest {
     }
 
     @Test
-    void readerPinsPreventReclamation() {
+    void readerPinsPreventReclamation() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var slab = new SlabAllocator(arena, 1 << 20);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var slab = new SlabAllocator(arena, cs, 1 << 20);
             int classId = slab.registerClass(SEGMENT_SIZE);
 
             var reclaimer = new EpochReclaimer(slab);
@@ -87,9 +98,13 @@ class EpochReclaimerTest {
     }
 
     @Test
-    void dualPinConstraint() {
+    void dualPinConstraint() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var slab = new SlabAllocator(arena, 1 << 20);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var slab = new SlabAllocator(arena, cs, 1 << 20);
             int classId = slab.registerClass(SEGMENT_SIZE);
 
             var reclaimer = new EpochReclaimer(slab);
@@ -129,7 +144,11 @@ class EpochReclaimerTest {
     @Test
     void concurrentRetireAndReclaim() throws Exception {
         try (var arena = Arena.ofShared()) {
-            var slab = new SlabAllocator(arena, 1 << 20);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var slab = new SlabAllocator(arena, cs, 1 << 20);
             int classId = slab.registerClass(SEGMENT_SIZE);
 
             var reclaimer = new EpochReclaimer(slab);

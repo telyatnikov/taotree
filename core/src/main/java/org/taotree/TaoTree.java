@@ -46,18 +46,19 @@ import org.taotree.layout.LeafLayout;
 import org.taotree.layout.QueryBuilder;
 
 /**
- * Off-heap key-value tree backed by an Adaptive Radix Tree.
+ * File-backed, off-heap key-value tree backed by an Adaptive Radix Tree.
  *
  * <p>Owns the memory lifecycle, off-heap slab and bump allocators, and a fair
  * {@link ReentrantReadWriteLock} that protects all shared state. Operates on
- * fixed-length, binary-comparable keys with zero GC pressure.
+ * fixed-length, binary-comparable keys with zero GC pressure. All data is
+ * memory-mapped from a {@link ChunkStore} file.
  *
  * <p>{@link TaoDictionary Dictionaries} created from a tree share its slab allocator
  * and lock, ensuring consistent concurrency control.
  *
  * <h3>Usage:</h3>
  * <pre>{@code
- * try (var tree = TaoTree.open(16, 24)) {
+ * try (var tree = TaoTree.create(path, 16, 24)) {
  *     var dict = TaoDictionary.u16(tree);
  *
  *     try (var w = tree.write()) {
@@ -98,10 +99,10 @@ public final class TaoTree implements AutoCloseable {
     private final ReentrantReadWriteLock lock;
     private final ReentrantLock commitLock = new ReentrantLock();
     private final boolean ownsArena;
-    private final ChunkStore chunkStore; // null for in-memory mode
+    private final ChunkStore chunkStore; // null for child trees (dictionaries)
 
-    // -- Persistence coordination (file-backed mode) --
-    private PersistenceManager persistence; // null for in-memory mode
+    // -- Persistence coordination --
+    private PersistenceManager persistence; // null for child trees (dictionaries)
 
     /** Package-private: provides overflow storage for {@link TaoString}. */
     BumpAllocator bump() { return bump; }
@@ -170,42 +171,6 @@ public final class TaoTree implements AutoCloseable {
     private final java.util.Map<Integer, TaoString.Layout> stringLayouts = new java.util.HashMap<>();
 
     // -----------------------------------------------------------------------
-    // Root tree constructor (owns arena)
-    // -----------------------------------------------------------------------
-
-    private TaoTree(int slabSize, int keyLen, int[] leafValueSizes) {
-        this.arena = Arena.ofShared();
-        this.slab = new SlabAllocator(arena, slabSize);
-        this.bump = new BumpAllocator(arena);
-        this.lock = new ReentrantReadWriteLock(true); // fair
-        this.ownsArena = true;
-        this.chunkStore = null;
-
-        // Register node slab classes
-        this.prefixClassId  = slab.registerClass(NodeConstants.PREFIX_SIZE);
-        this.node4ClassId   = slab.registerClass(NodeConstants.NODE4_SIZE);
-        this.node16ClassId  = slab.registerClass(NodeConstants.NODE16_SIZE);
-        this.node48ClassId  = slab.registerClass(NodeConstants.NODE48_SIZE);
-        this.node256ClassId = slab.registerClass(NodeConstants.NODE256_SIZE);
-
-        // Tree params
-        this.keyLen = keyLen;
-        this.keySlotSize = keyLen > 0 ? (keyLen + 7) & ~7 : 0;
-        this.leafValueSizes = leafValueSizes != null ? leafValueSizes.clone() : new int[0];
-        this.leafClassCount = this.leafValueSizes.length;
-        this.leafClassIds = new int[leafClassCount];
-        for (int i = 0; i < leafClassCount; i++) {
-            leafClassIds[i] = slab.registerClass(keySlotSize + this.leafValueSizes[i]);
-        }
-
-        // Init epoch reclaimer + COW engine
-        this.reclaimer = new EpochReclaimer(slab);
-        this.cowEngine = new CowEngine(slab, reclaimer,
-            prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
-            keyLen, keySlotSize, leafClassIds);
-    }
-
-    // -----------------------------------------------------------------------
     // Child tree constructor (shares parent's infrastructure)
     // -----------------------------------------------------------------------
 
@@ -226,7 +191,7 @@ public final class TaoTree implements AutoCloseable {
         this.bump = parent.bump;
         this.lock = parent.lock;
         this.ownsArena = false;
-        this.chunkStore = null; // child trees don't own the chunk store
+        this.chunkStore = null; // child trees share parent's ChunkStore via shared slab/bump
 
         // Share parent's epoch reclaimer (all trees sharing a slab should share reclamation)
         this.reclaimer = parent.reclaimer;
@@ -259,115 +224,6 @@ public final class TaoTree implements AutoCloseable {
     // -----------------------------------------------------------------------
     // Static factory methods
     // -----------------------------------------------------------------------
-
-    /**
-     * Create an infrastructure-only tree (no primary data tree).
-     *
-     * <p>Use this when you only need dictionaries and don't have a primary data tree.
-     * Dictionaries created from this tree share its slab allocator and lock.
-     *
-     * @param slabSize slab size in bytes
-     */
-    public static TaoTree forDictionaries(int slabSize) {
-        return new TaoTree(slabSize, 0, null);
-    }
-
-    /** Create an infrastructure-only tree with the default slab size (1 MB). */
-    public static TaoTree forDictionaries() {
-        return new TaoTree(SlabAllocator.DEFAULT_SLAB_SIZE, 0, null);
-    }
-
-    /**
-     * Create a data tree with a single leaf class.
-     *
-     * @param keyLen    fixed key length in bytes (must be positive)
-     * @param valueSize size of the leaf value region in bytes
-     */
-    public static TaoTree open(int keyLen, int valueSize) {
-        if (keyLen <= 0) throw new IllegalArgumentException("keyLen must be positive: " + keyLen);
-        return new TaoTree(SlabAllocator.DEFAULT_SLAB_SIZE, keyLen, new int[]{valueSize});
-    }
-
-    /**
-     * Create a data tree with a single leaf class and custom slab size.
-     *
-     * @param keyLen    fixed key length in bytes (must be positive)
-     * @param valueSize size of the leaf value region in bytes
-     * @param slabSize  slab size in bytes
-     */
-    public static TaoTree open(int keyLen, int valueSize, int slabSize) {
-        if (keyLen <= 0) throw new IllegalArgumentException("keyLen must be positive: " + keyLen);
-        return new TaoTree(slabSize, keyLen, new int[]{valueSize});
-    }
-
-    /**
-     * Create a data tree with multiple leaf classes.
-     *
-     * @param keyLen         fixed key length in bytes (must be positive)
-     * @param leafValueSizes value sizes for each leaf class (index = leaf class ID)
-     */
-    public static TaoTree open(int keyLen, int[] leafValueSizes) {
-        if (keyLen <= 0) throw new IllegalArgumentException("keyLen must be positive: " + keyLen);
-        if (leafValueSizes == null || leafValueSizes.length == 0) {
-            throw new IllegalArgumentException("At least one leaf value size required");
-        }
-        return new TaoTree(SlabAllocator.DEFAULT_SLAB_SIZE, keyLen, leafValueSizes);
-    }
-
-    /**
-     * Create a data tree with multiple leaf classes and custom slab size.
-     *
-     * @param keyLen         fixed key length in bytes (must be positive)
-     * @param leafValueSizes value sizes for each leaf class (index = leaf class ID)
-     * @param slabSize       slab size in bytes
-     */
-    public static TaoTree open(int keyLen, int[] leafValueSizes, int slabSize) {
-        if (keyLen <= 0) throw new IllegalArgumentException("keyLen must be positive: " + keyLen);
-        if (leafValueSizes == null || leafValueSizes.length == 0) {
-            throw new IllegalArgumentException("At least one leaf value size required");
-        }
-        return new TaoTree(slabSize, keyLen, leafValueSizes);
-    }
-
-    /**
-     * Create a data tree from a key layout and leaf layout.
-     *
-     * <p>Derives the key length from the key layout and the leaf value size from the
-     * leaf layout. Automatically registers {@link TaoString.Layout}s for any
-     * {@link LeafField.Str} or {@link LeafField.Json} fields so that
-     * {@link #copyFrom} handles out-of-line strings correctly.
-     *
-     * @param keyLayout  the compound key layout
-     * @param leafLayout the leaf value layout
-     */
-    public static TaoTree open(KeyLayout keyLayout, LeafLayout leafLayout) {
-        var tree = new TaoTree(SlabAllocator.DEFAULT_SLAB_SIZE,
-            keyLayout.totalWidth(), new int[]{leafLayout.totalWidth()});
-        registerStringLayouts(tree, leafLayout, 0);
-        tree.boundKeyLayout = bindDicts(tree, keyLayout);
-        tree.boundLeafLayout = leafLayout;
-        return tree;
-    }
-
-    /**
-     * Create a data tree that shares infrastructure with an existing tree.
-     *
-     * <p>The child tree shares the parent's arena, slab allocator, bump allocator,
-     * and lock. This is the preferred way to create a data tree when dictionaries
-     * are created from a {@link #forDictionaries()} infrastructure tree.
-     *
-     * @param parent     the infrastructure tree (typically from {@link #forDictionaries()})
-     * @param keyLayout  the compound key layout
-     * @param leafLayout the leaf value layout
-     */
-    public static TaoTree open(TaoTree parent, KeyLayout keyLayout, LeafLayout leafLayout) {
-        var tree = new TaoTree(parent, keyLayout.totalWidth(),
-            new int[]{leafLayout.totalWidth()});
-        registerStringLayouts(tree, leafLayout, 0);
-        tree.boundKeyLayout = bindDicts(tree, keyLayout);
-        tree.boundLeafLayout = leafLayout;
-        return tree;
-    }
 
     /**
      * Create a file-backed tree from a key layout and leaf layout.
@@ -444,6 +300,34 @@ public final class TaoTree implements AutoCloseable {
 
     private static KeyLayout bindDicts(TaoTree tree, KeyLayout keyLayout) {
         return Binding.bindDicts(tree, keyLayout);
+    }
+
+    // -----------------------------------------------------------------------
+    // Infrastructure-only (dictionaries) factory methods
+    // -----------------------------------------------------------------------
+
+    /**
+     * Create a file-backed infrastructure-only tree (no primary data tree).
+     *
+     * <p>Use this when you only need dictionaries and don't have a primary data tree.
+     * Dictionaries created from this tree share its slab allocator and lock.
+     *
+     * @param path path to the store file (must not exist)
+     */
+    public static TaoTree forDictionaries(Path path) throws IOException {
+        return createFileBacked(path, SlabAllocator.DEFAULT_SLAB_SIZE, 0, null,
+            ChunkStore.DEFAULT_CHUNK_SIZE, Preallocator.isSupported());
+    }
+
+    /**
+     * Create a file-backed infrastructure-only tree with a custom slab size.
+     *
+     * @param path     path to the store file (must not exist)
+     * @param slabSize slab size in bytes
+     */
+    public static TaoTree forDictionaries(Path path, int slabSize) throws IOException {
+        return createFileBacked(path, slabSize, 0, null,
+            ChunkStore.DEFAULT_CHUNK_SIZE, Preallocator.isSupported());
     }
 
     // -----------------------------------------------------------------------
@@ -581,9 +465,6 @@ public final class TaoTree implements AutoCloseable {
 
     /** Fixed key length in bytes. */
     public int keyLen() { return keyLen; }
-
-    /** Returns true if this tree is file-backed. */
-    public boolean isFileBacked() { return chunkStore != null; }
 
     /**
      * Returns the dictionary at the given index.
@@ -952,7 +833,7 @@ public final class TaoTree implements AutoCloseable {
         this.bump = parent.bump;
         this.lock = parent.lock;
         this.ownsArena = false;
-        this.chunkStore = null;
+        this.chunkStore = null; // child trees share parent's ChunkStore via shared slab/bump
 
         // Share parent's epoch reclaimer (all trees sharing a slab should share reclamation)
         this.reclaimer = parent.reclaimer;
@@ -1073,7 +954,6 @@ public final class TaoTree implements AutoCloseable {
      * @throws IOException if an I/O error occurs during checkpoint write
      */
     public void compact() throws IOException {
-        if (persistence == null) return;
         lock.writeLock().lock();
         try {
             long currentRoot = root;
@@ -1117,18 +997,17 @@ public final class TaoTree implements AutoCloseable {
     // -----------------------------------------------------------------------
 
     /**
-     * Flush all data to disk (file-backed mode only).
+     * Flush all data to disk.
      *
      * <p>Writes a lightweight commit record (one page) and forces only the
      * chunks that have been written to since the last sync. Every
-     * {@value #COMMITS_PER_CHECKPOINT} commits, also writes a full mirrored
+     * {@value org.taotree.internal.persist.PersistenceManager#COMMITS_PER_CHECKPOINT} commits, also writes a full mirrored
      * checkpoint to bound recovery time and advances {@code durableGeneration}
-     * for epoch reclamation. No-op for in-memory trees.
+     * for epoch reclamation.
      *
      * @throws IOException if an I/O error occurs during sync
      */
     public void sync() throws IOException {
-        if (persistence == null) return;
         lock.writeLock().lock();
         try {
             persistence.writeCommitRecord(buildCommitData());
@@ -1150,24 +1029,22 @@ public final class TaoTree implements AutoCloseable {
 
     /**
      * Close this tree, releasing the underlying arena if this is a root tree.
-     * For file-backed trees, writes a full checkpoint and syncs before closing.
+     * Writes a full checkpoint and syncs before closing.
      * Child trees (created internally by dictionaries) do not close the arena.
      */
     @Override
     public void close() {
         if (ownsArena) {
-            if (persistence != null) {
-                try {
-                    persistence.writeCheckpoint(gatherMetadata());
-                    chunkStore.sync();
-                    if (reclaimer != null) {
-                        reclaimer.advanceDurableGeneration(persistence.generation());
-                        reclaimer.reclaim();
-                    }
-                    chunkStore.close();
-                } catch (IOException e) {
-                    throw new UncheckedIOException("Failed to sync/close chunk store", e);
+            try {
+                persistence.writeCheckpoint(gatherMetadata());
+                chunkStore.sync();
+                if (reclaimer != null) {
+                    reclaimer.advanceDurableGeneration(persistence.generation());
+                    reclaimer.reclaim();
                 }
+                chunkStore.close();
+            } catch (IOException e) {
+                throw new UncheckedIOException("Failed to sync/close chunk store", e);
             }
             if (reclaimer != null) {
                 reclaimer.close();
@@ -1310,7 +1187,7 @@ public final class TaoTree implements AutoCloseable {
         if (reclaimer == null) {
             reclaimer = new EpochReclaimer(slab);
         }
-        cowEngine = new CowEngine(slab, reclaimer,
+        cowEngine = new CowEngine(slab, reclaimer, null, null,
             prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
             keyLen, keySlotSize, leafClassIds);
     }
@@ -1535,7 +1412,7 @@ public final class TaoTree implements AutoCloseable {
 
         private boolean closed;
         private final Thread ownerThread = Thread.currentThread();
-        private final WriterArena scopeArena; // per-scope arena (file-backed) or null (in-memory)
+        private final WriterArena scopeArena; // per-scope arena (null for child trees)
         private boolean commitLockHeld;
 
         private WriteScope() {

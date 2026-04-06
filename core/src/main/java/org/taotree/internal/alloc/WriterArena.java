@@ -37,8 +37,11 @@ public final class WriterArena {
     public static final int ARENA_SLAB_ID = 0xFFFF;
 
     private static final int PAGE_SIZE = ChunkStore.PAGE_SIZE;
+    private static final int PAGE_SHIFT = 12;
+    private static final int PAGE_MASK = PAGE_SIZE - 1;
     private static final int INITIAL_BATCH_PAGES = 16;  // 64 KB
     private static final int MAX_BATCH_PAGES = 256;     // 1 MB
+    static final int MAX_ADDRESSABLE_PAGES = 1 << (Integer.SIZE - PAGE_SHIFT);
 
     private final ChunkStore chunkStore;
 
@@ -173,7 +176,19 @@ public final class WriterArena {
      * field packs the page number (bits 31-12) and byte offset (bits 11-0).
      */
     static long encodeArenaPtr(int nodeType, int slabClassId, int page, int offsetInPage) {
-        int packed = (page << 12) | (offsetInPage & 0xFFF);
+        if (page < 0 || page >= MAX_ADDRESSABLE_PAGES) {
+            throw new IllegalStateException(
+                "WriterArena page " + Integer.toUnsignedString(page)
+                    + " exceeds 20-bit arena NodePtr limit (max="
+                    + Integer.toUnsignedString(MAX_ADDRESSABLE_PAGES - 1)
+                    + ", addressableBytes=" + ((long) MAX_ADDRESSABLE_PAGES * PAGE_SIZE)
+                    + "); arena pointers would alias older file pages");
+        }
+        if (offsetInPage < 0 || offsetInPage >= PAGE_SIZE) {
+            throw new IllegalArgumentException(
+                "offsetInPage out of range: " + offsetInPage + " (pageSize=" + PAGE_SIZE + ")");
+        }
+        int packed = (page << PAGE_SHIFT) | (offsetInPage & PAGE_MASK);
         return NodePtr.pack(nodeType, slabClassId, ARENA_SLAB_ID, packed);
     }
 
@@ -202,8 +217,8 @@ public final class WriterArena {
      */
     public static MemorySegment resolve(ChunkStore cs, long ptr, int size) {
         int packed = NodePtr.offset(ptr);
-        int page = packed >>> 12;
-        int off = packed & 0xFFF;
+        int page = packed >>> PAGE_SHIFT;
+        int off = packed & PAGE_MASK;
         return cs.resolveBytes(page, off, size);
     }
 

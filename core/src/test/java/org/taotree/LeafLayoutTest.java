@@ -2,6 +2,10 @@ package org.taotree;
 
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
+import java.nio.file.Path;
+import org.junit.jupiter.api.io.TempDir;
+
 import java.lang.foreign.Arena;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -16,10 +20,13 @@ import org.taotree.layout.LeafLayout;
  */
 class LeafLayoutTest {
 
+    @TempDir Path tmp;
+    private int fc;
+
     // ---- LeafField widths ----
 
     @Test
-    void fieldWidths() {
+    void fieldWidths() throws IOException {
         assertEquals(1,  LeafField.int8("x").width());
         assertEquals(2,  LeafField.int16("x").width());
         assertEquals(4,  LeafField.int32("x").width());
@@ -31,8 +38,8 @@ class LeafLayoutTest {
     }
 
     @Test
-    void dictFieldWidths() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void dictFieldWidths() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict16 = TaoDictionary.u16(tree);
             var dict32 = TaoDictionary.u32(tree);
             assertEquals(2, LeafField.dict16("x", dict16).width());
@@ -43,7 +50,7 @@ class LeafLayoutTest {
     // ---- LeafLayout ----
 
     @Test
-    void layoutOffsetsAndWidth() {
+    void layoutOffsetsAndWidth() throws IOException {
         var layout = LeafLayout.of(
             LeafField.int32("count"),
             LeafField.int64("timestamp"),
@@ -57,7 +64,7 @@ class LeafLayoutTest {
     }
 
     @Test
-    void layoutWithStringAndJson() {
+    void layoutWithStringAndJson() throws IOException {
         var layout = LeafLayout.of(
             LeafField.int32("count"),
             LeafField.string("name"),
@@ -70,7 +77,7 @@ class LeafLayoutTest {
     }
 
     @Test
-    void layoutFieldIndexLookup() {
+    void layoutFieldIndexLookup() throws IOException {
         var layout = LeafLayout.of(
             LeafField.int32("a"),
             LeafField.int64("b"),
@@ -83,12 +90,12 @@ class LeafLayoutTest {
     }
 
     @Test
-    void layoutRejectsNoFields() {
+    void layoutRejectsNoFields() throws IOException {
         assertThrows(IllegalArgumentException.class, () -> LeafLayout.of());
     }
 
     @Test
-    void hasStringFields() {
+    void hasStringFields() throws IOException {
         assertFalse(LeafLayout.of(LeafField.int32("x")).hasStringFields());
         assertTrue(LeafLayout.of(LeafField.string("x")).hasStringFields());
         assertTrue(LeafLayout.of(LeafField.int32("x"), LeafField.json("y")).hasStringFields());
@@ -97,7 +104,7 @@ class LeafLayoutTest {
     // ---- LeafAccessor — numeric fields ----
 
     @Test
-    void numericRoundTrip() {
+    void numericRoundTrip() throws IOException {
         var layout = LeafLayout.of(
             LeafField.int8("a"),
             LeafField.int16("b"),
@@ -107,7 +114,7 @@ class LeafLayoutTest {
             LeafField.float64("f")
         );
 
-        try (var tree = TaoTree.open(4, layout.totalWidth())) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
             byte[] key = {0, 0, 0, 1};
             try (var w = tree.write()) {
                 long ptr = w.getOrCreate(key);
@@ -135,13 +142,13 @@ class LeafLayoutTest {
     // ---- LeafAccessor — string field ----
 
     @Test
-    void stringFieldRoundTrip() {
+    void stringFieldRoundTrip() throws IOException {
         var layout = LeafLayout.of(
             LeafField.int32("count"),
             LeafField.string("name")
         );
 
-        try (var tree = TaoTree.open(4, layout.totalWidth())) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
             byte[] key = {0, 0, 0, 1};
             try (var w = tree.write()) {
                 long ptr = w.getOrCreate(key);
@@ -159,10 +166,10 @@ class LeafLayoutTest {
     }
 
     @Test
-    void longStringOverflow() {
+    void longStringOverflow() throws IOException {
         var layout = LeafLayout.of(LeafField.string("desc"));
 
-        try (var tree = TaoTree.open(4, layout.totalWidth())) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
             byte[] key = {0, 0, 0, 1};
             String longStr = "A".repeat(200); // > 12 bytes, triggers overflow
             try (var w = tree.write()) {
@@ -179,13 +186,13 @@ class LeafLayoutTest {
     // ---- LeafAccessor — JSON field ----
 
     @Test
-    void jsonFieldRoundTrip() {
+    void jsonFieldRoundTrip() throws IOException {
         var layout = LeafLayout.of(
             LeafField.int32("count"),
             LeafField.json("extras")
         );
 
-        try (var tree = TaoTree.open(4, layout.totalWidth())) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
             byte[] key = {0, 0, 0, 1};
             String json = """
                 {"elevation":1897,"notes":"near lake"}""";
@@ -207,8 +214,8 @@ class LeafLayoutTest {
     // ---- LeafAccessor — dict fields ----
 
     @Test
-    void dictFieldRoundTrip() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void dictFieldRoundTrip() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var statusDict = TaoDictionary.u16(tree);
             var tagDict = TaoDictionary.u32(tree);
 
@@ -246,7 +253,7 @@ class LeafLayoutTest {
     // ---- Layout-based tree factory ----
 
     @Test
-    void treeFromLayouts() {
+    void treeFromLayouts() throws IOException {
         var keyLayout = KeyLayout.of(
             KeyField.uint32("id")
         );
@@ -255,7 +262,7 @@ class LeafLayoutTest {
             LeafField.string("name")
         );
 
-        try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), keyLayout, leafLayout)) {
             assertEquals(4, tree.keyLen());
 
             try (var arena = Arena.ofConfined()) {
@@ -283,13 +290,13 @@ class LeafLayoutTest {
     // ---- Setter chaining ----
 
     @Test
-    void setterChaining() {
+    void setterChaining() throws IOException {
         var layout = LeafLayout.of(
             LeafField.int32("a"),
             LeafField.int64("b")
         );
 
-        try (var tree = TaoTree.open(4, layout.totalWidth())) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
             byte[] key = {0, 0, 0, 1};
             try (var w = tree.write()) {
                 long ptr = w.getOrCreate(key);
@@ -303,10 +310,10 @@ class LeafLayoutTest {
     // ---- Read-only enforcement ----
 
     @Test
-    void readOnlyAccessorRejectsWrites() {
+    void readOnlyAccessorRejectsWrites() throws IOException {
         var layout = LeafLayout.of(LeafField.int32("x"));
 
-        try (var tree = TaoTree.open(4, layout.totalWidth())) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
             byte[] key = {0, 0, 0, 1};
             try (var w = tree.write()) {
                 w.getOrCreate(key);
@@ -323,10 +330,10 @@ class LeafLayoutTest {
     // ---- Mutation-killing: LeafAccessor.segment() and layout() getters ----
 
     @Test
-    void accessorSegmentAndLayoutGetters() {
+    void accessorSegmentAndLayoutGetters() throws IOException {
         var layout = LeafLayout.of(LeafField.int32("x"));
 
-        try (var tree = TaoTree.open(4, layout.totalWidth())) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
             byte[] key = {0, 0, 0, 1};
             try (var w = tree.write()) {
                 long ptr = w.getOrCreate(key);
@@ -343,13 +350,13 @@ class LeafLayoutTest {
     // ---- Mutation-killing: index-based getters/setters ----
 
     @Test
-    void indexBasedAccess() {
+    void indexBasedAccess() throws IOException {
         var layout = LeafLayout.of(
             LeafField.int32("a"),
             LeafField.float64("b")
         );
 
-        try (var tree = TaoTree.open(4, layout.totalWidth())) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
             byte[] key = {0, 0, 0, 1};
             try (var w = tree.write()) {
                 long ptr = w.getOrCreate(key);
@@ -369,10 +376,10 @@ class LeafLayoutTest {
     // ---- Mutation-killing: dict field type check errors ----
 
     @Test
-    void setDict16OnNonDictFieldThrows() {
+    void setDict16OnNonDictFieldThrows() throws IOException {
         var layout = LeafLayout.of(LeafField.int32("count"));
 
-        try (var tree = TaoTree.open(4, layout.totalWidth())) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
             byte[] key = {0, 0, 0, 1};
             try (var w = tree.write()) {
                 long ptr = w.getOrCreate(key);
@@ -385,10 +392,10 @@ class LeafLayoutTest {
     }
 
     @Test
-    void setDict32OnNonDictFieldThrows() {
+    void setDict32OnNonDictFieldThrows() throws IOException {
         var layout = LeafLayout.of(LeafField.int64("count"));
 
-        try (var tree = TaoTree.open(4, layout.totalWidth())) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
             byte[] key = {0, 0, 0, 1};
             try (var w = tree.write()) {
                 long ptr = w.getOrCreate(key);
@@ -403,7 +410,7 @@ class LeafLayoutTest {
     // ---- Mutation-killing: LeafLayout.stringLayouts() ----
 
     @Test
-    void stringLayoutsForMixedFields() {
+    void stringLayoutsForMixedFields() throws IOException {
         var layout = LeafLayout.of(
             LeafField.int32("count"),
             LeafField.string("name"),
@@ -424,7 +431,7 @@ class LeafLayoutTest {
     }
 
     @Test
-    void stringLayoutsEmptyForNumericOnly() {
+    void stringLayoutsEmptyForNumericOnly() throws IOException {
         var layout = LeafLayout.of(
             LeafField.int32("a"),
             LeafField.float64("b")
@@ -435,13 +442,13 @@ class LeafLayoutTest {
     // ---- Mutation-killing: all int types by index ----
 
     @Test
-    void int8AndInt16ByIndex() {
+    void int8AndInt16ByIndex() throws IOException {
         var layout = LeafLayout.of(
             LeafField.int8("a"),
             LeafField.int16("b")
         );
 
-        try (var tree = TaoTree.open(4, layout.totalWidth())) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
             byte[] key = {0, 0, 0, 1};
             try (var w = tree.write()) {
                 long ptr = w.getOrCreate(key);
@@ -459,10 +466,10 @@ class LeafLayoutTest {
     }
 
     @Test
-    void float32ByIndex() {
+    void float32ByIndex() throws IOException {
         var layout = LeafLayout.of(LeafField.float32("f"));
 
-        try (var tree = TaoTree.open(4, layout.totalWidth())) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
             byte[] key = {0, 0, 0, 1};
             try (var w = tree.write()) {
                 long ptr = w.getOrCreate(key);
@@ -478,8 +485,8 @@ class LeafLayoutTest {
     // ---- Mutation-killing: dict code getters ----
 
     @Test
-    void dictCodeGettersByName() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void dictCodeGettersByName() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var d16 = TaoDictionary.u16(tree);
             var d32 = TaoDictionary.u32(tree);
 
@@ -510,8 +517,8 @@ class LeafLayoutTest {
     // ---- Mutation-killing: dict null encodes as 0 ----
 
     @Test
-    void dictNullEncodesZero() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void dictNullEncodesZero() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
             var layout = LeafLayout.of(LeafField.dict16("d", dict));
 

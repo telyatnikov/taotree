@@ -2,6 +2,10 @@ package org.taotree;
 
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
+import java.nio.file.Path;
+import org.junit.jupiter.api.io.TempDir;
+
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.ArrayList;
@@ -24,6 +28,9 @@ import org.taotree.internal.art.Node4;
  */
 class CowModeTest {
 
+    @TempDir Path tmp;
+    private int fc;
+
     private static final int KEY_LEN = 4;
     private static final int VALUE_SIZE = 8;
 
@@ -39,8 +46,8 @@ class CowModeTest {
     // ---- Basic COW operations ----
 
     @Test
-    void insertAndLookup() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
+    void insertAndLookup() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(intKey(42), 0);
@@ -57,9 +64,8 @@ class CowModeTest {
     }
 
     @Test
-    void insertMultipleKeys() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void insertMultipleKeys() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             try (var w = tree.write()) {
                 for (int i = 0; i < 100; i++) {
@@ -82,9 +88,8 @@ class CowModeTest {
     }
 
     @Test
-    void duplicateInsert() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void duplicateInsert() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             try (var w = tree.write()) {
                 long leaf1 = w.getOrCreate(intKey(42), 0);
@@ -96,9 +101,8 @@ class CowModeTest {
     }
 
     @Test
-    void deleteKeys() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void deleteKeys() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Insert
             try (var w = tree.write()) {
@@ -128,9 +132,8 @@ class CowModeTest {
     }
 
     @Test
-    void largeInsert() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void largeInsert() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             int count = 10_000;
             try (var w = tree.write()) {
@@ -155,9 +158,8 @@ class CowModeTest {
     // ---- Lock-free readers ----
 
     @Test
-    void lockFreeReadersDoNotBlock() throws InterruptedException {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void lockFreeReadersDoNotBlock() throws Exception {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Pre-populate
             try (var w = tree.write()) {
@@ -200,8 +202,7 @@ class CowModeTest {
 
     @Test
     void concurrentWritersDifferentKeys() throws Exception {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             int numWriters = 4;
             int keysPerWriter = 250;
@@ -245,8 +246,7 @@ class CowModeTest {
 
     @Test
     void concurrentReadersAndWriters() throws Exception {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Pre-populate
             try (var w = tree.write()) {
@@ -312,8 +312,8 @@ class CowModeTest {
     // ---- Multi-phase insert test ----
 
     @Test
-    void multiPhaseInsert() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
+    void multiPhaseInsert() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
             // Phase 1: insert first batch
             try (var w = tree.write()) {
                 for (int i = 0; i < 50; i++) {
@@ -354,9 +354,8 @@ class CowModeTest {
     // ---- Node growth (triggers node type transitions) ----
 
     @Test
-    void nodeGrowth() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void nodeGrowth() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Insert enough keys to force Node4 → Node16 → Node48 → Node256 growth
             // Use intKey() to ensure unique 4-byte keys (big-endian encoding)
@@ -380,9 +379,8 @@ class CowModeTest {
     }
 
     @Test
-    void deleteAndReinsert() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void deleteAndReinsert() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Insert
             try (var w = tree.write()) {
@@ -419,9 +417,8 @@ class CowModeTest {
     }
 
     @Test
-    void prefixSplit() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void prefixSplit() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Keys that share a long prefix then diverge
             byte[] key1 = {1, 2, 3, 10};
@@ -445,9 +442,8 @@ class CowModeTest {
     }
 
     @Test
-    void nodeShrink() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void nodeShrink() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Insert enough to grow nodes, then delete to trigger shrink
             try (var w = tree.write()) {
@@ -476,9 +472,8 @@ class CowModeTest {
     }
 
     @Test
-    void epochReclamation() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void epochReclamation() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Insert, then delete → retired nodes
             try (var w = tree.write()) {
@@ -514,9 +509,8 @@ class CowModeTest {
     // ---- Delete edge cases (exercises cowNodeAfterRemoval, cowCollapseSingleChild) ----
 
     @Test
-    void deleteSingleKey() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void deleteSingleKey() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             try (var w = tree.write()) {
                 w.getOrCreate(intKey(42), 0);
@@ -536,9 +530,8 @@ class CowModeTest {
     }
 
     @Test
-    void deleteFromEmptyTree() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void deleteFromEmptyTree() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             try (var w = tree.write()) {
                 assertFalse(w.delete(intKey(42)));
@@ -548,9 +541,8 @@ class CowModeTest {
     }
 
     @Test
-    void deleteNonExistentKey() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void deleteNonExistentKey() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             try (var w = tree.write()) {
                 for (int i = 0; i < 10; i++) {
@@ -567,10 +559,9 @@ class CowModeTest {
     }
 
     @Test
-    void deleteCollapseToSingleChild() {
+    void deleteCollapseToSingleChild() throws IOException {
         // Delete from Node4 until 1 child remains → should collapse to prefix
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Insert 3 keys that share a prefix, diverging at byte 3
             byte[] key1 = {10, 20, 30, 1};
@@ -605,9 +596,8 @@ class CowModeTest {
     }
 
     @Test
-    void deleteAllThenVerifyEmpty() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void deleteAllThenVerifyEmpty() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             int count = 200; // exercises multiple node types
             try (var w = tree.write()) {
@@ -636,9 +626,8 @@ class CowModeTest {
     // ---- Node shrink through specific thresholds ----
 
     @Test
-    void node48ShrinkToNode16() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void node48ShrinkToNode16() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Insert 48 keys to fill a Node48 (keys at depth 1 diverge across 48 distinct bytes)
             // Use keys like {0, X, 0, 0} to force divergence at byte 1
@@ -673,9 +662,8 @@ class CowModeTest {
     }
 
     @Test
-    void node256ShrinkToNode48() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void node256ShrinkToNode48() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Insert 100 keys to create a Node256 (>48 distinct byte values at same depth)
             // Keys: {0, X, 0, 0} — diverge at byte 1 with X=0..99
@@ -710,9 +698,8 @@ class CowModeTest {
     }
 
     @Test
-    void node16ShrinkToNode4() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void node16ShrinkToNode4() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Insert 16 keys to fill a Node16
             int count = 16;
@@ -748,12 +735,11 @@ class CowModeTest {
     // ---- Long keys: exercise prefix chaining (>15 bytes) ----
 
     @Test
-    void longKeysPrefixChaining() {
+    void longKeysPrefixChaining() throws IOException {
         int longKeyLen = 20; // > PREFIX_CAPACITY (15) → prefix chain
         int valueSize = 8;
 
-        try (var tree = TaoTree.open(longKeyLen, valueSize)) {
-
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), longKeyLen, valueSize)) {
 
             byte[] key1 = new byte[longKeyLen];
             byte[] key2 = new byte[longKeyLen];
@@ -786,12 +772,11 @@ class CowModeTest {
     }
 
     @Test
-    void longKeysManyInserts() {
+    void longKeysManyInserts() throws IOException {
         int longKeyLen = 24; // > 15 → chains multiple prefix nodes
         int valueSize = 8;
 
-        try (var tree = TaoTree.open(longKeyLen, valueSize)) {
-
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), longKeyLen, valueSize)) {
 
             int count = 100;
             try (var w = tree.write()) {
@@ -824,12 +809,11 @@ class CowModeTest {
     }
 
     @Test
-    void longKeysDeleteAndCollapse() {
+    void longKeysDeleteAndCollapse() throws IOException {
         int longKeyLen = 20;
         int valueSize = 8;
 
-        try (var tree = TaoTree.open(longKeyLen, valueSize)) {
-
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), longKeyLen, valueSize)) {
 
             byte[] key1 = new byte[longKeyLen];
             byte[] key2 = new byte[longKeyLen];
@@ -867,9 +851,8 @@ class CowModeTest {
     // ---- Prefix split at various positions ----
 
     @Test
-    void prefixSplitAtStart() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void prefixSplitAtStart() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Keys diverge at first byte → prefix split at position 0
             byte[] key1 = {1, 0, 0, 0};
@@ -891,9 +874,8 @@ class CowModeTest {
     }
 
     @Test
-    void prefixSplitMidway() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void prefixSplitMidway() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Keys share first 2 bytes, diverge at byte 2
             byte[] key1 = {10, 20, 1, 0};
@@ -926,9 +908,8 @@ class CowModeTest {
     // ---- Scan operations ----
 
     @Test
-    void forEachScan() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void forEachScan() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             int count = 50;
             try (var w = tree.write()) {
@@ -952,9 +933,8 @@ class CowModeTest {
     }
 
     @Test
-    void forEachEarlyStop() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void forEachEarlyStop() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             try (var w = tree.write()) {
                 for (int i = 0; i < 100; i++) {
@@ -978,8 +958,7 @@ class CowModeTest {
 
     @Test
     void concurrentWritersSameKeyRange() throws Exception {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             int numWriters = 4;
             int keysPerWriter = 100;
@@ -1025,8 +1004,7 @@ class CowModeTest {
 
     @Test
     void concurrentDeleteAndInsert() throws Exception {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Pre-populate with keys 0..199
             try (var w = tree.write()) {
@@ -1086,9 +1064,8 @@ class CowModeTest {
     // ---- Prefix merge edge case ----
 
     @Test
-    void prefixMergeOnDelete() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void prefixMergeOnDelete() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Create a tree where deleting forces prefix merge:
             // Insert keys that create: PREFIX → NODE4 → PREFIX → LEAF
@@ -1120,9 +1097,8 @@ class CowModeTest {
     // ---- Incremental growth through all node type transitions ----
 
     @Test
-    void incrementalGrowthAndShrink() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void incrementalGrowthAndShrink() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Grow from empty → Node4 → Node16 → Node48 → Node256
             // then shrink back: Node256 → Node48 → Node16 → Node4 → prefix → empty
@@ -1173,9 +1149,8 @@ class CowModeTest {
     // ---- Delete with key exhaustion at inner node (cowDelete line 204-205) ----
 
     @Test
-    void deleteKeyExhausted() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void deleteKeyExhausted() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             try (var w = tree.write()) {
                 w.getOrCreate(intKey(0), 0);
@@ -1193,9 +1168,8 @@ class CowModeTest {
     // ---- Prefix mismatch during delete (cowDelete line 195-196) ----
 
     @Test
-    void deletePrefixMismatch() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void deletePrefixMismatch() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             byte[] key1 = {1, 2, 3, 4};
             byte[] key2 = {1, 2, 3, 5};
@@ -1217,9 +1191,8 @@ class CowModeTest {
     // ---- Repeated reclamation cycles ----
 
     @Test
-    void repeatedInsertDeleteReclaim() {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-
+    void repeatedInsertDeleteReclaim() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             var reclaimer = tree.reclaimer();
             assertNotNull(reclaimer);

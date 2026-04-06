@@ -22,8 +22,7 @@ import org.taotree.internal.art.NodePtr;
  *
  * <p>Operations accept an optional {@link WriterArena} parameter. When provided,
  * COW allocations go through the per-scope arena (for concurrent writers). When
- * {@code null}, allocations go through the slab allocator directly (in-memory mode)
- * or through the engine's default arena (single-writer file-backed mode).
+ * {@code null}, allocations go through the slab allocator directly (child tree mode).
  */
 public final class CowEngine {
 
@@ -31,7 +30,7 @@ public final class CowEngine {
 
     // Immutable config — shared across all contexts
     final SlabAllocator slab;
-    final ChunkStore chunkStore; // null for in-memory mode
+    final ChunkStore chunkStore; // null for child trees
     final int prefixClassId;
     final int node4ClassId;
     final int node16ClassId;
@@ -40,15 +39,6 @@ public final class CowEngine {
     final int keyLen;
     final int keySlotSize;
     final int[] leafClassIds;
-
-    public CowEngine(SlabAllocator slab, EpochReclaimer reclaimer,
-                     int prefixClassId, int node4ClassId, int node16ClassId,
-                     int node48ClassId, int node256ClassId,
-                     int keyLen, int keySlotSize, int[] leafClassIds) {
-        this(slab, reclaimer, null, null,
-             prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
-             keyLen, keySlotSize, leafClassIds);
-    }
 
     public CowEngine(SlabAllocator slab, EpochReclaimer reclaimer,
                      WriterArena arena, ChunkStore chunkStore,
@@ -101,7 +91,7 @@ public final class CowEngine {
 
     /**
      * Insert a key using COW path-copy, without publishing.
-     * Uses the engine's default arena (single-writer or in-memory mode).
+     * Uses the engine's default arena (child tree / single-writer mode).
      */
     public DeferredResult deferredGetOrCreate(long currentRoot, MemorySegment key,
                                               int keyLen, int leafClass) {

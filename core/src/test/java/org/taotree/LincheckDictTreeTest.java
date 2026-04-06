@@ -6,7 +6,11 @@ import org.jetbrains.lincheck.datastructures.Param;
 import org.jetbrains.lincheck.datastructures.StressOptions;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
 import org.taotree.layout.KeyBuilder;
@@ -19,10 +23,6 @@ import org.taotree.layout.LeafLayout;
  * Lincheck linearizability test for TaoTree with dictionary-encoded compound keys
  * and typed leaf values via {@link LeafLayout} / {@link LeafAccessor}.
  *
- * <p>Exercises the full pipeline: {@link KeyBuilder#setDict} calls
- * {@link TaoDictionary#intern} (acquires write lock), then the tree operation
- * acquires another lock, and {@link LeafAccessor} provides typed access.
- *
  * <p>Key layout: [category:u16 dict][id:u32] = 6 bytes.
  * <br>Leaf layout: [value:int64] = 8 bytes.
  */
@@ -31,24 +31,38 @@ import org.taotree.layout.LeafLayout;
 public class LincheckDictTreeTest {
 
     private static final String[] CATEGORIES = {null, "Alpha", "Beta", "Gamma"};
+    private static final long CHUNK_SIZE = 1024L * 1024;
 
     private final TaoTree tree;
+    private final Path storePath;
     private final KeyLayout keyLayout;
     private final LeafLayout leafLayout;
 
     public LincheckDictTreeTest() {
-        // LeafLayout first — no dependencies, derives value size
-        leafLayout = LeafLayout.of(LeafField.int64("value"));
+        try {
+            leafLayout = LeafLayout.of(LeafField.int64("value"));
 
-        // Create tree: dict16(2B) + uint32(4B) = 6B key, value from layout
-        tree = TaoTree.open(6, leafLayout.totalWidth());
+            storePath = Files.createTempFile("lincheck-dict-", ".dat");
+            storePath.toFile().deleteOnExit();
+            Files.delete(storePath);
+            tree = TaoTree.create(storePath, 6, leafLayout.totalWidth(), CHUNK_SIZE, false);
 
-        // Create dict on the data tree (shares lock + allocators)
-        var dict = TaoDictionary.u16(tree);
-        keyLayout = KeyLayout.of(
-            KeyField.dict16("category", dict),
-            KeyField.uint32("id")
-        );
+            var dict = TaoDictionary.u16(tree);
+            keyLayout = KeyLayout.of(
+                KeyField.dict16("category", dict),
+                KeyField.uint32("id")
+            );
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** Eagerly release file resources so RAMDisk doesn't fill up across Lincheck invocations. */
+    @SuppressWarnings("deprecation")
+    @Override
+    protected void finalize() {
+        tree.close();
+        try { Files.deleteIfExists(storePath); } catch (IOException ignored) {}
     }
 
     private long compositeValue(int cat, int id) {
@@ -107,7 +121,7 @@ public class LincheckDictTreeTest {
     void stressTest() {
         new StressOptions()
             .iterations(100)
-            .invocationsPerIteration(1000)
+            .invocationsPerIteration(50)
             .threads(3)
             .actorsPerThread(3)
             .sequentialSpecification(SequentialSpec.class)

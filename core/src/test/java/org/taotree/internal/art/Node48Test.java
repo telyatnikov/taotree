@@ -1,12 +1,15 @@
 package org.taotree.internal.art;
 
 import java.lang.foreign.Arena;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 import org.junit.jupiter.api.Test;
 import java.util.HashSet;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
+import org.taotree.internal.alloc.ChunkStore;
 import org.taotree.internal.alloc.SlabAllocator;
 import org.taotree.internal.art.Node16;
 import org.taotree.internal.art.Node48;
@@ -16,9 +19,13 @@ import org.taotree.internal.art.NodePtr;
 class Node48Test {
 
     @Test
-    void insertAndFindO1() {
+    void insertAndFindO1() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 64 * 1024);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
             int node16ClassId = alloc.registerClass(NodeConstants.NODE16_SIZE);
@@ -42,9 +49,13 @@ class Node48Test {
     }
 
     @Test
-    void fillAll48Slots() {
+    void fillAll48Slots() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 64 * 1024);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
             int node16ClassId = alloc.registerClass(NodeConstants.NODE16_SIZE);
@@ -68,9 +79,13 @@ class Node48Test {
     }
 
     @Test
-    void removeChild() {
+    void removeChild() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 64 * 1024);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
             int node16ClassId = alloc.registerClass(NodeConstants.NODE16_SIZE);
@@ -96,9 +111,13 @@ class Node48Test {
     }
 
     @Test
-    void removeAndReinsert() {
+    void removeAndReinsert() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 64 * 1024);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
             int node16ClassId = alloc.registerClass(NodeConstants.NODE16_SIZE);
@@ -121,9 +140,13 @@ class Node48Test {
     }
 
     @Test
-    void copyFromNode16() {
+    void copyFromNode16() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 64 * 1024);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
             int node16ClassId = alloc.registerClass(NodeConstants.NODE16_SIZE);
@@ -151,9 +174,13 @@ class Node48Test {
     }
 
     @Test
-    void forEach() {
+    void forEach() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 64 * 1024);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
             int node16ClassId = alloc.registerClass(NodeConstants.NODE16_SIZE);
@@ -183,9 +210,13 @@ class Node48Test {
     // ---- Mutation-killing: isFull, init, removeChild ----
 
     @Test
-    void isFullReturnsFalseBeforeCapacity() {
+    void isFullReturnsFalseBeforeCapacity() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, SlabAllocator.DEFAULT_SLAB_SIZE);
             int classId = alloc.registerClass(NodeConstants.NODE48_SIZE);
             long ptr = alloc.allocate(classId);
             var seg = alloc.resolve(ptr);
@@ -202,9 +233,13 @@ class Node48Test {
     }
 
     @Test
-    void removeChildClearsSlot() {
+    void removeChildClearsSlot() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, SlabAllocator.DEFAULT_SLAB_SIZE);
             int classId = alloc.registerClass(NodeConstants.NODE48_SIZE);
             long ptr = alloc.allocate(classId);
             var seg = alloc.resolve(ptr);

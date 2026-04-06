@@ -1,21 +1,28 @@
 package org.taotree.internal.alloc;
 
 import java.lang.foreign.Arena;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 import org.junit.jupiter.api.Test;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
 import static org.junit.jupiter.api.Assertions.*;
+import org.taotree.internal.alloc.ChunkStore;
 import org.taotree.internal.alloc.SlabAllocator;
 import org.taotree.internal.art.NodePtr;
 
 class SlabAllocatorTest {
 
     @Test
-    void registerClassAndAllocate() {
-        try (var arena = Arena.ofConfined();
-             var alloc = new SlabAllocator(arena, 4096)) {
+    void registerClassAndAllocate() throws Exception {
+        try (var arena = Arena.ofConfined()) {
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 4096);
 
             int classId = alloc.registerClass(64);
             assertEquals(0, classId);
@@ -31,9 +38,13 @@ class SlabAllocatorTest {
     }
 
     @Test
-    void multipleClasses() {
-        try (var arena = Arena.ofConfined();
-             var alloc = new SlabAllocator(arena, 4096)) {
+    void multipleClasses() throws Exception {
+        try (var arena = Arena.ofConfined()) {
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 4096);
 
             int small = alloc.registerClass(16);
             int large = alloc.registerClass(256);
@@ -50,9 +61,13 @@ class SlabAllocatorTest {
     }
 
     @Test
-    void writeAndReadBack() {
-        try (var arena = Arena.ofConfined();
-             var alloc = new SlabAllocator(arena, 4096)) {
+    void writeAndReadBack() throws Exception {
+        try (var arena = Arena.ofConfined()) {
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 4096);
 
             int classId = alloc.registerClass(32);
             long ptr = alloc.allocate(classId);
@@ -69,9 +84,13 @@ class SlabAllocatorTest {
     }
 
     @Test
-    void allocateManySlotsSpansMultipleSlabs() {
-        try (var arena = Arena.ofConfined();
-             var alloc = new SlabAllocator(arena, 1024)) {
+    void allocateManySlotsSpansMultipleSlabs() throws Exception {
+        try (var arena = Arena.ofConfined()) {
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 4096);
 
             int classId = alloc.registerClass(64);
             // 1024 / 64 = 16 segments per slab. Allocate 50 → need 4 slabs.
@@ -93,9 +112,13 @@ class SlabAllocatorTest {
     }
 
     @Test
-    void freeAndReallocate() {
-        try (var arena = Arena.ofConfined();
-             var alloc = new SlabAllocator(arena, 4096)) {
+    void freeAndReallocate() throws Exception {
+        try (var arena = Arena.ofConfined()) {
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 4096);
 
             int classId = alloc.registerClass(128);
             long ptr1 = alloc.allocate(classId);
@@ -113,9 +136,13 @@ class SlabAllocatorTest {
     }
 
     @Test
-    void freeAllAndReallocate() {
-        try (var arena = Arena.ofConfined();
-             var alloc = new SlabAllocator(arena, 1024)) {
+    void freeAllAndReallocate() throws Exception {
+        try (var arena = Arena.ofConfined()) {
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 4096);
 
             int classId = alloc.registerClass(64);
             long[] ptrs = new long[16]; // exactly one slab
@@ -135,15 +162,19 @@ class SlabAllocatorTest {
                 alloc.allocate(classId);
             }
             assertEquals(16, alloc.totalSegmentsInUse());
-            // Should still be 1 slab's worth of memory
-            assertEquals(1024, alloc.totalAllocatedBytes());
+            // Should still be 1 slab's worth of memory (4096 bytes for 4096-byte slabs)
+            assertEquals(4096, alloc.totalAllocatedBytes());
         }
     }
 
     @Test
-    void resolveWithExplicitLength() {
-        try (var arena = Arena.ofConfined();
-             var alloc = new SlabAllocator(arena, 4096)) {
+    void resolveWithExplicitLength() throws Exception {
+        try (var arena = Arena.ofConfined()) {
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 4096);
 
             int classId = alloc.registerClass(128);
             long ptr = alloc.allocate(classId);
@@ -156,17 +187,26 @@ class SlabAllocatorTest {
     }
 
     @Test
-    void segmentSizeExceedingSlabThrows() {
-        try (var arena = Arena.ofConfined();
-             var alloc = new SlabAllocator(arena, 256)) {
-            assertThrows(IllegalArgumentException.class, () -> alloc.registerClass(512));
+    void segmentSizeExceedingSlabThrows() throws Exception {
+        try (var arena = Arena.ofConfined()) {
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 4096);
+            // Segment size exceeds slab size (4096) → must throw
+            assertThrows(IllegalArgumentException.class, () -> alloc.registerClass(8192));
         }
     }
 
     @Test
-    void differentClassesIndependent() {
-        try (var arena = Arena.ofConfined();
-             var alloc = new SlabAllocator(arena, 4096)) {
+    void differentClassesIndependent() throws Exception {
+        try (var arena = Arena.ofConfined()) {
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 4096);
 
             int c4   = alloc.registerClass(4);
             int c16  = alloc.registerClass(16);
@@ -191,34 +231,50 @@ class SlabAllocatorTest {
     // ---- STRONGER: input validation ----
 
     @Test
-    void rejectZeroSlabSize() {
+    void rejectZeroSlabSize() throws Exception {
         try (var arena = Arena.ofConfined()) {
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             assertThrows(IllegalArgumentException.class,
-                () -> new SlabAllocator(arena, 0));
+                () -> new SlabAllocator(arena, cs, 0));
         }
     }
 
     @Test
-    void rejectNegativeSlabSize() {
+    void rejectNegativeSlabSize() throws Exception {
         try (var arena = Arena.ofConfined()) {
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             assertThrows(IllegalArgumentException.class,
-                () -> new SlabAllocator(arena, -1));
+                () -> new SlabAllocator(arena, cs, -1));
         }
     }
 
     @Test
-    void rejectZeroSegmentSize() {
+    void rejectZeroSegmentSize() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, SlabAllocator.DEFAULT_SLAB_SIZE);
             assertThrows(IllegalArgumentException.class,
                 () -> alloc.registerClass(0));
         }
     }
 
     @Test
-    void rejectNegativeSegmentSize() {
+    void rejectNegativeSegmentSize() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, SlabAllocator.DEFAULT_SLAB_SIZE);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, SlabAllocator.DEFAULT_SLAB_SIZE);
             assertThrows(IllegalArgumentException.class,
                 () -> alloc.registerClass(-1));
         }
@@ -227,37 +283,46 @@ class SlabAllocatorTest {
     // ---- STRONGER: allocate fills slab then grows ----
 
     @Test
-    void allocateFillsEntireSlabThenGrows() {
+    void allocateFillsEntireSlabThenGrows() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            // Small slab: 256 bytes with 32-byte segments = 8 segments per slab
-            var alloc = new SlabAllocator(arena, 256);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            // 4096 bytes with 32-byte segments = 128 segments per slab
+            var alloc = new SlabAllocator(arena, cs, 4096);
             int classId = alloc.registerClass(32);
 
             // Fill first slab completely
-            long[] ptrs = new long[8];
-            for (int i = 0; i < 8; i++) {
+            int segsPerSlab = 4096 / 32; // 128
+            long[] ptrs = new long[segsPerSlab];
+            for (int i = 0; i < segsPerSlab; i++) {
                 ptrs[i] = alloc.allocate(classId);
                 alloc.resolve(ptrs[i]).set(ValueLayout.JAVA_INT, 0, i);
             }
 
-            // 9th allocation should go to a second slab
-            long ptr9 = alloc.allocate(classId);
-            alloc.resolve(ptr9).set(ValueLayout.JAVA_INT, 0, 99);
+            // Next allocation should go to a second slab
+            long ptrNext = alloc.allocate(classId);
+            alloc.resolve(ptrNext).set(ValueLayout.JAVA_INT, 0, 99);
 
             // Verify all previous allocations still valid
-            for (int i = 0; i < 8; i++) {
+            for (int i = 0; i < segsPerSlab; i++) {
                 assertEquals(i, alloc.resolve(ptrs[i]).get(ValueLayout.JAVA_INT, 0));
             }
-            assertEquals(99, alloc.resolve(ptr9).get(ValueLayout.JAVA_INT, 0));
+            assertEquals(99, alloc.resolve(ptrNext).get(ValueLayout.JAVA_INT, 0));
         }
     }
 
     // ---- STRONGER: free and scan finds freed slot ----
 
     @Test
-    void freeSlotIsReusedByNextAllocate() {
+    void freeSlotIsReusedByNextAllocate() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 256);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 4096);
             int classId = alloc.registerClass(32);
 
             // Allocate all 8 slots
@@ -281,37 +346,45 @@ class SlabAllocatorTest {
     // ---- STRONGER: non-power-of-two segments per slab ----
 
     @Test
-    void nonPowerOfTwoSegmentsPerSlab() {
+    void nonPowerOfTwoSegmentsPerSlab() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            // 300 bytes / 64 byte segments = 4 segments (300/64 = 4.6, rounds down)
-            var alloc = new SlabAllocator(arena, 300);
-            int classId = alloc.registerClass(64);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            // 4096 bytes / 48 byte segments = 85 segments (4096/48 = 85.3, rounds down)
+            var alloc = new SlabAllocator(arena, cs, 4096);
+            int classId = alloc.registerClass(48);
 
-            // Should be able to allocate 4 segments from first slab
-            long[] ptrs = new long[4];
-            for (int i = 0; i < 4; i++) {
+            // Should be able to allocate 85 segments from first slab
+            long[] ptrs = new long[85];
+            for (int i = 0; i < 85; i++) {
                 ptrs[i] = alloc.allocate(classId);
                 alloc.resolve(ptrs[i]).set(ValueLayout.JAVA_INT, 0, i);
             }
 
-            // 5th should go to second slab
-            long ptr5 = alloc.allocate(classId);
-            alloc.resolve(ptr5).set(ValueLayout.JAVA_INT, 0, 42);
+            // 86th should go to second slab
+            long ptr86 = alloc.allocate(classId);
+            alloc.resolve(ptr86).set(ValueLayout.JAVA_INT, 0, 42);
 
             // Verify all
-            for (int i = 0; i < 4; i++) {
+            for (int i = 0; i < 85; i++) {
                 assertEquals(i, alloc.resolve(ptrs[i]).get(ValueLayout.JAVA_INT, 0));
             }
-            assertEquals(42, alloc.resolve(ptr5).get(ValueLayout.JAVA_INT, 0));
+            assertEquals(42, alloc.resolve(ptr86).get(ValueLayout.JAVA_INT, 0));
         }
     }
 
     // ---- allocate with nodeType ----
 
     @Test
-    void allocateWithNodeType() {
-        try (var arena = Arena.ofConfined();
-             var alloc = new SlabAllocator(arena, 4096)) {
+    void allocateWithNodeType() throws Exception {
+        try (var arena = Arena.ofConfined()) {
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var alloc = new SlabAllocator(arena, cs, 4096);
 
             int classId = alloc.registerClass(64);
 
@@ -336,36 +409,17 @@ class SlabAllocatorTest {
         }
     }
 
-    // ---- isFileBacked ----
-
-    @Test
-    void inMemoryIsNotFileBacked() {
-        try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena, 4096);
-            assertFalse(alloc.isFileBacked());
-        }
-    }
-
-    // ---- default slab size constructor ----
-
-    @Test
-    void defaultSlabSizeConstructor() {
-        try (var arena = Arena.ofConfined()) {
-            var alloc = new SlabAllocator(arena);
-            int classId = alloc.registerClass(64);
-            long ptr = alloc.allocate(classId);
-            assertFalse(NodePtr.isEmpty(ptr));
-            assertEquals(64, alloc.resolve(ptr).byteSize());
-        }
-    }
-
     // ---- boundary: slabSize = 1 should still work ----
 
     @Test
-    void slabSizeOne() {
+    void slabSizeOne() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            // slabSize=1 means 1 byte slabs, segment size must be 1
-            var alloc = new SlabAllocator(arena, 1);
+            Path tmp = Files.createTempFile("slab-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            // Minimum slab size is PAGE_SIZE (4096) for file-backed mode
+            var alloc = new SlabAllocator(arena, cs, 4096);
             int classId = alloc.registerClass(1);
             long ptr = alloc.allocate(classId);
             assertFalse(NodePtr.isEmpty(ptr));

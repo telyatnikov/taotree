@@ -19,12 +19,8 @@ import org.taotree.internal.persist.Superblock;
  * <p>Pointers returned by {@link #allocate(int)} are swizzled {@link NodePtr} values
  * encoding {@code (slabClassId, slabId, offset)} — position-independent and serializable.
  *
- * <p>Supports two modes:
- * <ul>
- *   <li><b>In-memory:</b> slabs and bitmasks are allocated from an {@link Arena}.
- *   <li><b>File-backed:</b> slabs and bitmasks are allocated as pages from a {@link ChunkStore}.
- *       Writes are immediately visible in the mapped file.
- * </ul>
+ * <p>Slabs and bitmasks are allocated as pages from a {@link ChunkStore}.
+ * Writes are immediately visible in the mapped file.
  *
  * <p><b>Thread safety:</b> not thread-safe on its own. Must be accessed under the
  * owning tree's {@code ReentrantReadWriteLock}. All trees and dictionaries sharing
@@ -39,8 +35,7 @@ public final class SlabAllocator implements AutoCloseable {
     private static final int MAX_SLABS_PER_CLASS = 65536;  // 16-bit slabId
     private static final int INITIAL_SLABS_CAPACITY = 4;
 
-    private final Arena arena;          // always set (in-memory or shared with ChunkStore)
-    private final ChunkStore chunkStore; // null for in-memory mode
+    private final ChunkStore chunkStore;
     private final int slabSize;
     private final SlabClass[] classes;
     private int classCount;
@@ -50,43 +45,18 @@ public final class SlabAllocator implements AutoCloseable {
     // -----------------------------------------------------------------------
 
     /**
-     * Create a new in-memory allocator.
-     *
-     * @param arena    the arena used to allocate slab memory (controls lifetime)
-     * @param slabSize the size of each slab in bytes (default: 1 MB)
-     */
-    public SlabAllocator(Arena arena, int slabSize) {
-        if (slabSize <= 0) throw new IllegalArgumentException("slabSize must be positive");
-        this.arena = arena;
-        this.chunkStore = null;
-        this.slabSize = slabSize;
-        this.classes = new SlabClass[MAX_SLAB_CLASSES];
-        this.classCount = 0;
-    }
-
-    public SlabAllocator(Arena arena) {
-        this(arena, DEFAULT_SLAB_SIZE);
-    }
-
-    /**
      * Create a new file-backed allocator.
      *
-     * @param arena      the arena controlling mapping lifetimes
+     * @param arena      the arena controlling mapping lifetimes (retained for API compatibility)
      * @param chunkStore the chunk store providing mapped file pages
      * @param slabSize   the size of each slab in bytes
      */
     public SlabAllocator(Arena arena, ChunkStore chunkStore, int slabSize) {
         if (slabSize <= 0) throw new IllegalArgumentException("slabSize must be positive");
-        this.arena = arena;
         this.chunkStore = chunkStore;
         this.slabSize = slabSize;
         this.classes = new SlabClass[MAX_SLAB_CLASSES];
         this.classCount = 0;
-    }
-
-    /** Returns true if this allocator is file-backed. */
-    public boolean isFileBacked() {
-        return chunkStore != null;
     }
 
     /**
@@ -233,9 +203,6 @@ public final class SlabAllocator implements AutoCloseable {
      * @return the slab class ID
      */
     public int restoreClass(Superblock.SlabClassDescriptor desc) {
-        if (chunkStore == null) {
-            throw new IllegalStateException("restoreClass requires file-backed mode");
-        }
         int id = registerClass(desc.segmentSize);
         var cls = classes[id];
 
@@ -276,7 +243,7 @@ public final class SlabAllocator implements AutoCloseable {
         int slabCount;
         int segmentsInUse;
 
-        // File-backed: page locations for each slab (null in in-memory mode)
+        // File-backed: page locations for each slab
         int[] dataStartPages;
         int[] bitmaskStartPages;
         int[] bitmaskPageCounts;
@@ -299,11 +266,9 @@ public final class SlabAllocator implements AutoCloseable {
             this.slabCount = 0;
             this.segmentsInUse = 0;
 
-            if (chunkStore != null) {
-                this.dataStartPages = new int[INITIAL_SLABS_CAPACITY];
-                this.bitmaskStartPages = new int[INITIAL_SLABS_CAPACITY];
-                this.bitmaskPageCounts = new int[INITIAL_SLABS_CAPACITY];
-            }
+            this.dataStartPages = new int[INITIAL_SLABS_CAPACITY];
+            this.bitmaskStartPages = new int[INITIAL_SLABS_CAPACITY];
+            this.bitmaskPageCounts = new int[INITIAL_SLABS_CAPACITY];
         }
 
         long allocate(int nodeType) {
@@ -404,43 +369,35 @@ public final class SlabAllocator implements AutoCloseable {
                 MemorySegment[] newBm = new MemorySegment[newCap];
                 System.arraycopy(bitmaskSegs, 0, newBm, 0, slabCount);
                 bitmaskSegs = newBm;
-                if (dataStartPages != null) {
-                    int[] newDsp = new int[newCap];
-                    System.arraycopy(dataStartPages, 0, newDsp, 0, slabCount);
-                    dataStartPages = newDsp;
-                    int[] newBsp = new int[newCap];
-                    System.arraycopy(bitmaskStartPages, 0, newBsp, 0, slabCount);
-                    bitmaskStartPages = newBsp;
-                    int[] newBpc = new int[newCap];
-                    System.arraycopy(bitmaskPageCounts, 0, newBpc, 0, slabCount);
-                    bitmaskPageCounts = newBpc;
-                }
+                int[] newDsp = new int[newCap];
+                System.arraycopy(dataStartPages, 0, newDsp, 0, slabCount);
+                dataStartPages = newDsp;
+                int[] newBsp = new int[newCap];
+                System.arraycopy(bitmaskStartPages, 0, newBsp, 0, slabCount);
+                bitmaskStartPages = newBsp;
+                int[] newBpc = new int[newCap];
+                System.arraycopy(bitmaskPageCounts, 0, newBpc, 0, slabCount);
+                bitmaskPageCounts = newBpc;
             }
 
             int newId = slabCount;
             int bitmaskBytes = bitmaskLongs * 8;
 
-            if (chunkStore != null) {
-                // File-backed: allocate pages from ChunkStore
-                try {
-                    int slabPages = slabSize / ChunkStore.PAGE_SIZE;
-                    int bmPages = (bitmaskBytes + ChunkStore.PAGE_SIZE - 1) / ChunkStore.PAGE_SIZE;
+            // Allocate pages from ChunkStore
+            try {
+                int slabPages = slabSize / ChunkStore.PAGE_SIZE;
+                int bmPages = (bitmaskBytes + ChunkStore.PAGE_SIZE - 1) / ChunkStore.PAGE_SIZE;
 
-                    int dataPage = chunkStore.allocPages(slabPages);
-                    int bmPage = chunkStore.allocPages(bmPages);
+                int dataPage = chunkStore.allocPages(slabPages);
+                int bmPage = chunkStore.allocPages(bmPages);
 
-                    slabs[newId] = chunkStore.resolve(dataPage, slabPages);
-                    bitmaskSegs[newId] = chunkStore.resolve(bmPage, bmPages);
-                    dataStartPages[newId] = dataPage;
-                    bitmaskStartPages[newId] = bmPage;
-                    bitmaskPageCounts[newId] = bmPages;
-                } catch (IOException e) {
-                    throw new UncheckedIOException("Failed to grow slab class " + id, e);
-                }
-            } else {
-                // In-memory: allocate from Arena
-                slabs[newId] = arena.allocate(slabSize, 8);
-                bitmaskSegs[newId] = arena.allocate(bitmaskBytes, 8);
+                slabs[newId] = chunkStore.resolve(dataPage, slabPages);
+                bitmaskSegs[newId] = chunkStore.resolve(bmPage, bmPages);
+                dataStartPages[newId] = dataPage;
+                bitmaskStartPages[newId] = bmPage;
+                bitmaskPageCounts[newId] = bmPages;
+            } catch (IOException e) {
+                throw new UncheckedIOException("Failed to grow slab class " + id, e);
             }
 
             // Initialize bitmask: all bits set = all free

@@ -1,13 +1,20 @@
 package org.taotree;
 
 import org.junit.jupiter.api.Test;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import org.junit.jupiter.api.io.TempDir;
 import static org.junit.jupiter.api.Assertions.*;
 
 class TaoDictionaryTest {
 
+    @TempDir Path tmp;
+    private int fc;
+
     @Test
-    void internBasic() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void internBasic() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
 
             int code1 = dict.intern("Animalia");
@@ -23,8 +30,8 @@ class TaoDictionaryTest {
     }
 
     @Test
-    void resolveOnly() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void resolveOnly() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
             dict.intern("Chordata");
             assertEquals(-1, dict.resolve("Unknown"));
@@ -33,8 +40,8 @@ class TaoDictionaryTest {
     }
 
     @Test
-    void monotonicallyIncreasing() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void monotonicallyIncreasing() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
             int c1 = dict.intern("first");
             int c2 = dict.intern("second");
@@ -45,8 +52,8 @@ class TaoDictionaryTest {
     }
 
     @Test
-    void nullSentinel() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void nullSentinel() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
             int code = dict.intern("test");
             assertEquals(1, code);
@@ -54,8 +61,8 @@ class TaoDictionaryTest {
     }
 
     @Test
-    void manyEntries() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void manyEntries() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u32(tree);
             String[] names = {
                 "Animalia", "Plantae", "Fungi", "Protista", "Archaea", "Bacteria", "Chromista",
@@ -84,8 +91,8 @@ class TaoDictionaryTest {
     }
 
     @Test
-    void u16TaoDictionaryCapacity() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void u16TaoDictionaryCapacity() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = new TaoDictionary(tree, 3, 1);
             dict.intern("a");
             dict.intern("b");
@@ -95,8 +102,8 @@ class TaoDictionaryTest {
     }
 
     @Test
-    void newDictEntryCodeIsNeverZero() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void newDictEntryCodeIsNeverZero() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
             // All assigned codes must be > 0 (0 is sentinel)
             for (int i = 0; i < 50; i++) {
@@ -109,8 +116,8 @@ class TaoDictionaryTest {
     // ---- Mutation-killing: owner() ----
 
     @Test
-    void ownerReturnsTree() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void ownerReturnsTree() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
             assertSame(tree, dict.owner());
         }
@@ -119,8 +126,8 @@ class TaoDictionaryTest {
     // ---- Mutation-killing: nextCode() ----
 
     @Test
-    void nextCodeTracksState() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void nextCodeTracksState() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
             assertEquals(1, dict.nextCode()); // starts at 1
             dict.intern("first");
@@ -135,8 +142,8 @@ class TaoDictionaryTest {
     // ---- Mutation-killing: scoped access ----
 
     @Test
-    void scopedReadAccess() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void scopedReadAccess() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
             dict.intern("test");
 
@@ -149,8 +156,8 @@ class TaoDictionaryTest {
     }
 
     @Test
-    void scopedWriteAccess() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void scopedWriteAccess() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
 
             try (var w = dict.write()) {
@@ -166,8 +173,8 @@ class TaoDictionaryTest {
     // ---- Mutation-killing: size() ----
 
     @Test
-    void sizeTracksEntries() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void sizeTracksEntries() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
             assertEquals(0, dict.size());
             dict.intern("a");
@@ -182,8 +189,8 @@ class TaoDictionaryTest {
     // ---- Mutation-killing: encodeAndPad boundary ----
 
     @Test
-    void longStringNearMaxKeyLen() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void longStringNearMaxKeyLen() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u32(tree);
             // Create a string that, after encoding, fits within 128 bytes
             StringBuilder sb = new StringBuilder();
@@ -197,8 +204,8 @@ class TaoDictionaryTest {
     // ---- Round 2: scope close releases lock ----
 
     @Test
-    void readScopeCloseReleasesLock() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void readScopeCloseReleasesLock() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
             dict.intern("test");
 
@@ -216,8 +223,8 @@ class TaoDictionaryTest {
     }
 
     @Test
-    void writeScopeCloseReleasesLock() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void writeScopeCloseReleasesLock() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
 
             // Open and close a write scope
@@ -235,8 +242,8 @@ class TaoDictionaryTest {
     // ---- Round 2: encodeAndPad boundary ----
 
     @Test
-    void stringExceedingMaxKeyLenThrows() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void stringExceedingMaxKeyLenThrows() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u32(tree);
             // Create a string whose encoded form exceeds 128 bytes
             // Each char is 1 byte in UTF-8 + null terminator, so 128 chars → 129 bytes encoded
@@ -249,8 +256,8 @@ class TaoDictionaryTest {
     // ---- Mutation-killing: MAX_KEY_LEN exact boundary ----
 
     @Test
-    void stringExactlyAtMaxKeyLenSucceeds() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void stringExactlyAtMaxKeyLenSucceeds() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u32(tree);
             // Encoded form = raw bytes + null terminator.
             // 127 chars → 127 bytes + 1 null = 128 bytes = MAX_KEY_LEN → should succeed
@@ -266,7 +273,7 @@ class TaoDictionaryTest {
 
     @Test
     void writeScopeCloseReleasesLockFromAnotherThread() throws Exception {
-        try (var tree = TaoTree.forDictionaries()) {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
 
             // Open write scope and close it
@@ -288,8 +295,8 @@ class TaoDictionaryTest {
     // ---- Mutation-killing: copyFrom requires write lock ----
 
     @Test
-    void copyFromSelfLocking() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void copyFromSelfLocking() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var source = TaoDictionary.u16(tree);
             source.intern("hello");
 

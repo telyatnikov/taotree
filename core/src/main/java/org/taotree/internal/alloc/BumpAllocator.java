@@ -15,11 +15,7 @@ import org.taotree.TaoString;
  * <p>Payloads are packed contiguously within pages with no per-entry metadata. The length
  * of each payload is known by the caller (stored in the TaoString leaf's {@code len} field).
  *
- * <p>Supports two modes:
- * <ul>
- *   <li><b>In-memory:</b> pages are allocated from an {@link Arena}.
- *   <li><b>File-backed:</b> pages are allocated from a {@link ChunkStore}.
- * </ul>
+ * <p>Pages are allocated from a {@link ChunkStore} (file-backed).
  *
  * <p>Deallocation is deferred: deleted payloads become dead space, reclaimed only during
  * compaction (vacuum).
@@ -36,13 +32,12 @@ public final class BumpAllocator implements AutoCloseable {
     private static final int MAX_PAGES = 0x00FF_FFFF + 1; // 24-bit pageId → 16M pages
     private static final int INITIAL_PAGES_CAPACITY = 8;
 
-    private final Arena arena;           // always set
-    private final ChunkStore chunkStore; // null for in-memory mode
+    private final ChunkStore chunkStore;
     private final int pageSize;
 
     private MemorySegment[] pages;
-    private int[] pageStartPages;     // file-backed: ChunkStore start page for each bump page
-    private int[] pageSizesInPages;   // file-backed: number of ChunkStore pages per bump page
+    private int[] pageStartPages;     // ChunkStore start page for each bump page
+    private int[] pageSizesInPages;   // number of ChunkStore pages per bump page
     private int pageCount;            // number of allocated pages
     private int currentPage;          // index of the page currently being bumped into
     private int bumpOffset;           // next free byte in currentPage
@@ -52,32 +47,15 @@ public final class BumpAllocator implements AutoCloseable {
     // Construction
     // -----------------------------------------------------------------------
 
-    public BumpAllocator(Arena arena, int pageSize) {
-        if (pageSize <= 0) throw new IllegalArgumentException("pageSize must be positive");
-        this.arena = arena;
-        this.chunkStore = null;
-        this.pageSize = pageSize;
-        this.pages = new MemorySegment[INITIAL_PAGES_CAPACITY];
-        this.pageCount = 0;
-        this.currentPage = -1;
-        this.bumpOffset = 0;
-        this.bytesAllocated = 0;
-    }
-
-    public BumpAllocator(Arena arena) {
-        this(arena, DEFAULT_PAGE_SIZE);
-    }
-
     /**
      * Create a file-backed bump allocator.
      *
-     * @param arena      the arena controlling mapping lifetimes
+     * @param arena      the arena controlling mapping lifetimes (retained for API compatibility)
      * @param chunkStore the chunk store providing mapped file pages
      * @param pageSize   the bump page size in bytes
      */
     public BumpAllocator(Arena arena, ChunkStore chunkStore, int pageSize) {
         if (pageSize <= 0) throw new IllegalArgumentException("pageSize must be positive");
-        this.arena = arena;
         this.chunkStore = chunkStore;
         this.pageSize = pageSize;
         this.pages = new MemorySegment[INITIAL_PAGES_CAPACITY];
@@ -87,11 +65,6 @@ public final class BumpAllocator implements AutoCloseable {
         this.currentPage = -1;
         this.bumpOffset = 0;
         this.bytesAllocated = 0;
-    }
-
-    /** Returns true if this allocator is file-backed. */
-    public boolean isFileBacked() {
-        return chunkStore != null;
     }
 
     /**
@@ -170,7 +143,7 @@ public final class BumpAllocator implements AutoCloseable {
 
     @Override
     public void close() {
-        // Memory is owned by the Arena (in-memory) or ChunkStore (file-backed).
+        // Memory is owned by the ChunkStore.
     }
 
     // -----------------------------------------------------------------------
@@ -209,9 +182,6 @@ public final class BumpAllocator implements AutoCloseable {
      * @param sizeInPages the number of ChunkStore pages
      */
     public void restorePage(int startPage, int sizeInPages) {
-        if (chunkStore == null) {
-            throw new IllegalStateException("restorePage requires file-backed mode");
-        }
         ensureCapacity();
         int id = pageCount;
         pages[id] = chunkStore.resolve(startPage, sizeInPages);
@@ -241,18 +211,14 @@ public final class BumpAllocator implements AutoCloseable {
         }
         ensureCapacity();
 
-        if (chunkStore != null) {
-            try {
-                int chunkPages = pageSize / ChunkStore.PAGE_SIZE;
-                int startPage = chunkStore.allocPages(chunkPages);
-                pages[pageCount] = chunkStore.resolve(startPage, chunkPages);
-                pageStartPages[pageCount] = startPage;
-                pageSizesInPages[pageCount] = chunkPages;
-            } catch (IOException e) {
-                throw new UncheckedIOException("Failed to grow bump allocator", e);
-            }
-        } else {
-            pages[pageCount] = arena.allocate(pageSize, 1);
+        try {
+            int chunkPages = pageSize / ChunkStore.PAGE_SIZE;
+            int startPage = chunkStore.allocPages(chunkPages);
+            pages[pageCount] = chunkStore.resolve(startPage, chunkPages);
+            pageStartPages[pageCount] = startPage;
+            pageSizesInPages[pageCount] = chunkPages;
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to grow bump allocator", e);
         }
 
         currentPage = pageCount;
@@ -270,18 +236,14 @@ public final class BumpAllocator implements AutoCloseable {
 
         int oversizedPageId = pageCount;
 
-        if (chunkStore != null) {
-            try {
-                int chunkPages = (length + ChunkStore.PAGE_SIZE - 1) / ChunkStore.PAGE_SIZE;
-                int startPage = chunkStore.allocPages(chunkPages);
-                pages[oversizedPageId] = chunkStore.resolve(startPage, chunkPages);
-                pageStartPages[oversizedPageId] = startPage;
-                pageSizesInPages[oversizedPageId] = chunkPages;
-            } catch (IOException e) {
-                throw new UncheckedIOException("Failed to allocate oversized bump page", e);
-            }
-        } else {
-            pages[oversizedPageId] = arena.allocate(length, 1);
+        try {
+            int chunkPages = (length + ChunkStore.PAGE_SIZE - 1) / ChunkStore.PAGE_SIZE;
+            int startPage = chunkStore.allocPages(chunkPages);
+            pages[oversizedPageId] = chunkStore.resolve(startPage, chunkPages);
+            pageStartPages[oversizedPageId] = startPage;
+            pageSizesInPages[oversizedPageId] = chunkPages;
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to allocate oversized bump page", e);
         }
 
         pageCount++;
@@ -296,14 +258,12 @@ public final class BumpAllocator implements AutoCloseable {
             MemorySegment[] newPages = new MemorySegment[newCap];
             System.arraycopy(pages, 0, newPages, 0, pageCount);
             pages = newPages;
-            if (pageStartPages != null) {
-                int[] newSp = new int[newCap];
-                System.arraycopy(pageStartPages, 0, newSp, 0, pageCount);
-                pageStartPages = newSp;
-                int[] newSip = new int[newCap];
-                System.arraycopy(pageSizesInPages, 0, newSip, 0, pageCount);
-                pageSizesInPages = newSip;
-            }
+            int[] newSp = new int[newCap];
+            System.arraycopy(pageStartPages, 0, newSp, 0, pageCount);
+            pageStartPages = newSp;
+            int[] newSip = new int[newCap];
+            System.arraycopy(pageSizesInPages, 0, newSip, 0, pageCount);
+            pageSizesInPages = newSip;
         }
     }
 }

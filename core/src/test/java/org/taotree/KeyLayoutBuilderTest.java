@@ -1,6 +1,10 @@
 package org.taotree;
 
 import org.junit.jupiter.api.Test;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import org.junit.jupiter.api.io.TempDir;
 import java.lang.foreign.Arena;
 import java.lang.foreign.ValueLayout;
 
@@ -11,8 +15,11 @@ import org.taotree.layout.KeyLayout;
 
 class KeyLayoutBuilderTest {
 
+    @TempDir Path tmp;
+    private int fc;
+
     @Test
-    void layoutBasic() {
+    void layoutBasic() throws IOException {
         var layout = KeyLayout.of(
             KeyField.uint16("a"),
             KeyField.uint32("b"),
@@ -26,7 +33,7 @@ class KeyLayoutBuilderTest {
     }
 
     @Test
-    void encodeU16AndU32() {
+    void encodeU16AndU32() throws IOException {
         try (var arena = Arena.ofConfined()) {
             var layout = KeyLayout.of(
                 KeyField.uint16("first"),
@@ -43,8 +50,8 @@ class KeyLayoutBuilderTest {
     }
 
     @Test
-    void encodeDictFields() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void encodeDictFields() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var kingdomDict = TaoDictionary.u16(tree);
             var speciesDict = TaoDictionary.u32(tree);
 
@@ -71,8 +78,8 @@ class KeyLayoutBuilderTest {
     }
 
     @Test
-    void encodeDictNull() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void encodeDictNull() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
             var layout = KeyLayout.of(KeyField.dict16("field", dict));
 
@@ -85,8 +92,8 @@ class KeyLayoutBuilderTest {
     }
 
     @Test
-    void fullGbifKey() {
-        try (var tree = TaoTree.forDictionaries(512 * 1024)) {
+    void fullGbifKey() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"), 512 * 1024)) {
             var kingdomDict  = TaoDictionary.u16(tree);
             var phylumDict   = TaoDictionary.u16(tree);
             var familyDict   = TaoDictionary.u16(tree);
@@ -135,8 +142,8 @@ class KeyLayoutBuilderTest {
     }
 
     @Test
-    void keySchemaWithArt() {
-        try (var tree = TaoTree.forDictionaries(512 * 1024)) {
+    void keySchemaWithArt() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"), 512 * 1024)) {
             var dict = TaoDictionary.u16(tree);
             var layout = KeyLayout.of(
                 KeyField.dict16("a", dict),
@@ -180,7 +187,7 @@ class KeyLayoutBuilderTest {
     // ---- Mutation-killing: U8, U64, I64 encoding ----
 
     @Test
-    void encodeU8() {
+    void encodeU8() throws IOException {
         try (var arena = Arena.ofConfined()) {
             var layout = KeyLayout.of(KeyField.uint8("byte"));
             var enc = new KeyBuilder(layout, arena);
@@ -191,7 +198,7 @@ class KeyLayoutBuilderTest {
     }
 
     @Test
-    void encodeU64() {
+    void encodeU64() throws IOException {
         try (var arena = Arena.ofConfined()) {
             var layout = KeyLayout.of(KeyField.uint64("big"));
             var enc = new KeyBuilder(layout, arena);
@@ -202,7 +209,7 @@ class KeyLayoutBuilderTest {
     }
 
     @Test
-    void encodeI64() {
+    void encodeI64() throws IOException {
         try (var arena = Arena.ofConfined()) {
             var layout = KeyLayout.of(KeyField.int64("signed"));
             var enc = new KeyBuilder(layout, arena);
@@ -213,7 +220,7 @@ class KeyLayoutBuilderTest {
     }
 
     @Test
-    void encodeI64OrderPreserving() {
+    void encodeI64OrderPreserving() throws IOException {
         try (var arena = Arena.ofConfined()) {
             var layout = KeyLayout.of(KeyField.int64("signed"));
             var enc1 = new KeyBuilder(layout, arena);
@@ -235,7 +242,7 @@ class KeyLayoutBuilderTest {
     // ---- Mutation-killing: name-based setters ----
 
     @Test
-    void nameBasedSetters() {
+    void nameBasedSetters() throws IOException {
         try (var arena = Arena.ofConfined()) {
             var layout = KeyLayout.of(
                 KeyField.uint8("a"),
@@ -262,7 +269,7 @@ class KeyLayoutBuilderTest {
     // ---- Mutation-killing: chaining returns this ----
 
     @Test
-    void setterChaining() {
+    void setterChaining() throws IOException {
         try (var arena = Arena.ofConfined()) {
             var layout = KeyLayout.of(KeyField.uint16("a"), KeyField.uint32("b"));
             var enc = new KeyBuilder(layout, arena);
@@ -274,7 +281,7 @@ class KeyLayoutBuilderTest {
     // ---- Mutation-killing: fieldIndex lookup ----
 
     @Test
-    void fieldIndexLookup() {
+    void fieldIndexLookup() throws IOException {
         var layout = KeyLayout.of(
             KeyField.uint16("first"),
             KeyField.uint32("second"),
@@ -289,7 +296,7 @@ class KeyLayoutBuilderTest {
     // ---- Mutation-killing: KeyField factories ----
 
     @Test
-    void keyFieldFactoryWidths() {
+    void keyFieldFactoryWidths() throws IOException {
         assertEquals(1, KeyField.uint8("x").width());
         assertEquals(2, KeyField.uint16("x").width());
         assertEquals(4, KeyField.uint32("x").width());
@@ -300,7 +307,7 @@ class KeyLayoutBuilderTest {
     // ---- Round 2: I64 setter chaining ----
 
     @Test
-    void setI64Chaining() {
+    void setI64Chaining() throws IOException {
         try (var arena = Arena.ofConfined()) {
             var layout = KeyLayout.of(KeyField.int64("a"), KeyField.int64("b"));
             var enc = new KeyBuilder(layout, arena);
@@ -312,7 +319,7 @@ class KeyLayoutBuilderTest {
     }
 
     @Test
-    void setI64ByNameChaining() {
+    void setI64ByNameChaining() throws IOException {
         try (var arena = Arena.ofConfined()) {
             var layout = KeyLayout.of(KeyField.int64("x"), KeyField.uint32("y"));
             var enc = new KeyBuilder(layout, arena);
@@ -324,8 +331,8 @@ class KeyLayoutBuilderTest {
     }
 
     @Test
-    void setDictByNameChaining() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void setDictByNameChaining() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
             var layout = KeyLayout.of(KeyField.dict16("d", dict), KeyField.uint32("n"));
             try (var arena = Arena.ofConfined()) {
@@ -339,15 +346,15 @@ class KeyLayoutBuilderTest {
     // ---- STRONGER: KeyLayout.of validation ----
 
     @Test
-    void keyLayoutRejectsNoFields() {
+    void keyLayoutRejectsNoFields() throws IOException {
         assertThrows(IllegalArgumentException.class, () -> KeyLayout.of());
     }
 
     // ---- STRONGER: setDict null vs non-null ----
 
     @Test
-    void setDictNullEncodesZero() {
-        try (var tree = TaoTree.forDictionaries()) {
+    void setDictNullEncodesZero() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
             var dict = TaoDictionary.u16(tree);
             var layout = KeyLayout.of(KeyField.dict16("d", dict));
 

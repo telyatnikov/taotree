@@ -273,4 +273,21 @@ class WriterArenaTest {
             cs.close();
         }
     }
+
+    @Test
+    void pageEncodingLimitBoundary() {
+        long ptr = WriterArena.encodeArenaPtr(
+            NodePtr.LEAF, 7, WriterArena.MAX_ADDRESSABLE_PAGES - 1, ChunkStore.PAGE_SIZE - 8);
+
+        assertEquals(WriterArena.ARENA_SLAB_ID, NodePtr.slabId(ptr));
+        assertEquals(WriterArena.MAX_ADDRESSABLE_PAGES - 1, NodePtr.offset(ptr) >>> 12);
+        assertEquals(ChunkStore.PAGE_SIZE - 8, NodePtr.offset(ptr) & 0xFFF);
+    }
+
+    @Test
+    void pageEncodingOverflowThrows() {
+        var ex = assertThrows(IllegalStateException.class,
+            () -> WriterArena.encodeArenaPtr(NodePtr.LEAF, 0, WriterArena.MAX_ADDRESSABLE_PAGES, 0));
+        assertTrue(ex.getMessage().contains("20-bit arena NodePtr limit"));
+    }
 }

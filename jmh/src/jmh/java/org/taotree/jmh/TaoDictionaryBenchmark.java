@@ -3,6 +3,9 @@ package org.taotree.jmh;
 import org.openjdk.jmh.annotations.*;
 import org.taotree.*;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
@@ -26,8 +29,11 @@ public class TaoDictionaryBenchmark {
     private int lookupIndex;
 
     @Setup(Level.Trial)
-    public void setup() {
-        tree = TaoTree.forDictionaries(4 * 1024 * 1024);
+    public void setup() throws IOException {
+        Path tmp = Files.createTempFile("jmh-dict-", ".dat");
+        tmp.toFile().deleteOnExit();
+        Files.delete(tmp);
+        tree = TaoTree.forDictionaries(tmp, 4 * 1024 * 1024);
         dict = TaoDictionary.u32(tree);
 
         var rng = new Random(42);

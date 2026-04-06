@@ -1,5 +1,6 @@
 package org.taotree.internal.cow;
 
+import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -7,7 +8,11 @@ import java.lang.foreign.ValueLayout;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
 import org.taotree.TaoTree;
+import org.taotree.internal.alloc.ChunkStore;
 import org.taotree.internal.alloc.BumpAllocator;
 import org.taotree.internal.alloc.SlabAllocator;
 import org.taotree.internal.art.Node16;
@@ -129,11 +134,11 @@ class CompactorTest {
      * Create a Compactor wired to the given SlabAllocator and class IDs.
      */
     private static Compactor newCompactor(SlabAllocator slab, BumpAllocator bump,
-                                          EpochReclaimer reclaimer,
+                                          EpochReclaimer reclaimer, ChunkStore cs,
                                           int prefixId, int n4Id, int n16Id,
                                           int n48Id, int n256Id,
                                           int leafId) {
-        return new Compactor(slab, bump, reclaimer,
+        return new Compactor(slab, bump, reclaimer, cs,
                 prefixId, n4Id, n16Id, n48Id, n256Id,
                 KEY_LEN, KEY_SLOT_SIZE,
                 new int[]{leafId}, new int[]{VALUE_SIZE});
@@ -144,9 +149,13 @@ class CompactorTest {
     // -----------------------------------------------------------------------
 
     @Test
-    void compactEmptyTree() {
+    void compactEmptyTree() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var slab = new SlabAllocator(arena, 1 << 16);
+            Path tmp = Files.createTempFile("compactor-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var slab = new SlabAllocator(arena, cs, 1 << 16);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
             int n16Id    = slab.registerClass(NodeConstants.NODE16_SIZE);
@@ -154,10 +163,10 @@ class CompactorTest {
             int n256Id   = slab.registerClass(NodeConstants.NODE256_SIZE);
             int leafId   = slab.registerClass(LEAF_SEG_SIZE);
 
-            var bump = new BumpAllocator(arena);
+            var bump = new BumpAllocator(arena, cs, BumpAllocator.DEFAULT_PAGE_SIZE);
             var reclaimer = new EpochReclaimer(slab);
 
-            var compactor = newCompactor(slab, bump, reclaimer,
+            var compactor = newCompactor(slab, bump, reclaimer, cs,
                     prefixId, n4Id, n16Id, n48Id, n256Id, leafId);
 
             var result = compactor.compact(NodePtr.EMPTY_PTR);
@@ -168,9 +177,13 @@ class CompactorTest {
     }
 
     @Test
-    void compactSingleLeaf() {
+    void compactSingleLeaf() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var slab = new SlabAllocator(arena, 1 << 16);
+            Path tmp = Files.createTempFile("compactor-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var slab = new SlabAllocator(arena, cs, 1 << 16);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
             int n16Id    = slab.registerClass(NodeConstants.NODE16_SIZE);
@@ -178,7 +191,7 @@ class CompactorTest {
             int n256Id   = slab.registerClass(NodeConstants.NODE256_SIZE);
             int leafId   = slab.registerClass(LEAF_SEG_SIZE);
 
-            var bump = new BumpAllocator(arena);
+            var bump = new BumpAllocator(arena, cs, BumpAllocator.DEFAULT_PAGE_SIZE);
             var reclaimer = new EpochReclaimer(slab);
 
             // Build: PREFIX([0,0,0,42]) -> LEAF(key=[0,0,0,42], value=0xCAFE)
@@ -186,7 +199,7 @@ class CompactorTest {
             long leafPtr = allocLeaf(slab, leafId, key, 0xCAFEL);
             long root = wrapInPrefix(slab, prefixId, key, 0, KEY_LEN, leafPtr);
 
-            var compactor = newCompactor(slab, bump, reclaimer,
+            var compactor = newCompactor(slab, bump, reclaimer, cs,
                     prefixId, n4Id, n16Id, n48Id, n256Id, leafId);
 
             var result = compactor.compact(root);
@@ -210,9 +223,13 @@ class CompactorTest {
     }
 
     @Test
-    void compactSmallTreeWithNode4() {
+    void compactSmallTreeWithNode4() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var slab = new SlabAllocator(arena, 1 << 16);
+            Path tmp = Files.createTempFile("compactor-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var slab = new SlabAllocator(arena, cs, 1 << 16);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
             int n16Id    = slab.registerClass(NodeConstants.NODE16_SIZE);
@@ -220,7 +237,7 @@ class CompactorTest {
             int n256Id   = slab.registerClass(NodeConstants.NODE256_SIZE);
             int leafId   = slab.registerClass(LEAF_SEG_SIZE);
 
-            var bump = new BumpAllocator(arena);
+            var bump = new BumpAllocator(arena, cs, BumpAllocator.DEFAULT_PAGE_SIZE);
             var reclaimer = new EpochReclaimer(slab);
 
             // Build a tree:
@@ -243,7 +260,7 @@ class CompactorTest {
             // Wrap in prefix [0,0,0]
             long root = wrapInPrefix(slab, prefixId, new byte[]{0, 0, 0}, 0, 3, n4Ptr);
 
-            var compactor = newCompactor(slab, bump, reclaimer,
+            var compactor = newCompactor(slab, bump, reclaimer, cs,
                     prefixId, n4Id, n16Id, n48Id, n256Id, leafId);
 
             var result = compactor.compact(root);
@@ -275,9 +292,13 @@ class CompactorTest {
     }
 
     @Test
-    void compactPreservesLeafValues() {
+    void compactPreservesLeafValues() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var slab = new SlabAllocator(arena, 1 << 16);
+            Path tmp = Files.createTempFile("compactor-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var slab = new SlabAllocator(arena, cs, 1 << 16);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
             int n16Id    = slab.registerClass(NodeConstants.NODE16_SIZE);
@@ -285,7 +306,7 @@ class CompactorTest {
             int n256Id   = slab.registerClass(NodeConstants.NODE256_SIZE);
             int leafId   = slab.registerClass(LEAF_SEG_SIZE);
 
-            var bump = new BumpAllocator(arena);
+            var bump = new BumpAllocator(arena, cs, BumpAllocator.DEFAULT_PAGE_SIZE);
             var reclaimer = new EpochReclaimer(slab);
 
             // Insert 4 leaves with distinct values
@@ -306,7 +327,7 @@ class CompactorTest {
 
             long root = wrapInPrefix(slab, prefixId, new byte[]{0, 0, 0}, 0, 3, n4Ptr);
 
-            var compactor = newCompactor(slab, bump, reclaimer,
+            var compactor = newCompactor(slab, bump, reclaimer, cs,
                     prefixId, n4Id, n16Id, n48Id, n256Id, leafId);
 
             var result = compactor.compact(root);
@@ -329,9 +350,13 @@ class CompactorTest {
     }
 
     @Test
-    void compactPreservesEntryCount() {
+    void compactPreservesEntryCount() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var slab = new SlabAllocator(arena, 1 << 16);
+            Path tmp = Files.createTempFile("compactor-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var slab = new SlabAllocator(arena, cs, 1 << 16);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
             int n16Id    = slab.registerClass(NodeConstants.NODE16_SIZE);
@@ -339,7 +364,7 @@ class CompactorTest {
             int n256Id   = slab.registerClass(NodeConstants.NODE256_SIZE);
             int leafId   = slab.registerClass(LEAF_SEG_SIZE);
 
-            var bump = new BumpAllocator(arena);
+            var bump = new BumpAllocator(arena, cs, BumpAllocator.DEFAULT_PAGE_SIZE);
             var reclaimer = new EpochReclaimer(slab);
 
             // Build a deeper tree:
@@ -379,7 +404,7 @@ class CompactorTest {
 
             long root = wrapInPrefix(slab, prefixId, new byte[]{0}, 0, 1, rootN4);
 
-            var compactor = newCompactor(slab, bump, reclaimer,
+            var compactor = newCompactor(slab, bump, reclaimer, cs,
                     prefixId, n4Id, n16Id, n48Id, n256Id, leafId);
 
             var result = compactor.compact(root);
@@ -393,9 +418,13 @@ class CompactorTest {
     }
 
     @Test
-    void compactBareLeafWithoutPrefix() {
+    void compactBareLeafWithoutPrefix() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var slab = new SlabAllocator(arena, 1 << 16);
+            Path tmp = Files.createTempFile("compactor-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var slab = new SlabAllocator(arena, cs, 1 << 16);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
             int n16Id    = slab.registerClass(NodeConstants.NODE16_SIZE);
@@ -403,14 +432,14 @@ class CompactorTest {
             int n256Id   = slab.registerClass(NodeConstants.NODE256_SIZE);
             int leafId   = slab.registerClass(LEAF_SEG_SIZE);
 
-            var bump = new BumpAllocator(arena);
+            var bump = new BumpAllocator(arena, cs, BumpAllocator.DEFAULT_PAGE_SIZE);
             var reclaimer = new EpochReclaimer(slab);
 
             // A bare leaf as root (no prefix wrapping)
             byte[] key = {1, 2, 3, 4};
             long leafPtr = allocLeaf(slab, leafId, key, 0x42L);
 
-            var compactor = newCompactor(slab, bump, reclaimer,
+            var compactor = newCompactor(slab, bump, reclaimer, cs,
                     prefixId, n4Id, n16Id, n48Id, n256Id, leafId);
 
             var result = compactor.compact(leafPtr);
@@ -423,9 +452,13 @@ class CompactorTest {
     }
 
     @Test
-    void compactNode16() {
+    void compactNode16() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var slab = new SlabAllocator(arena, 1 << 16);
+            Path tmp = Files.createTempFile("compactor-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var slab = new SlabAllocator(arena, cs, 1 << 16);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
             int n16Id    = slab.registerClass(NodeConstants.NODE16_SIZE);
@@ -433,7 +466,7 @@ class CompactorTest {
             int n256Id   = slab.registerClass(NodeConstants.NODE256_SIZE);
             int leafId   = slab.registerClass(LEAF_SEG_SIZE);
 
-            var bump = new BumpAllocator(arena);
+            var bump = new BumpAllocator(arena, cs, BumpAllocator.DEFAULT_PAGE_SIZE);
             var reclaimer = new EpochReclaimer(slab);
 
             // Build a Node16 with 8 leaves
@@ -448,7 +481,7 @@ class CompactorTest {
 
             long root = wrapInPrefix(slab, prefixId, new byte[]{0, 0}, 0, 2, n16Ptr);
 
-            var compactor = newCompactor(slab, bump, reclaimer,
+            var compactor = newCompactor(slab, bump, reclaimer, cs,
                     prefixId, n4Id, n16Id, n48Id, n256Id, leafId);
 
             var result = compactor.compact(root);
@@ -465,9 +498,13 @@ class CompactorTest {
     }
 
     @Test
-    void compactNode48() {
+    void compactNode48() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var slab = new SlabAllocator(arena, 1 << 20);
+            Path tmp = Files.createTempFile("compactor-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var slab = new SlabAllocator(arena, cs, 1 << 20);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
             int n16Id    = slab.registerClass(NodeConstants.NODE16_SIZE);
@@ -475,7 +512,7 @@ class CompactorTest {
             int n256Id   = slab.registerClass(NodeConstants.NODE256_SIZE);
             int leafId   = slab.registerClass(LEAF_SEG_SIZE);
 
-            var bump = new BumpAllocator(arena);
+            var bump = new BumpAllocator(arena, cs, BumpAllocator.DEFAULT_PAGE_SIZE);
             var reclaimer = new EpochReclaimer(slab);
 
             // Build a Node48 with 20 leaves
@@ -490,7 +527,7 @@ class CompactorTest {
 
             long root = wrapInPrefix(slab, prefixId, new byte[]{0}, 0, 1, n48Ptr);
 
-            var compactor = newCompactor(slab, bump, reclaimer,
+            var compactor = newCompactor(slab, bump, reclaimer, cs,
                     prefixId, n4Id, n16Id, n48Id, n256Id, leafId);
 
             var result = compactor.compact(root);
@@ -506,9 +543,13 @@ class CompactorTest {
     }
 
     @Test
-    void compactNode256() {
+    void compactNode256() throws Exception {
         try (var arena = Arena.ofConfined()) {
-            var slab = new SlabAllocator(arena, 1 << 20);
+            Path tmp = Files.createTempFile("compactor-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var slab = new SlabAllocator(arena, cs, 1 << 20);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
             int n16Id    = slab.registerClass(NodeConstants.NODE16_SIZE);
@@ -516,7 +557,7 @@ class CompactorTest {
             int n256Id   = slab.registerClass(NodeConstants.NODE256_SIZE);
             int leafId   = slab.registerClass(LEAF_SEG_SIZE);
 
-            var bump = new BumpAllocator(arena);
+            var bump = new BumpAllocator(arena, cs, BumpAllocator.DEFAULT_PAGE_SIZE);
             var reclaimer = new EpochReclaimer(slab);
 
             // Build a Node256 with 64 leaves
@@ -531,7 +572,7 @@ class CompactorTest {
 
             long root = wrapInPrefix(slab, prefixId, new byte[]{}, 0, 0, n256Ptr);
 
-            var compactor = newCompactor(slab, bump, reclaimer,
+            var compactor = newCompactor(slab, bump, reclaimer, cs,
                     prefixId, n4Id, n16Id, n48Id, n256Id, leafId);
 
             var result = compactor.compact(root);

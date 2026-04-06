@@ -22,6 +22,7 @@ class MappedTaoTreeTest {
     private static final int VALUE_SIZE = 8;
 
     @TempDir Path tmp;
+    private int fc;
 
     private byte[] intKey(int value) {
         byte[] key = new byte[KEY_LEN];
@@ -36,7 +37,6 @@ class MappedTaoTreeTest {
     void createAndLookup() throws IOException {
         Path file = tmp.resolve("test.tao");
         try (var tree = TaoTree.create(file, KEY_LEN, VALUE_SIZE)) {
-            assertTrue(tree.isFileBacked());
 
             try (var w = tree.write()) {
                 long leaf = w.getOrCreate(intKey(1));
@@ -72,7 +72,6 @@ class MappedTaoTreeTest {
 
         // Phase 2: reopen and verify all data is intact
         try (var tree = TaoTree.open(file)) {
-            assertTrue(tree.isFileBacked());
 
             try (var r = tree.read()) {
                 assertEquals(100, r.size());
@@ -200,7 +199,6 @@ class MappedTaoTreeTest {
     void createWithMultipleLeafClasses() throws IOException {
         Path file = tmp.resolve("multi.tao");
         try (var tree = TaoTree.create(file, KEY_LEN, new int[]{8, 16, 24})) {
-            assertTrue(tree.isFileBacked());
             try (var w = tree.write()) {
                 long l0 = w.getOrCreate(intKey(1), 0);
                 long l1 = w.getOrCreate(intKey(2), 1);
@@ -225,7 +223,7 @@ class MappedTaoTreeTest {
     // ---- File-backed: create parameter validation ----
 
     @Test
-    void createRejectsInvalidKeyLen() {
+    void createRejectsInvalidKeyLen() throws IOException {
         Path file = tmp.resolve("bad.tao");
         assertThrows(IllegalArgumentException.class,
             () -> TaoTree.create(file, 0, VALUE_SIZE));
@@ -234,7 +232,7 @@ class MappedTaoTreeTest {
     }
 
     @Test
-    void createMultiLeafRejectsInvalidArgs() {
+    void createMultiLeafRejectsInvalidArgs() throws IOException {
         Path file = tmp.resolve("bad.tao");
         assertThrows(IllegalArgumentException.class,
             () -> TaoTree.create(file, 0, new int[]{8}));
@@ -388,7 +386,6 @@ class MappedTaoTreeTest {
         }
 
         try (var tree = TaoTree.open(file)) {
-            assertTrue(tree.isFileBacked());
             assertEquals(KEY_LEN, tree.keyLen());
             try (var r = tree.read()) {
                 assertEquals(100, r.size());
@@ -396,13 +393,12 @@ class MappedTaoTreeTest {
         }
     }
 
-    // ---- File-backed: sync is no-op for in-memory trees ----
+    // ---- File-backed: sync on empty tree ----
 
     @Test
-    void syncNoOpForInMemoryTree() throws IOException {
-        try (var tree = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
-            assertFalse(tree.isFileBacked());
-            // sync should be a no-op, not throw
+    void syncOnEmptyTree() throws IOException {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
+            // sync on empty tree should not throw
             tree.sync();
         }
     }

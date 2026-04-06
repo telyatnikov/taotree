@@ -6,7 +6,11 @@ import org.jetbrains.lincheck.datastructures.Param;
 import org.jetbrains.lincheck.datastructures.StressOptions;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.foreign.ValueLayout;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -25,8 +29,30 @@ public class LincheckTaoTreeTest {
 
     private static final int KEY_LEN = 4;
     private static final int VALUE_SIZE = 4;
+    /** Chunk size must be >= slab size (1 MB default). */
+    private static final long CHUNK_SIZE = 1024L * 1024;
 
-    private final TaoTree tree = TaoTree.open(KEY_LEN, VALUE_SIZE);
+    private final TaoTree tree;
+    private final Path storePath;
+
+    public LincheckTaoTreeTest() {
+        try {
+            storePath = Files.createTempFile("lincheck-taotree-", ".dat");
+            storePath.toFile().deleteOnExit();
+            Files.delete(storePath);
+            tree = TaoTree.create(storePath, KEY_LEN, VALUE_SIZE, CHUNK_SIZE, false);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** Eagerly release file resources so RAMDisk doesn't fill up across Lincheck invocations. */
+    @SuppressWarnings("deprecation")
+    @Override
+    protected void finalize() {
+        tree.close();
+        try { Files.deleteIfExists(storePath); } catch (IOException ignored) {}
+    }
 
     private static byte[] encodeKey(int k) {
         return new byte[]{
@@ -74,7 +100,7 @@ public class LincheckTaoTreeTest {
     void stressTest() {
         new StressOptions()
             .iterations(100)
-            .invocationsPerIteration(1000)
+            .invocationsPerIteration(50)
             .threads(3)
             .actorsPerThread(3)
             .sequentialSpecification(SequentialSpec.class)

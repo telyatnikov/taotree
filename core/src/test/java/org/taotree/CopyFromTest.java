@@ -18,6 +18,7 @@ class CopyFromTest {
     private static final int VALUE_SIZE = 8;
 
     @TempDir Path tmp;
+    private int fc;
 
     private byte[] intKey(int value) {
         byte[] key = new byte[KEY_LEN];
@@ -35,9 +36,9 @@ class CopyFromTest {
     // ---- Basic copy ----
 
     @Test
-    void copyEmptySource() {
-        try (var src = TaoTree.open(KEY_LEN, VALUE_SIZE);
-             var tgt = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
+    void copyEmptySource() throws IOException {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE);
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
             tgt.copyFrom(src);
             try (var r = tgt.read()) {
                 assertEquals(0, r.size());
@@ -46,9 +47,9 @@ class CopyFromTest {
     }
 
     @Test
-    void copyBasic() {
-        try (var src = TaoTree.open(KEY_LEN, VALUE_SIZE);
-             var tgt = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
+    void copyBasic() throws IOException {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE);
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             try (var w = src.write()) {
                 for (int i = 0; i < 100; i++) {
@@ -73,9 +74,9 @@ class CopyFromTest {
     // ---- Copy-vacuum: insert, delete, copy only live entries ----
 
     @Test
-    void copyVacuum() {
-        try (var src = TaoTree.open(KEY_LEN, VALUE_SIZE);
-             var tgt = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
+    void copyVacuum() throws IOException {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE);
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Insert 1000, delete 900
             try (var w = src.write()) {
@@ -114,9 +115,9 @@ class CopyFromTest {
     // ---- Overflow (TaoString) copy ----
 
     @Test
-    void copyWithOverflow() {
-        try (var src = TaoTree.open(KEY_LEN, TaoString.SIZE);
-             var tgt = TaoTree.open(KEY_LEN, TaoString.SIZE)) {
+    void copyWithOverflow() throws IOException {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, TaoString.SIZE);
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, TaoString.SIZE)) {
 
             tgt.registerStringLayout(0, TaoString.STRING_LAYOUT);
 
@@ -148,9 +149,9 @@ class CopyFromTest {
     }
 
     @Test
-    void copyVacuumWithOverflow() {
-        try (var src = TaoTree.open(KEY_LEN, TaoString.SIZE);
-             var tgt = TaoTree.open(KEY_LEN, TaoString.SIZE)) {
+    void copyVacuumWithOverflow() throws IOException {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, TaoString.SIZE);
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, TaoString.SIZE)) {
 
             tgt.registerStringLayout(0, TaoString.STRING_LAYOUT);
 
@@ -223,9 +224,9 @@ class CopyFromTest {
     // ---- Large copy ----
 
     @Test
-    void copyLarge() {
-        try (var src = TaoTree.open(KEY_LEN, VALUE_SIZE);
-             var tgt = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
+    void copyLarge() throws IOException {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE);
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             try (var w = src.write()) {
                 for (int i = 0; i < 10_000; i++) {
@@ -251,9 +252,9 @@ class CopyFromTest {
     // ---- Key length mismatch ----
 
     @Test
-    void keyLengthMismatchThrows() {
-        try (var src = TaoTree.open(4, VALUE_SIZE);
-             var tgt = TaoTree.open(8, VALUE_SIZE)) {
+    void keyLengthMismatchThrows() throws IOException {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, VALUE_SIZE);
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), 8, VALUE_SIZE)) {
             try (var w = tgt.write()) {
                 assertThrows(IllegalArgumentException.class, () -> tgt.copyFrom(src));
             }
@@ -261,9 +262,9 @@ class CopyFromTest {
     }
 
     @Test
-    void leafClassCountMismatchThrows() {
-        try (var src = TaoTree.open(KEY_LEN, new int[]{8});
-             var tgt = TaoTree.open(KEY_LEN, new int[]{8, 16})) {
+    void leafClassCountMismatchThrows() throws IOException {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, new int[]{8});
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, new int[]{8, 16})) {
             try (var w = tgt.write()) {
                 assertThrows(IllegalArgumentException.class, () -> tgt.copyFrom(src));
             }
@@ -271,9 +272,9 @@ class CopyFromTest {
     }
 
     @Test
-    void leafValueSizeMismatchThrows() {
-        try (var src = TaoTree.open(KEY_LEN, new int[]{8});
-             var tgt = TaoTree.open(KEY_LEN, new int[]{16})) {
+    void leafValueSizeMismatchThrows() throws IOException {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, new int[]{8});
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, new int[]{16})) {
             try (var w = tgt.write()) {
                 assertThrows(IllegalArgumentException.class, () -> tgt.copyFrom(src));
             }
@@ -281,9 +282,9 @@ class CopyFromTest {
     }
 
     @Test
-    void copyFromSelfLocking() {
-        try (var src = TaoTree.open(KEY_LEN, VALUE_SIZE);
-             var tgt = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
+    void copyFromSelfLocking() throws IOException {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE);
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
             // copyFrom acquires its own lock — no need for external write scope
             tgt.copyFrom(src); // empty → empty, should not throw
         }
@@ -292,9 +293,9 @@ class CopyFromTest {
     // ---- Copy into non-empty target (merge) ----
 
     @Test
-    void copyIntoNonEmptyTarget() {
-        try (var src = TaoTree.open(KEY_LEN, VALUE_SIZE);
-             var tgt = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
+    void copyIntoNonEmptyTarget() throws IOException {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE);
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Target has keys 0-49
             try (var w = tgt.write()) {
@@ -334,9 +335,9 @@ class CopyFromTest {
     // ---- Dictionary copy ----
 
     @Test
-    void copyWithDictionaries() {
-        try (var src = TaoTree.open(KEY_LEN, VALUE_SIZE);
-             var tgt = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
+    void copyWithDictionaries() throws IOException {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE);
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             // Source: data + dictionary
             var srcDict = TaoDictionary.u16(src);
@@ -431,9 +432,9 @@ class CopyFromTest {
     // ---- Scope-based copyFrom ----
 
     @Test
-    void scopeBasedCopyFrom() {
-        try (var src = TaoTree.open(KEY_LEN, VALUE_SIZE);
-             var tgt = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
+    void scopeBasedCopyFrom() throws IOException {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE);
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             try (var w = src.write()) {
                 for (int i = 0; i < 50; i++) {
@@ -461,10 +462,10 @@ class CopyFromTest {
     // ---- Leaf class conflict detection ----
 
     @Test
-    void leafClassConflictThrows() {
+    void leafClassConflictThrows() throws IOException {
         // Source and target both have 2 leaf classes with same sizes
-        try (var src = TaoTree.open(KEY_LEN, new int[]{8, 16});
-             var tgt = TaoTree.open(KEY_LEN, new int[]{8, 16})) {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, new int[]{8, 16});
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, new int[]{8, 16})) {
 
             // Target has key 1 in class 1 (16-byte value)
             try (var w = tgt.write()) {
@@ -488,9 +489,9 @@ class CopyFromTest {
     // ---- Dict copyFrom guards ----
 
     @Test
-    void dictCopyFromNonEmptyTargetThrows() {
-        try (var src = TaoTree.open(KEY_LEN, VALUE_SIZE);
-             var tgt = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
+    void dictCopyFromNonEmptyTargetThrows() throws IOException {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE);
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             var srcDict = TaoDictionary.u16(src);
             srcDict.intern("A");
@@ -505,9 +506,9 @@ class CopyFromTest {
     }
 
     @Test
-    void dictCopyFromMaxCodeMismatchThrows() {
-        try (var src = TaoTree.open(KEY_LEN, VALUE_SIZE);
-             var tgt = TaoTree.open(KEY_LEN, VALUE_SIZE)) {
+    void dictCopyFromMaxCodeMismatchThrows() throws IOException {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE);
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), KEY_LEN, VALUE_SIZE)) {
 
             var srcDict = TaoDictionary.u32(src); // maxCode = Integer.MAX_VALUE
             var tgtDict = TaoDictionary.u16(tgt); // maxCode = 0xFFFF

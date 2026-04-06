@@ -3,7 +3,10 @@ package org.taotree.jmh;
 import org.openjdk.jmh.annotations.*;
 import org.taotree.*;
 
+import java.io.IOException;
 import java.lang.foreign.ValueLayout;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
@@ -29,8 +32,11 @@ public class TaoTreeBenchmark {
     private int lookupIndex;
 
     @Setup(Level.Trial)
-    public void setup() {
-        tree = TaoTree.open(KEY_LEN, VALUE_SIZE, 4 * 1024 * 1024);
+    public void setup() throws IOException {
+        Path tmp = Files.createTempFile("jmh-taotree-", ".dat");
+        tmp.toFile().deleteOnExit();
+        Files.delete(tmp);
+        tree = TaoTree.create(tmp, KEY_LEN, VALUE_SIZE, 4L * 1024 * 1024, false);
 
         var rng = new Random(42);
         keys = new byte[keyCount][KEY_LEN];
