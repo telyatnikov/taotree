@@ -34,7 +34,6 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.taotree.layout.KeyBuilder;
 import org.taotree.layout.KeyField;
@@ -123,25 +122,32 @@ public final class TaoTree implements AutoCloseable {
     long size = 0; // package-private for TaoDictionary
 
     // -- COW infrastructure --
-    // Volatile root pointer for lock-free dictionary resolve via VarHandle.
-    // Writers update root (non-volatile) during mutations, then publish to
-    // rootPtr via setRelease in commitWrite(). Dict resolvers read rootPtr
-    // via getAcquire in lookupLockFree().
-    @SuppressWarnings("unused") // accessed via ROOT_HANDLE VarHandle
-    private volatile long rootPtr = NodePtr.EMPTY_PTR;
+    // Immutable published state: root pointer + entry count, captured atomically
+    // by readers via a single VarHandle.getAcquire. Writers build a successor
+    // PublicationState and publish via VarHandle.setRelease in commitWrite().
+    // This single-reference publication replaces the old separate rootPtr + atomicSize,
+    // ensuring root and size are always consistent for readers.
+    @SuppressWarnings("unused") // accessed via PUB_HANDLE VarHandle
+    private volatile PublicationState published = PublicationState.EMPTY;
 
-    private static final VarHandle ROOT_HANDLE;
+    private static final VarHandle PUB_HANDLE;
     static {
         try {
-            ROOT_HANDLE = MethodHandles.lookup()
-                .findVarHandle(TaoTree.class, "rootPtr", long.class);
+            PUB_HANDLE = MethodHandles.lookup()
+                .findVarHandle(TaoTree.class, "published", PublicationState.class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
     }
 
-    // Atomic size counter for lock-free dictionary size queries
-    private final AtomicLong atomicSize = new AtomicLong(0);
+    /**
+     * Immutable snapshot of the published tree state. One acquire on the
+     * {@link #PUB_HANDLE} transitively covers all nodes reachable from the root.
+     * This is the atomic unit for Phase 7 CAS-based concurrent writer publication.
+     */
+    record PublicationState(long root, long size) {
+        static final PublicationState EMPTY = new PublicationState(NodePtr.EMPTY_PTR, 0);
+    }
 
     // Epoch-based reclaimer: deferred node freeing after COW path-copy
     private EpochReclaimer reclaimer;
@@ -926,8 +932,7 @@ public final class TaoTree implements AutoCloseable {
         this.cowEngine = new CowEngine(slab, reclaimer, writerArena, chunkStore,
             prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
             keyLen, keySlotSize, leafClassIds);
-        ROOT_HANDLE.setRelease(this, root);
-        atomicSize.set(size);
+        PUB_HANDLE.setRelease(this, new PublicationState(root, size));
     }
 
     // -----------------------------------------------------------------------
@@ -964,9 +969,8 @@ public final class TaoTree implements AutoCloseable {
 
         this.root = desc.root;
         this.size = desc.size;
-        // Publish root for dict resolve (lock-free via rootPtr acquire)
-        ROOT_HANDLE.setRelease(this, root);
-        atomicSize.set(size);
+        // Publish root for dict resolve (lock-free via published state acquire)
+        PUB_HANDLE.setRelease(this, new PublicationState(root, size));
     }
 
     // -----------------------------------------------------------------------
@@ -976,10 +980,14 @@ public final class TaoTree implements AutoCloseable {
     /** Returns the epoch reclaimer. */
     EpochReclaimer reclaimer() { return reclaimer; }
 
-    /** Package-private: publish root and size for dict resolvers (via rootPtr/atomicSize). */
+    /** Package-private: publish root and size as an atomic PublicationState. */
     void publishRoot() {
-        ROOT_HANDLE.setRelease(this, root);
-        atomicSize.set(size);
+        PUB_HANDLE.setRelease(this, new PublicationState(root, size));
+    }
+
+    /** Package-private: read the current published state (lock-free). */
+    PublicationState publishedState() {
+        return (PublicationState) PUB_HANDLE.getAcquire(this);
     }
 
     // -----------------------------------------------------------------------
@@ -987,11 +995,11 @@ public final class TaoTree implements AutoCloseable {
     // -----------------------------------------------------------------------
 
     /**
-     * Lock-free point lookup. Uses one acquire on the root pointer, then
+     * Lock-free point lookup. Uses one acquire on the published state, then
      * plain loads for the entire traversal.
      */
     long lookupLockFree(MemorySegment key, int keyLen) {
-        long node = (long) ROOT_HANDLE.getAcquire(this);
+        long node = publishedState().root();
         int depth = 0;
 
         while (!NodePtr.isEmpty(node)) {
@@ -1318,11 +1326,14 @@ public final class TaoTree implements AutoCloseable {
         private boolean closed;
         private final Thread ownerThread = Thread.currentThread();
         private final long snapshotRoot;
+        private final long snapshotSize;
         private final int epochSlot;
 
         private ReadScope() {
             this.epochSlot = reclaimer.enterEpoch();
-            this.snapshotRoot = (long) ROOT_HANDLE.getAcquire(TaoTree.this);
+            var pub = (PublicationState) PUB_HANDLE.getAcquire(TaoTree.this);
+            this.snapshotRoot = pub.root();
+            this.snapshotSize = pub.size();
         }
 
         /**
@@ -1360,11 +1371,11 @@ public final class TaoTree implements AutoCloseable {
 
         public long size() {
             checkAccess();
-            return atomicSize.get();
+            return snapshotSize;
         }
         public boolean isEmpty() {
             checkAccess();
-            return atomicSize.get() == 0;
+            return snapshotSize == 0;
         }
 
         /**

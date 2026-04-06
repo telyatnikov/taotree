@@ -148,7 +148,7 @@ public final class TaoDictionary {
 
     /** Number of entries (lock-free). */
     public int size() {
-        return (int) tree.size;
+        return (int) tree.publishedState().size();
     }
 
     /** The next code that will be assigned (lock-free). */
@@ -166,7 +166,7 @@ public final class TaoDictionary {
         public int resolve(String value) { return resolveImpl(value); }
 
         /** Number of entries. */
-        public int size() { return (int) tree.size; }
+        public int size() { return (int) tree.publishedState().size(); }
 
         @Override
         public void close() { /* lock-free — nothing to release */ }
@@ -185,7 +185,7 @@ public final class TaoDictionary {
         public int resolve(String value) { return resolveImpl(value); }
 
         /** Number of entries. */
-        public int size() { return (int) tree.size; }
+        public int size() { return (int) tree.publishedState().size(); }
 
         @Override
         public void close() {
@@ -267,7 +267,7 @@ public final class TaoDictionary {
 
     private int resolveImpl(String value) {
         byte[] padded = encodeAndPad(value);
-        // Lock-free lookup via acquire on rootPtr
+        // Lock-free lookup via acquire on published state
         long leafRef = tree.lookupLockFree(MemorySegment.ofArray(padded), MAX_KEY_LEN);
         if (NodePtr.isEmpty(leafRef)) return -1;
         return tree.leafValueImpl(leafRef).get(ValueLayout.JAVA_INT_UNALIGNED, 0);
