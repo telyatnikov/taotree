@@ -7,6 +7,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.BitSet;
 import org.taotree.internal.persist.Superblock;
 
 /**
@@ -50,6 +51,9 @@ public final class ChunkStore implements AutoCloseable {
     private int chunkCount;           // number of mapped chunks
     private int totalPages;           // total committed pages (file size = totalPages × PAGE_SIZE)
     private int nextPage;             // next page to allocate (bump pointer)
+
+    // Dirty tracking: which chunks have been written to since the last syncDirty()
+    private final BitSet dirtyChunks = new BitSet();
 
     // -----------------------------------------------------------------------
     // Construction
@@ -189,6 +193,10 @@ public final class ChunkStore implements AutoCloseable {
         }
 
         nextPage = endPage;
+
+        // Mark the containing chunk as dirty
+        dirtyChunks.set(startPage / pagesPerChunk);
+
         return startPage;
     }
 
@@ -263,6 +271,41 @@ public final class ChunkStore implements AutoCloseable {
     // -----------------------------------------------------------------------
 
     /**
+     * Mark the chunk containing the given page as dirty.
+     *
+     * <p>Callers should use this when writing to pages that were allocated in a
+     * previous sync cycle (e.g., checkpoint slot pages, pre-reserved commit pages).
+     * Pages allocated via {@link #allocPages} are marked dirty automatically.
+     *
+     * @param page the global page number of any page within the chunk to mark
+     */
+    public void markDirty(int page) {
+        dirtyChunks.set(page / pagesPerChunk);
+    }
+
+    /**
+     * Force only the chunks that have been written to since the last
+     * {@code syncDirty()} call, then flush the file channel and clear the
+     * dirty set.
+     *
+     * <p>For a 10 GB file with 160 chunks, a typical write scope only dirties
+     * 1-2 chunks, reducing the number of {@code force()} calls from 160 to 2.
+     *
+     * <p>Use {@link #sync()} when all chunks must be forced (e.g., after
+     * compaction or before close).
+     */
+    public void syncDirty() throws IOException {
+        for (int i = dirtyChunks.nextSetBit(0); i >= 0; i = dirtyChunks.nextSetBit(i + 1)) {
+            if (i < chunkCount) {
+                chunks[i].force();
+            }
+        }
+        dirtyChunks.clear();
+        channel.force(true);
+        Preallocator.fullSync(path);
+    }
+
+    /**
      * Force all mapped chunks to disk.
      * On macOS, also uses {@code F_FULLFSYNC} for hardware cache flush.
      */
@@ -270,6 +313,7 @@ public final class ChunkStore implements AutoCloseable {
         for (int i = 0; i < chunkCount; i++) {
             chunks[i].force();
         }
+        dirtyChunks.clear();
         channel.force(true);
         // On macOS, channel.force() uses fsync which may not flush the drive's write cache.
         // F_FULLFSYNC ensures the drive actually writes to persistent media.
@@ -301,6 +345,9 @@ public final class ChunkStore implements AutoCloseable {
 
     /** Number of mapped chunks. */
     public int chunkCount() { return chunkCount; }
+
+    /** Number of chunks currently marked dirty. */
+    public int dirtyChunkCount() { return dirtyChunks.cardinality(); }
 
     /** The file path. */
     public Path path() { return path; }

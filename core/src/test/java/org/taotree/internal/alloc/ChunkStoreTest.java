@@ -303,4 +303,141 @@ class ChunkStoreTest {
             assertEquals(0xCAFEBABEL, seg.get(ValueLayout.JAVA_LONG, 8));
         }
     }
+
+    // ---- Dirty chunk tracking ----
+
+    @Test
+    void allocPagesDirtiesContainingChunk() throws Exception {
+        Path file = tmp.resolve("dirty_track.tao");
+        long smallChunk = 512L * ChunkStore.PAGE_SIZE; // 2 MB chunks
+        try (var arena = Arena.ofConfined();
+             var store = ChunkStore.create(file, arena, smallChunk, false)) {
+
+            // After create, chunk 0 is mapped (for the superblock) and pages were
+            // allocated internally — chunk 0 is dirty from the initial growFile.
+            // But only allocPages() marks dirty, and create() calls growFile()
+            // then sets nextPage directly (no allocPages()). So dirtyChunkCount
+            // starts at 0.
+            assertEquals(0, store.dirtyChunkCount());
+
+            // Allocate pages in chunk 0
+            store.allocPages(4);
+            assertEquals(1, store.dirtyChunkCount());
+
+            // Allocate more in chunk 0 — still 1 dirty chunk
+            store.allocPages(4);
+            assertEquals(1, store.dirtyChunkCount());
+
+            // syncDirty clears the dirty set
+            store.syncDirty();
+            assertEquals(0, store.dirtyChunkCount());
+
+            // Allocate again — re-dirties chunk 0
+            store.allocPages(4);
+            assertEquals(1, store.dirtyChunkCount());
+        }
+    }
+
+    @Test
+    void allocAcrossChunksDirtiesMultiple() throws Exception {
+        Path file = tmp.resolve("dirty_multi.tao");
+        long smallChunk = 8L * ChunkStore.PAGE_SIZE; // 8 pages per chunk (32 KB)
+        try (var arena = Arena.ofConfined();
+             var store = ChunkStore.create(file, arena, smallChunk, false)) {
+
+            // Chunk 0: pages 0-7. Pages 0-1 are superblock. Available: 2-7 = 6 pages.
+            store.allocPages(2); // pages 2-3 in chunk 0
+            assertEquals(1, store.dirtyChunkCount());
+
+            store.allocPages(2); // pages 4-5 in chunk 0
+            assertEquals(1, store.dirtyChunkCount()); // still chunk 0
+
+            // Next alloc of 4 pages won't fit in chunk 0 (only 2 pages left) → chunk 1
+            store.allocPages(4); // skips to chunk 1 (page 8)
+            assertEquals(2, store.dirtyChunkCount()); // chunks 0 and 1
+
+            // Another alloc in chunk 1
+            store.allocPages(4); // pages 12-15 in chunk 1? No, 8+4=12, then 12+4=16 which is chunk 2
+            // Actually: chunk 1 has pages 8-15, we allocated 8-11, now 12-15
+            assertEquals(2, store.dirtyChunkCount()); // still chunks 0 and 1
+
+            // Force into chunk 2
+            store.allocPages(4); // pages 16-19 in chunk 2
+            assertEquals(3, store.dirtyChunkCount());
+
+            // syncDirty clears all
+            store.syncDirty();
+            assertEquals(0, store.dirtyChunkCount());
+        }
+    }
+
+    @Test
+    void markDirtyExplicitly() throws Exception {
+        Path file = tmp.resolve("dirty_mark.tao");
+        long smallChunk = 512L * ChunkStore.PAGE_SIZE;
+        try (var arena = Arena.ofConfined();
+             var store = ChunkStore.create(file, arena, smallChunk, false)) {
+
+            // No dirty chunks initially
+            assertEquals(0, store.dirtyChunkCount());
+
+            // Explicitly mark page 0 (checkpoint slot) dirty
+            store.markDirty(0);
+            assertEquals(1, store.dirtyChunkCount());
+
+            // Mark same chunk again — no change
+            store.markDirty(1);
+            assertEquals(1, store.dirtyChunkCount());
+
+            // syncDirty clears
+            store.syncDirty();
+            assertEquals(0, store.dirtyChunkCount());
+
+            // Mark again after sync
+            store.markDirty(0);
+            assertEquals(1, store.dirtyChunkCount());
+        }
+    }
+
+    @Test
+    void syncDirtyAndReopenData() throws Exception {
+        Path file = tmp.resolve("sync_dirty.tao");
+        long chunk = 64L * ChunkStore.PAGE_SIZE;
+        int startPage;
+        int totalPages;
+        int nextPage;
+
+        try (var arena = Arena.ofConfined();
+             var store = ChunkStore.create(file, arena, chunk, false)) {
+            startPage = store.allocPages(4);
+            var seg = store.resolvePage(startPage);
+            seg.set(ValueLayout.JAVA_LONG, 0, 0xDEADBEEFL);
+            seg.set(ValueLayout.JAVA_LONG, 8, 0xCAFEBABEL);
+            totalPages = store.totalPages();
+            nextPage = store.nextPage();
+            // Use syncDirty instead of sync
+            store.syncDirty();
+        }
+
+        try (var arena = Arena.ofConfined();
+             var store = ChunkStore.open(file, arena, chunk, totalPages, nextPage)) {
+            var seg = store.resolvePage(startPage);
+            assertEquals(0xDEADBEEFL, seg.get(ValueLayout.JAVA_LONG, 0));
+            assertEquals(0xCAFEBABEL, seg.get(ValueLayout.JAVA_LONG, 8));
+        }
+    }
+
+    @Test
+    void fullSyncClearsDirtySet() throws Exception {
+        Path file = tmp.resolve("full_sync.tao");
+        try (var arena = Arena.ofConfined();
+             var store = ChunkStore.create(file, arena)) {
+            store.allocPages(4);
+            assertEquals(1, store.dirtyChunkCount());
+
+            // Full sync also clears the dirty set
+            store.sync();
+            assertEquals(0, store.dirtyChunkCount());
+        }
+    }
 }

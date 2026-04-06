@@ -60,6 +60,8 @@ public final class PersistenceManager {
         generation++;
 
         var cpData = CheckpointIO.toCheckpoint(metadata, generation, targetSlotId);
+        // Checkpoint slot pages may have been synced in a previous cycle — re-mark dirty
+        chunkStore.markDirty(targetSlotPage);
         MemorySegment slot = chunkStore.resolve(targetSlotPage, CheckpointV2.SLOT_SIZE_PAGES);
         slot.fill((byte) 0);
         CheckpointV2.write(slot, cpData);
@@ -88,6 +90,9 @@ public final class PersistenceManager {
         commitData.arenaStartPage = nextCommitPage;
         commitData.arenaEndPage = chunkStore.nextPage();
 
+        // The commit page was allocated (and dirtied) by a previous reserveNextCommitPage(),
+        // but its chunk may have been cleaned by syncDirty() since then — re-mark dirty.
+        chunkStore.markDirty(nextCommitPage);
         MemorySegment page = chunkStore.resolvePage(nextCommitPage);
         CommitRecord.write(page, commitData);
 

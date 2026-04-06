@@ -1109,10 +1109,11 @@ public final class TaoTree implements AutoCloseable {
     /**
      * Flush all data to disk (file-backed mode only).
      *
-     * <p>Writes a lightweight commit record (one page) and forces all mapped
-     * regions. Every {@value #COMMITS_PER_CHECKPOINT} commits, also writes a
-     * full mirrored checkpoint to bound recovery time and advances
-     * {@code durableGeneration} for epoch reclamation. No-op for in-memory trees.
+     * <p>Writes a lightweight commit record (one page) and forces only the
+     * chunks that have been written to since the last sync. Every
+     * {@value #COMMITS_PER_CHECKPOINT} commits, also writes a full mirrored
+     * checkpoint to bound recovery time and advances {@code durableGeneration}
+     * for epoch reclamation. No-op for in-memory trees.
      *
      * @throws IOException if an I/O error occurs during sync
      */
@@ -1124,13 +1125,13 @@ public final class TaoTree implements AutoCloseable {
             if (persistence.shouldCheckpoint()) {
                 persistence.writeCheckpoint(gatherMetadata());
                 persistence.resetCommitCount();
-                chunkStore.sync();
+                chunkStore.syncDirty();
                 if (reclaimer != null) {
                     reclaimer.advanceDurableGeneration(persistence.generation());
                     reclaimer.reclaim();
                 }
             } else {
-                chunkStore.sync();
+                chunkStore.syncDirty();
             }
         } finally {
             lock.writeLock().unlock();
