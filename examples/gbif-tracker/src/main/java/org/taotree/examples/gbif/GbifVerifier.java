@@ -67,6 +67,12 @@ public class GbifVerifier {
                     int indCnt, int taxonKey, int speciesKey,
                     String locality, String recordedBy, String extras) {}
 
+    /** Result of a verification run. */
+    record VerifyResult(long treeEntries, long expectedEntries, int checked,
+                        int missing, int fieldErrors, List<String> errors) {
+        boolean passed() { return treeEntries == expectedEntries && missing == 0 && fieldErrors == 0; }
+    }
+
     public static void main(String[] args) throws Exception {
         if (args.length == 0) { System.out.println("Usage: GbifVerifier <parquet-dir>"); return; }
 
@@ -87,8 +93,37 @@ public class GbifVerifier {
         System.out.println("=== Independent Verification ===");
         System.out.println("Store:   " + storePath);
         System.out.println("Sources: " + files.length + " parquet files");
-        System.out.println("NOTE: uses independent parsing — does NOT reuse GbifTracker helpers");
         System.out.println();
+
+        var result = verify(storePath, files);
+
+        System.out.println();
+        System.out.println("=== Results ===");
+        System.out.printf("  Tree entries:     %,d%n", result.treeEntries);
+        System.out.printf("  Expected entries: %,d  %s%n", result.expectedEntries,
+            result.treeEntries == result.expectedEntries ? "OK" : "MISMATCH!");
+        System.out.printf("  Entries checked:  %,d%n", result.checked);
+        System.out.printf("  Missing:          %d%n", result.missing);
+        System.out.printf("  Field mismatches: %d%n", result.fieldErrors);
+        if (!result.errors.isEmpty()) {
+            System.out.println();
+            result.errors.stream().limit(20).forEach(e -> System.out.println("    " + e));
+        }
+        System.out.println();
+        System.out.println(result.passed()
+            ? "RESULT: ALL FIELDS MATCH (independent verification)"
+            : "RESULT: MISMATCHES FOUND");
+    }
+
+    /**
+     * Verify a store against Parquet source files.
+     * Uses independent parsing (not GbifTracker helpers) to detect bugs.
+     *
+     * @param storePath path to the .taotree file
+     * @param files     the Parquet source files
+     * @return verification result
+     */
+    static VerifyResult verify(Path storePath, File[] files) throws Exception {
 
         // Phase 1: Build expected state with INDEPENDENT parsing
         System.out.println("Phase 1: Reading Parquet with independent parser...");
@@ -230,25 +265,10 @@ public class GbifVerifier {
                 }
             }
 
-            System.out.println();
-            System.out.println("=== Results ===");
-            System.out.printf("  Tree entries:     %,d%n", treeEntries);
-            System.out.printf("  Expected entries: %,d  %s%n", expected.size(),
-                treeEntries == expected.size() ? "OK" : "MISMATCH!");
-            System.out.printf("  Entries checked:  %,d%n", checked);
-            System.out.printf("  Missing:          %d%n", missing);
-            System.out.printf("  Field mismatches: %d%n", fieldErrors);
-            System.out.printf("  Fields compared:  all 13 (count, year, month, day, lat, lon,%n");
-            System.out.printf("                    elevation, individualCount, taxonKey,%n");
-            System.out.printf("                    speciesKey, locality, recordedBy, extras)%n");
-            if (!errors.isEmpty()) {
-                System.out.println();
-                errors.stream().limit(20).forEach(e -> System.out.println("    " + e));
-            }
-            System.out.println();
-            System.out.println(treeEntries == expected.size() && missing == 0 && fieldErrors == 0
-                ? "RESULT: ALL FIELDS MATCH (independent verification)"
-                : "RESULT: MISMATCHES FOUND");
+            System.out.printf("  Checked: %,d  Missing: %d  Field errors: %d%n",
+                checked, missing, fieldErrors);
+
+            return new VerifyResult(treeEntries, expected.size(), checked, missing, fieldErrors, errors);
         }
     }
 

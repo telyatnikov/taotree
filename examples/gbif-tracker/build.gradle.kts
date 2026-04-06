@@ -14,3 +14,12 @@ application {
     mainClass = "org.taotree.examples.gbif.GbifTracker"
     applicationDefaultJvmArgs = listOf("-Xmx2g")
 }
+
+tasks.register<JavaExec>("bench") {
+    description = "Run GBIF ingestion benchmark (multi-thread comparison)"
+    group = "application"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass = "org.taotree.examples.gbif.GbifBenchmark"
+    jvmArgs = listOf("-Xmx4g", "--enable-native-access=ALL-UNNAMED")
+    workingDir = rootProject.projectDir
+}

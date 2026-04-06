@@ -11,7 +11,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import org.taotree.TaoTree;
+import org.taotree.layout.KeyBuilder;
 import org.taotree.layout.KeyField;
+import org.taotree.layout.KeyHandle;
 import org.taotree.layout.KeyLayout;
 import org.taotree.layout.LeafField;
 import org.taotree.layout.LeafHandle;
@@ -75,6 +77,106 @@ public class GbifTracker {
     static final LeafHandle.Str     RECORDED  = LEAF_LAYOUT.string("recordedBy");
     static final LeafHandle.Json    EXTRAS    = LEAF_LAYOUT.json("extras");
 
+    // -----------------------------------------------------------------------
+    // Reusable key-handle bundle (bound to a specific tree)
+    // -----------------------------------------------------------------------
+
+    /** Key handles bound to a tree instance. Thread-safe (immutable after construction). */
+    record KeyHandles(
+        KeyHandle.Dict16 kingdom, KeyHandle.Dict16 phylum, KeyHandle.Dict16 family,
+        KeyHandle.Dict32 species, KeyHandle.Dict16 country, KeyHandle.Dict16 state
+    ) {
+        static KeyHandles bind(TaoTree tree) {
+            return new KeyHandles(
+                tree.keyDict16("kingdom"), tree.keyDict16("phylum"),
+                tree.keyDict16("family"),  tree.keyDict32("species"),
+                tree.keyDict16("countryCode"), tree.keyDict16("stateProvince"));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared ingestion: encode key + write leaf from a Parquet row
+    // -----------------------------------------------------------------------
+
+    /**
+     * Encode the key from the current Parquet row. Returns the species string,
+     * or {@code null} if the row should be skipped (no species field).
+     */
+    static String encodeKey(KeyBuilder kb, KeyHandles kh, RowReader rows) {
+        String species = nullSafe(rows, "species");
+        if (species == null) return null;
+        kb.set(kh.kingdom, nullSafe(rows, "kingdom"))
+          .set(kh.phylum,  nullSafe(rows, "phylum"))
+          .set(kh.family,  nullSafe(rows, "family"))
+          .set(kh.species, species)
+          .set(kh.country, nullSafe(rows, "countrycode"))
+          .set(kh.state,   nullSafe(rows, "stateprovince"));
+        return species;
+    }
+
+    /**
+     * Write (or update) the leaf for the current Parquet row.
+     * The key must already be encoded in the KeyBuilder.
+     *
+     * @return 1 if the row was forwarded (new or updated), 0 if suppressed (older dup)
+     */
+    static int writeLeaf(TaoTree.WriteScope w, KeyBuilder kb, RowReader rows) {
+        var leaf = w.getOrCreate(kb);
+
+        int year  = safeInt(rows, "year");
+        int month = safeInt(rows, "month");
+        int day   = safeInt(rows, "day");
+        double lat  = safeDouble(rows, "decimallatitude");
+        double lon  = safeDouble(rows, "decimallongitude");
+        double elev = safeDouble(rows, "elevation");
+
+        int existingCount = leaf.get(COUNT);
+        if (existingCount == 0) {
+            leaf.set(COUNT, 1)
+                .set(YEAR, year).set(MONTH, month).set(DAY, day)
+                .set(LAT, lat).set(LON, lon).set(ELEV, elev)
+                .set(IND_CNT, safeInt(rows, "individualcount"))
+                .set(TAXON_K, safeInt(rows, "taxonkey"))
+                .set(SPECIES_K, safeInt(rows, "specieskey"));
+            String locality = nullSafe(rows, "locality");
+            if (locality != null) leaf.set(LOCALITY, locality);
+            String recordedBy = nullSafe(rows, "recordedby");
+            if (recordedBy != null) leaf.set(RECORDED, recordedBy);
+            String extras = buildExtras(rows);
+            if (extras != null) leaf.set(EXTRAS, extras);
+            return 1;
+        } else {
+            leaf.set(COUNT, existingCount + 1);
+            if (year > leaf.get(YEAR)
+                || (year == leaf.get(YEAR) && month > leaf.get(MONTH))) {
+                leaf.set(YEAR, year).set(MONTH, month).set(DAY, day)
+                    .set(LAT, lat).set(LON, lon).set(ELEV, elev)
+                    .set(IND_CNT, safeInt(rows, "individualcount"))
+                    .set(TAXON_K, safeInt(rows, "taxonkey"))
+                    .set(SPECIES_K, safeInt(rows, "specieskey"));
+                String locality = nullSafe(rows, "locality");
+                if (locality != null) leaf.set(LOCALITY, locality);
+                String recordedBy = nullSafe(rows, "recordedby");
+                if (recordedBy != null) leaf.set(RECORDED, recordedBy);
+                String extras = buildExtras(rows);
+                if (extras != null) leaf.set(EXTRAS, extras);
+                return 1;
+            }
+            return 0;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Create a fresh store
+    // -----------------------------------------------------------------------
+
+    static TaoTree createFresh(Path storePath) throws java.io.IOException {
+        if (Files.exists(storePath)) {
+            Files.delete(storePath);
+        }
+        return TaoTree.create(storePath, KEY_LAYOUT, LEAF_LAYOUT);
+    }
+
     public static void main(String[] args) throws Exception {
         if (args.length == 0) {
             System.out.println("Usage: GbifTracker <parquet-dir-or-file>");
@@ -109,14 +211,7 @@ public class GbifTracker {
         // Create a fresh persistent store
         try (var tree = createFresh(storePath)) {
 
-            // COW mode is always active (lock-free readers, concurrent writers)
-
-            var KINGDOM = tree.keyDict16("kingdom");
-            var PHYLUM  = tree.keyDict16("phylum");
-            var FAMILY  = tree.keyDict16("family");
-            var SPECIES = tree.keyDict32("species");
-            var COUNTRY = tree.keyDict16("countryCode");
-            var STATE   = tree.keyDict16("stateProvince");
+            var kh = KeyHandles.bind(tree);
 
             try (var arena = Arena.ofConfined()) {
                 var kb = tree.newKeyBuilder(arena);
@@ -139,71 +234,9 @@ public class GbifTracker {
                             rows.next();
                             totalRows++;
 
-                            String species = nullSafe(rows, "species");
-                            if (species == null) { skipped++; continue; }
-
-                            kb.set(KINGDOM, nullSafe(rows, "kingdom"))
-                              .set(PHYLUM,  nullSafe(rows, "phylum"))
-                              .set(FAMILY,  nullSafe(rows, "family"))
-                              .set(SPECIES, species)
-                              .set(COUNTRY, nullSafe(rows, "countrycode"))
-                              .set(STATE,   nullSafe(rows, "stateprovince"));
-
-                            int year  = safeInt(rows, "year");
-                            int month = safeInt(rows, "month");
-                            int day   = safeInt(rows, "day");
-                            double lat  = safeDouble(rows, "decimallatitude");
-                            double lon  = safeDouble(rows, "decimallongitude");
-                            double elev = safeDouble(rows, "elevation");
-
-                            var leaf = w.getOrCreate(kb);
-
-                            int existingCount = leaf.get(COUNT);
-                            if (existingCount == 0) {
-                                leaf.set(COUNT, 1)
-                                    .set(YEAR, year)
-                                    .set(MONTH, month)
-                                    .set(DAY, day)
-                                    .set(LAT, lat)
-                                    .set(LON, lon)
-                                    .set(ELEV, elev)
-                                    .set(IND_CNT, safeInt(rows, "individualcount"))
-                                    .set(TAXON_K, safeInt(rows, "taxonkey"))
-                                    .set(SPECIES_K, safeInt(rows, "specieskey"));
-
-                                String locality = nullSafe(rows, "locality");
-                                if (locality != null) leaf.set(LOCALITY, locality);
-                                String recordedBy = nullSafe(rows, "recordedby");
-                                if (recordedBy != null) leaf.set(RECORDED, recordedBy);
-                                String extras = buildExtras(rows);
-                                if (extras != null) leaf.set(EXTRAS, extras);
-                                forwarded++;
-                            } else {
-                                // Existing entry: increment count, update all fields if newer
-                                leaf.set(COUNT, existingCount + 1);
-                                if (year > leaf.get(YEAR)
-                                    || (year == leaf.get(YEAR) && month > leaf.get(MONTH))) {
-                                    leaf.set(YEAR, year)
-                                        .set(MONTH, month)
-                                        .set(DAY, day)
-                                        .set(LAT, lat)
-                                        .set(LON, lon)
-                                        .set(ELEV, elev)
-                                        .set(IND_CNT, safeInt(rows, "individualcount"))
-                                        .set(TAXON_K, safeInt(rows, "taxonkey"))
-                                        .set(SPECIES_K, safeInt(rows, "specieskey"));
-
-                                    String locality = nullSafe(rows, "locality");
-                                    if (locality != null) leaf.set(LOCALITY, locality);
-                                    String recordedBy = nullSafe(rows, "recordedby");
-                                    if (recordedBy != null) leaf.set(RECORDED, recordedBy);
-                                    String extras = buildExtras(rows);
-                                    if (extras != null) leaf.set(EXTRAS, extras);
-                                    forwarded++;
-                                } else {
-                                    suppressed++;
-                                }
-                            }
+                            if (encodeKey(kb, kh, rows) == null) { skipped++; continue; }
+                            int result = writeLeaf(w, kb, rows);
+                            if (result == 1) forwarded++; else suppressed++;
 
                             if (totalRows % 100_000 == 0) {
                                 // Close scope, sync, reopen for progress reporting
@@ -267,16 +300,6 @@ public class GbifTracker {
                     tree.overflowPageCount());
             }
         }
-    }
-
-    private static TaoTree createFresh(Path storePath) throws java.io.IOException {
-        if (Files.exists(storePath)) {
-            System.out.println("Replacing existing store...");
-            Files.delete(storePath);
-        } else {
-            System.out.println("Creating new store...");
-        }
-        return TaoTree.create(storePath, KEY_LAYOUT, LEAF_LAYOUT);
     }
 
     /** Read a nullable string field. For array fields (e.g. recordedBy), joins elements with "; ". */
