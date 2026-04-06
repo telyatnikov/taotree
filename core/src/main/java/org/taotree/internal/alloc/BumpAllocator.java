@@ -97,10 +97,13 @@ public final class BumpAllocator implements AutoCloseable {
     /**
      * Allocate space for a payload of the given length.
      *
+     * <p>Thread-safe: synchronized to support concurrent writer scopes that
+     * may write TaoString overflow data simultaneously.
+     *
      * @param length payload size in bytes (must be positive)
      * @return an {@link OverflowPtr}-encoded pointer to the allocated space
      */
-    public long allocate(int length) {
+    public synchronized long allocate(int length) {
         if (length <= 0) throw new IllegalArgumentException("length must be positive: " + length);
 
         // Oversized payload: allocate a dedicated page

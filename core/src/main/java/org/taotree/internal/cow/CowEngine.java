@@ -19,10 +19,27 @@ import org.taotree.internal.art.NodePtr;
  *
  * <p>The caller ({@link org.taotree.TaoTree.WriteScope}) accumulates the new root
  * and publishes once at close time.
+ *
+ * <p>Operations accept an optional {@link WriterArena} parameter. When provided,
+ * COW allocations go through the per-scope arena (for concurrent writers). When
+ * {@code null}, allocations go through the slab allocator directly (in-memory mode)
+ * or through the engine's default arena (single-writer file-backed mode).
  */
 public final class CowEngine {
 
-    private final CowContext ctx;
+    private final CowContext defaultCtx;
+
+    // Immutable config — shared across all contexts
+    final SlabAllocator slab;
+    final ChunkStore chunkStore; // null for in-memory mode
+    final int prefixClassId;
+    final int node4ClassId;
+    final int node16ClassId;
+    final int node48ClassId;
+    final int node256ClassId;
+    final int keyLen;
+    final int keySlotSize;
+    final int[] leafClassIds;
 
     public CowEngine(SlabAllocator slab, EpochReclaimer reclaimer,
                      int prefixClassId, int node4ClassId, int node16ClassId,
@@ -38,7 +55,17 @@ public final class CowEngine {
                      int prefixClassId, int node4ClassId, int node16ClassId,
                      int node48ClassId, int node256ClassId,
                      int keyLen, int keySlotSize, int[] leafClassIds) {
-        this.ctx = new CowContext(slab, arena, chunkStore,
+        this.slab = slab;
+        this.chunkStore = chunkStore;
+        this.prefixClassId = prefixClassId;
+        this.node4ClassId = node4ClassId;
+        this.node16ClassId = node16ClassId;
+        this.node48ClassId = node48ClassId;
+        this.node256ClassId = node256ClassId;
+        this.keyLen = keyLen;
+        this.keySlotSize = keySlotSize;
+        this.leafClassIds = leafClassIds;
+        this.defaultCtx = new CowContext(slab, arena, chunkStore,
             prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
             keyLen, keySlotSize, leafClassIds);
     }
@@ -74,17 +101,45 @@ public final class CowEngine {
 
     /**
      * Insert a key using COW path-copy, without publishing.
+     * Uses the engine's default arena (single-writer or in-memory mode).
      */
     public DeferredResult deferredGetOrCreate(long currentRoot, MemorySegment key,
                                               int keyLen, int leafClass) {
+        return CowInsert.deferredGetOrCreate(defaultCtx, currentRoot, key, keyLen, leafClass);
+    }
+
+    /**
+     * Insert a key using COW path-copy with a per-scope arena.
+     * Used by concurrent writers to isolate arena allocations per WriteScope.
+     */
+    public DeferredResult deferredGetOrCreate(WriterArena arena, long currentRoot,
+                                              MemorySegment key, int keyLen, int leafClass) {
+        var ctx = contextWithArena(arena);
         return CowInsert.deferredGetOrCreate(ctx, currentRoot, key, keyLen, leafClass);
     }
 
     /**
      * Delete a key using COW path-copy, without publishing.
+     * Uses the engine's default arena.
      */
     public DeferredResult deferredDelete(long currentRoot, MemorySegment key, int keyLen) {
+        return CowDelete.deferredDelete(defaultCtx, currentRoot, key, keyLen);
+    }
+
+    /**
+     * Delete a key using COW path-copy with a per-scope arena.
+     */
+    public DeferredResult deferredDelete(WriterArena arena, long currentRoot,
+                                         MemorySegment key, int keyLen) {
+        var ctx = contextWithArena(arena);
         return CowDelete.deferredDelete(ctx, currentRoot, key, keyLen);
+    }
+
+    /** Create a CowContext with a per-scope arena (reuses immutable config). */
+    private CowContext contextWithArena(WriterArena arena) {
+        return new CowContext(slab, arena, chunkStore,
+            prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
+            keyLen, keySlotSize, leafClassIds);
     }
 
     // -----------------------------------------------------------------------

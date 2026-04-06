@@ -24,8 +24,11 @@ import org.taotree.internal.persist.Superblock;
  * pages are guaranteed to be contiguous within a single chunk mapping, so the caller can
  * slice them as a single {@link MemorySegment}.
  *
- * <p><b>Thread safety:</b> not thread-safe. Must be accessed under the owning tree's
- * write lock for mutations, read lock for resolve.
+ * <p><b>Thread safety:</b> {@link #allocPages} is synchronized to support concurrent
+ * writer arenas. Resolution methods ({@link #resolve}, {@link #resolvePage},
+ * {@link #resolveBytes}) are safe for concurrent reads once the chunk is mapped.
+ * {@link #sync()}, {@link #syncDirty()}, and {@link #close()} must be called under
+ * external serialization (e.g., the tree's write lock or commit lock).
  */
 public final class ChunkStore implements AutoCloseable {
 
@@ -165,11 +168,13 @@ public final class ChunkStore implements AutoCloseable {
      * <p>The returned pages are guaranteed to reside within a single chunk mapping,
      * so the caller can obtain a contiguous {@link MemorySegment} via {@link #resolve}.
      *
+     * <p>Thread-safe: synchronized to support concurrent {@link WriterArena} instances.
+     *
      * @param pageCount number of consecutive pages to allocate
      * @return the global page number of the first page in the run
      * @throws IOException if the file cannot be grown
      */
-    public int allocPages(int pageCount) throws IOException {
+    public synchronized int allocPages(int pageCount) throws IOException {
         if (pageCount <= 0) throw new IllegalArgumentException("pageCount must be positive");
         if (pageCount > pagesPerChunk) {
             throw new IllegalArgumentException(
