@@ -79,7 +79,7 @@ final class CowContext {
     // -- Resolution --
 
     MemorySegment resolveAny(long ptr) {
-        if (arena != null && WriterArena.isArenaAllocated(ptr)) {
+        if (chunkStore != null && WriterArena.isArenaAllocated(ptr)) {
             int classId = NodePtr.slabClassId(ptr);
             return WriterArena.resolve(chunkStore, ptr, slab.segmentSize(classId));
         }
@@ -87,7 +87,7 @@ final class CowContext {
     }
 
     MemorySegment resolveAny(long ptr, int length) {
-        if (arena != null && WriterArena.isArenaAllocated(ptr)) {
+        if (chunkStore != null && WriterArena.isArenaAllocated(ptr)) {
             return WriterArena.resolve(chunkStore, ptr, length);
         }
         return slab.resolve(ptr, length);

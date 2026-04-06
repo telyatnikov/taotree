@@ -170,6 +170,21 @@ public final class TaoTree implements AutoCloseable {
     // String layouts per slab class ID (for copyFrom out-of-line string handling)
     private final java.util.Map<Integer, TaoString.Layout> stringLayouts = new java.util.HashMap<>();
 
+    // Per-thread WriterArena reuse: each thread gets a dedicated arena that persists
+    // across WriteScopes, avoiding wasteful batch re-reservation on every scope open.
+    // Lazily initialized because chunkStore is not set until construction completes.
+    private ThreadLocal<WriterArena> threadArena;
+
+    /** Get or create the per-thread WriterArena for this tree. */
+    private WriterArena threadArena() {
+        var tl = threadArena;
+        if (tl == null) {
+            tl = ThreadLocal.withInitial(() -> new WriterArena(chunkStore));
+            threadArena = tl;
+        }
+        return tl.get();
+    }
+
     // -----------------------------------------------------------------------
     // Child tree constructor (shares parent's infrastructure)
     // -----------------------------------------------------------------------
@@ -774,9 +789,9 @@ public final class TaoTree implements AutoCloseable {
         }
 
         // COW always active: init epoch reclaimer + COW engine
+        // Default context has no arena — WriteScope provides per-thread arenas explicitly
         this.reclaimer = new EpochReclaimer(slab);
-        var writerArena = new WriterArena(chunkStore);
-        this.cowEngine = new CowEngine(slab, reclaimer, writerArena, chunkStore,
+        this.cowEngine = new CowEngine(slab, reclaimer, null, chunkStore,
             prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
             keyLen, keySlotSize, leafClassIds);
     }
@@ -810,9 +825,9 @@ public final class TaoTree implements AutoCloseable {
         this.size = desc.size;
 
         // COW always active: init epoch reclaimer + COW engine
+        // Default context has no arena — WriteScope provides per-thread arenas explicitly
         this.reclaimer = new EpochReclaimer(slab);
-        var writerArena = new WriterArena(chunkStore);
-        this.cowEngine = new CowEngine(slab, reclaimer, writerArena, chunkStore,
+        this.cowEngine = new CowEngine(slab, reclaimer, null, chunkStore,
             prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
             keyLen, keySlotSize, leafClassIds);
         PUB_HANDLE.setRelease(this, new PublicationState(root, size));
@@ -1412,11 +1427,16 @@ public final class TaoTree implements AutoCloseable {
 
         private boolean closed;
         private final Thread ownerThread = Thread.currentThread();
-        private final WriterArena scopeArena; // per-scope arena (null for child trees)
+        private final WriterArena scopeArena; // per-thread arena (null for child trees)
         private boolean commitLockHeld;
 
         private WriteScope() {
-            this.scopeArena = (chunkStore != null) ? new WriterArena(chunkStore) : null;
+            if (chunkStore != null) {
+                this.scopeArena = threadArena();
+                this.scopeArena.beginScope();
+            } else {
+                this.scopeArena = null;
+            }
         }
 
         // -- Read operations --
@@ -1678,6 +1698,9 @@ public final class TaoTree implements AutoCloseable {
                     // mutation are visible to readers via JMM setRelease transitivity
                     publishRoot();
                     commitLock.unlock();
+                }
+                if (scopeArena != null) {
+                    scopeArena.endScope();
                 }
             }
         }
