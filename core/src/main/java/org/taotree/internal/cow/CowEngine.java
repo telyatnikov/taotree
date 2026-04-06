@@ -1,7 +1,6 @@
 package org.taotree.internal.cow;
 
 import java.lang.foreign.MemorySegment;
-import java.util.List;
 import org.taotree.internal.alloc.ChunkStore;
 import org.taotree.internal.alloc.SlabAllocator;
 import org.taotree.internal.alloc.WriterArena;
@@ -62,10 +61,10 @@ public final class CowEngine {
         boolean mutated,
         long newRoot,
         int sizeDelta,
-        List<Long> retirees
+        LongList retirees
     ) {
         static DeferredResult unchanged(long leafPtr) {
-            return new DeferredResult(leafPtr, false, NodePtr.EMPTY_PTR, 0, List.of());
+            return new DeferredResult(leafPtr, false, NodePtr.EMPTY_PTR, 0, LongList.empty());
         }
     }
 

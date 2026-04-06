@@ -1,9 +1,7 @@
 package org.taotree.internal.cow;
 
 
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
+import java.util.Arrays;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -45,8 +43,8 @@ public final class EpochReclaimer implements AutoCloseable {
     private final AtomicInteger nextSlotIndex = new AtomicInteger(0);
     private final ThreadLocal<Integer> threadSlotIndex;
 
-    private final ThreadLocal<List<RetiredNode>> retireList;
-    private final ConcurrentLinkedQueue<List<RetiredNode>> allRetireLists = new ConcurrentLinkedQueue<>();
+    private final ThreadLocal<RetireList> retireList;
+    private final ConcurrentLinkedQueue<RetireList> allRetireLists = new ConcurrentLinkedQueue<>();
 
     private final SlabAllocator slab;
 
@@ -73,7 +71,7 @@ public final class EpochReclaimer implements AutoCloseable {
             return idx;
         });
         this.retireList = ThreadLocal.withInitial(() -> {
-            var list = new ArrayList<RetiredNode>();
+            var list = new RetireList();
             allRetireLists.add(list);
             return list;
         });
@@ -111,7 +109,7 @@ public final class EpochReclaimer implements AutoCloseable {
      * tagged with the current global generation. No synchronization is required.
      */
     public void retire(long nodePtr) {
-        retireList.get().add(new RetiredNode(nodePtr, globalGeneration.get()));
+        retireList.get().add(nodePtr, globalGeneration.get());
     }
 
     /**
@@ -155,8 +153,8 @@ public final class EpochReclaimer implements AutoCloseable {
     public int reclaim() {
         long safeGen = safeReclaimGeneration();
         int freed = 0;
-        for (List<RetiredNode> list : allRetireLists) {
-            freed += drainList(list, safeGen);
+        for (RetireList list : allRetireLists) {
+            freed += list.drain(safeGen, slab);
         }
         return freed;
     }
@@ -178,7 +176,7 @@ public final class EpochReclaimer implements AutoCloseable {
     /** Total retired nodes across all threads (for testing). */
     public int pendingRetiredCount() {
         int count = 0;
-        for (List<RetiredNode> list : allRetireLists) {
+        for (RetireList list : allRetireLists) {
             count += list.size();
         }
         return count;
@@ -194,31 +192,72 @@ public final class EpochReclaimer implements AutoCloseable {
      */
     @Override
     public void close() {
-        for (List<RetiredNode> list : allRetireLists) {
-            for (RetiredNode rn : list) {
-                slab.free(rn.nodePtr);
-            }
-            list.clear();
+        for (RetireList list : allRetireLists) {
+            list.freeAll(slab);
         }
     }
 
     // -----------------------------------------------------------------------
-    // Internals
+    // RetireList — parallel long[] arrays, no boxing
     // -----------------------------------------------------------------------
 
-    private int drainList(List<RetiredNode> list, long safeGen) {
-        int freed = 0;
-        Iterator<RetiredNode> it = list.iterator();
-        while (it.hasNext()) {
-            RetiredNode rn = it.next();
-            if (rn.retireGeneration < safeGen) {
-                slab.free(rn.nodePtr);
-                it.remove();
-                freed++;
-            }
-        }
-        return freed;
-    }
+    /**
+     * Per-thread retire list backed by parallel {@code long[]} arrays.
+     * Avoids boxing every retired node pointer into a {@link Long} or
+     * allocating a record object per entry.
+     */
+    static final class RetireList {
+        private static final int INITIAL_CAPACITY = 16;
 
-    private record RetiredNode(long nodePtr, long retireGeneration) {}
+        private long[] ptrs;
+        private long[] gens;
+        private int size;
+
+        RetireList() {
+            ptrs = new long[INITIAL_CAPACITY];
+            gens = new long[INITIAL_CAPACITY];
+        }
+
+        void add(long nodePtr, long generation) {
+            if (size == ptrs.length) {
+                int newCap = ptrs.length * 2;
+                ptrs = Arrays.copyOf(ptrs, newCap);
+                gens = Arrays.copyOf(gens, newCap);
+            }
+            ptrs[size] = nodePtr;
+            gens[size] = generation;
+            size++;
+        }
+
+        int size() { return size; }
+
+        /**
+         * Free all entries with {@code generation < safeGen}, compact survivors.
+         * Returns the number of entries freed.
+         */
+        int drain(long safeGen, SlabAllocator slab) {
+            int freed = 0;
+            int write = 0;
+            for (int read = 0; read < size; read++) {
+                if (gens[read] < safeGen) {
+                    slab.free(ptrs[read]);
+                    freed++;
+                } else {
+                    ptrs[write] = ptrs[read];
+                    gens[write] = gens[read];
+                    write++;
+                }
+            }
+            size = write;
+            return freed;
+        }
+
+        /** Free all entries unconditionally (shutdown). */
+        void freeAll(SlabAllocator slab) {
+            for (int i = 0; i < size; i++) {
+                slab.free(ptrs[i]);
+            }
+            size = 0;
+        }
+    }
 }

@@ -2,8 +2,6 @@ package org.taotree.internal.cow;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.util.ArrayList;
-import java.util.List;
 import org.taotree.internal.art.NodePtr;
 import org.taotree.internal.art.PrefixNode;
 
@@ -68,7 +66,7 @@ final class CowDelete {
             CowContext ctx, CowEngine.PathStack path, long replacement,
             long originalTarget) {
         long current = replacement;
-        var retirees = new ArrayList<Long>();
+        var retirees = new LongList();
         ctx.addIfSlabAllocated(retirees, originalTarget);
 
         for (int i = path.depth - 1; i >= 0; i--) {

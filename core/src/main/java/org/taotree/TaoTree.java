@@ -1883,7 +1883,7 @@ public final class TaoTree implements AutoCloseable {
     static final class WriteState {
         long root;
         long size;
-        final List<Long> retirees = new ArrayList<>();
+        final org.taotree.internal.cow.LongList retirees = new org.taotree.internal.cow.LongList();
 
         WriteState(long root, long size) {
             this.root = root;
@@ -1907,8 +1907,9 @@ public final class TaoTree implements AutoCloseable {
         size = ws.size;
         publishRoot();
         if (reclaimer != null) {
-            for (long old : ws.retirees) {
-                reclaimer.retire(old);
+            var retirees = ws.retirees;
+            for (int i = 0, n = retirees.size(); i < n; i++) {
+                reclaimer.retire(retirees.get(i));
             }
             reclaimer.advanceGeneration();
         }

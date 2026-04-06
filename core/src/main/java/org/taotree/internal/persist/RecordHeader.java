@@ -153,10 +153,13 @@ public final class RecordHeader {
 
     /**
      * Compute CRC-32C over {@code length} bytes starting at {@code offset} in {@code seg}.
+     *
+     * <p>Uses {@link MemorySegment#asByteBuffer()} to obtain a direct {@link java.nio.ByteBuffer}
+     * view of the segment, avoiding a heap copy. For mapped segments this is zero-copy.
      */
     static int crc32c(MemorySegment seg, long offset, int length) {
         var crc = new CRC32C();
-        byte[] buf = seg.asSlice(offset, length).toArray(ValueLayout.JAVA_BYTE);
+        var buf = seg.asSlice(offset, length).asByteBuffer();
         crc.update(buf);
         return (int) crc.getValue();
     }

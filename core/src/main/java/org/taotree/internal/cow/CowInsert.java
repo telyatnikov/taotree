@@ -2,8 +2,6 @@ package org.taotree.internal.cow;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.util.ArrayList;
-import java.util.List;
 import org.taotree.internal.art.Node4;
 import org.taotree.internal.art.NodePtr;
 import org.taotree.internal.art.PrefixNode;
@@ -21,7 +19,7 @@ final class CowInsert {
         if (NodePtr.isEmpty(currentRoot)) {
             long leafPtr = ctx.allocateLeaf(key, keyLen, leafClass);
             long wrapped = ctx.wrapInPrefix(key, 0, keyLen, leafPtr);
-            return new CowEngine.DeferredResult(leafPtr, true, wrapped, 1, List.of());
+            return new CowEngine.DeferredResult(leafPtr, true, wrapped, 1, LongList.empty());
         }
 
         var path = new CowEngine.PathStack();
@@ -81,7 +79,7 @@ final class CowInsert {
             CowContext ctx, CowEngine.PathStack path, long newSubtree,
             long leafPtr, long originalTarget, int sizeDelta) {
         long current = newSubtree;
-        var retirees = new ArrayList<Long>();
+        var retirees = new LongList();
         ctx.addIfSlabAllocated(retirees, originalTarget);
 
         for (int i = path.depth - 1; i >= 0; i--) {

@@ -2,8 +2,6 @@ package org.taotree.internal.cow;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.util.ArrayList;
-import java.util.List;
 import org.taotree.internal.alloc.ChunkStore;
 import org.taotree.internal.alloc.SlabAllocator;
 import org.taotree.internal.alloc.WriterArena;
@@ -174,7 +172,7 @@ final class CowContext {
 
     // -- Retire filtering --
 
-    void addIfSlabAllocated(List<Long> retirees, long nodePtr) {
+    void addIfSlabAllocated(LongList retirees, long nodePtr) {
         if (!NodePtr.isEmpty(nodePtr) && (arena == null || !WriterArena.isArenaAllocated(nodePtr))) {
             retirees.add(nodePtr);
         }
