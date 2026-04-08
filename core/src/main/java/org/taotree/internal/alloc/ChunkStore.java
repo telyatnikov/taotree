@@ -38,8 +38,8 @@ public final class ChunkStore implements AutoCloseable {
     /** Default chunk size: 64 MB (16384 pages per chunk). */
     public static final long DEFAULT_CHUNK_SIZE = 64L * 1024 * 1024;
 
-    /** Number of reserved pages for v2 checkpoint slots (pages 0-3, 16 KB). */
-    public static final int V2_RESERVED_PAGES = 4;
+    /** Number of reserved pages for v2 checkpoint slots (pages 0-7, 32 KB: two 16 KB slots). */
+    public static final int V2_RESERVED_PAGES = 8;
 
     private static final int MAX_CHUNKS = 16384; // 64 MB × 16384 = 1 TB max
 
@@ -261,14 +261,16 @@ public final class ChunkStore implements AutoCloseable {
     // V2 checkpoint slot access
     // -----------------------------------------------------------------------
 
-    /** Returns a writable MemorySegment for checkpoint slot A (pages 0-1, 8 KB). */
+    /** Returns a writable MemorySegment for checkpoint slot A (pages 0-3, 16 KB). */
     public MemorySegment checkpointSlotA() {
-        return resolve(0, 2);
+        int slotSizePages = V2_RESERVED_PAGES / 2;
+        return resolve(0, slotSizePages);
     }
 
-    /** Returns a writable MemorySegment for checkpoint slot B (pages 2-3, 8 KB). */
+    /** Returns a writable MemorySegment for checkpoint slot B (pages 4-7, 16 KB). */
     public MemorySegment checkpointSlotB() {
-        return resolve(2, 2);
+        int slotSizePages = V2_RESERVED_PAGES / 2;
+        return resolve(slotSizePages, slotSizePages);
     }
 
     // -----------------------------------------------------------------------

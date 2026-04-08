@@ -169,8 +169,12 @@ public class GbifVerifier {
                             indCnt, taxK, spK, loc, rec, ext));
                     } else {
                         int newCount = existing.count + 1;
-                        if (year > existing.year
-                            || (year == existing.year && month > existing.month)) {
+                        if (GbifTracker.isNewer(year, month, day, lat, lon, taxK, spK, indCnt,
+                                loc, rec, ext,
+                                existing.year, existing.month, existing.day,
+                                existing.lat, existing.lon,
+                                existing.taxonKey, existing.speciesKey, existing.indCnt,
+                                existing.locality, existing.recordedBy, existing.extras)) {
                             expected.put(key, new Expected(newCount, year, month, day,
                                 lat, lon, elev, indCnt, taxK, spK, loc, rec, ext));
                         } else {

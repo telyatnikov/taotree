@@ -76,6 +76,26 @@ final class CowContext {
         return ptr;
     }
 
+    /**
+     * Copy an existing leaf into a new arena-allocated leaf (same class).
+     * Copies both key bytes and the entire value portion, so the caller gets
+     * a private mutable copy that is invisible to readers until publication.
+     */
+    long copyLeaf(long existingPtr, int leafClass) {
+        int classId = leafClassIds[leafClass];
+        int segSize = slab.segmentSize(classId);
+        long newPtr;
+        if (arena != null) {
+            newPtr = arena.alloc(segSize, NodePtr.LEAF, classId).nodePtr();
+        } else {
+            newPtr = slab.allocate(classId);
+        }
+        MemorySegment src = resolveAny(existingPtr);
+        MemorySegment dst = resolveAny(newPtr);
+        MemorySegment.copy(src, 0, dst, 0, segSize);
+        return newPtr;
+    }
+
     // -- Resolution --
 
     MemorySegment resolveAny(long ptr) {

@@ -18,7 +18,8 @@ final class CowDelete {
             return CowEngine.DeferredResult.unchanged(0);
         }
 
-        var path = new CowEngine.PathStack();
+        var path = CowEngine.PATH_STACK_CACHE.get();
+        path.reset();
         long node = currentRoot;
         int depth = 0;
 

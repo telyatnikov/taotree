@@ -137,6 +137,9 @@ public class GbifBenchmark {
             boolean ok = vr.passed();
             System.out.printf(" %s (checked %,d, %d errors)%n",
                 ok ? "PASS" : "FAIL", vr.checked(), vr.fieldErrors());
+            if (!ok) {
+                vr.errors().stream().limit(10).forEach(e -> System.out.println("    " + e));
+            }
 
             return new RunResult(nThreads, entries, elapsedSec,
                 fileSize, slabBytes, segsInUse, overflowBytes, overflowPages, ok);
@@ -194,6 +197,41 @@ public class GbifBenchmark {
         var latch = new CountDownLatch(nThreads);
         var kh = GbifTracker.KeyHandles.bind(tree);
 
+        // Conflict resolver: during rebase, merge row-count deltas and keep the newer observation.
+        ConflictResolver resolver = (target, pending, snapshot) -> {
+            // Count is an accumulator: add the delta (rows processed by this scope)
+            int countDelta = pending.get(GbifTracker.COUNT) - snapshot.get(GbifTracker.COUNT);
+            target.set(GbifTracker.COUNT, target.get(GbifTracker.COUNT) + countDelta);
+            // Keep the newer observation per the total-order comparison
+            if (GbifTracker.isNewer(
+                pending.get(GbifTracker.YEAR), pending.get(GbifTracker.MONTH), pending.get(GbifTracker.DAY),
+                pending.get(GbifTracker.LAT), pending.get(GbifTracker.LON),
+                pending.get(GbifTracker.TAXON_K), pending.get(GbifTracker.SPECIES_K),
+                pending.get(GbifTracker.IND_CNT),
+                pending.get(GbifTracker.LOCALITY), pending.get(GbifTracker.RECORDED),
+                pending.get(GbifTracker.EXTRAS),
+                target.get(GbifTracker.YEAR), target.get(GbifTracker.MONTH), target.get(GbifTracker.DAY),
+                target.get(GbifTracker.LAT), target.get(GbifTracker.LON),
+                target.get(GbifTracker.TAXON_K), target.get(GbifTracker.SPECIES_K),
+                target.get(GbifTracker.IND_CNT),
+                target.get(GbifTracker.LOCALITY), target.get(GbifTracker.RECORDED),
+                target.get(GbifTracker.EXTRAS)
+            )) {
+                target.set(GbifTracker.YEAR, pending.get(GbifTracker.YEAR));
+                target.set(GbifTracker.MONTH, pending.get(GbifTracker.MONTH));
+                target.set(GbifTracker.DAY, pending.get(GbifTracker.DAY));
+                target.set(GbifTracker.LAT, pending.get(GbifTracker.LAT));
+                target.set(GbifTracker.LON, pending.get(GbifTracker.LON));
+                target.set(GbifTracker.ELEV, pending.get(GbifTracker.ELEV));
+                target.set(GbifTracker.IND_CNT, pending.get(GbifTracker.IND_CNT));
+                target.set(GbifTracker.TAXON_K, pending.get(GbifTracker.TAXON_K));
+                target.set(GbifTracker.SPECIES_K, pending.get(GbifTracker.SPECIES_K));
+                target.set(GbifTracker.LOCALITY, pending.get(GbifTracker.LOCALITY));
+                target.set(GbifTracker.RECORDED, pending.get(GbifTracker.RECORDED));
+                target.set(GbifTracker.EXTRAS, pending.get(GbifTracker.EXTRAS));
+            }
+        };
+
         for (int t = 0; t < nThreads; t++) {
             final List<File> myFiles = partitions[t];
             Thread.ofPlatform().name("writer-" + t).start(() -> {
@@ -205,7 +243,7 @@ public class GbifBenchmark {
                         try (var fileReader = ParquetFileReader.open(InputFile.of(file.toPath()));
                              var rows = fileReader.createRowReader()) {
 
-                            var w = tree.write();
+                            var w = tree.write(resolver);
                             try {
                                 while (rows.hasNext()) {
                                     rows.next();
@@ -214,7 +252,7 @@ public class GbifBenchmark {
 
                                     if (++batchCount % BATCH_ROWS == 0) {
                                         w.close();
-                                        w = tree.write();
+                                        w = tree.write(resolver);
                                     }
                                 }
                             } finally {

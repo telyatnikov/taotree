@@ -2,6 +2,7 @@ package org.taotree.internal.cow;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import org.taotree.internal.alloc.WriterArena;
 import org.taotree.internal.art.Node4;
 import org.taotree.internal.art.NodePtr;
 import org.taotree.internal.art.PrefixNode;
@@ -16,13 +17,44 @@ final class CowInsert {
     static CowEngine.DeferredResult deferredGetOrCreate(
             CowContext ctx, long currentRoot, MemorySegment key,
             int keyLen, int leafClass) {
+        return deferredGetOrCreateImpl(ctx, currentRoot, key, keyLen, leafClass, false, false);
+    }
+
+    /**
+     * Like {@link #deferredGetOrCreate} but always copies existing leaves into the
+     * writer's arena so the caller gets a private mutable copy. Used by the
+     * deferred-commit WriteScope where leaf writes must be invisible to readers
+     * until publication.
+     */
+    static CowEngine.DeferredResult deferredGetOrCreateCopy(
+            CowContext ctx, long currentRoot, MemorySegment key,
+            int keyLen, int leafClass) {
+        return deferredGetOrCreateImpl(ctx, currentRoot, key, keyLen, leafClass, true, false);
+    }
+
+    /**
+     * Like {@link #deferredGetOrCreateCopy}, but forces a COW-copy even for
+     * arena-allocated leaves. Used during rebase, where arena-allocated leaves
+     * may belong to a different thread's arena (the published tree) and must
+     * not be modified in place.
+     */
+    static CowEngine.DeferredResult deferredGetOrCreateForceCopy(
+            CowContext ctx, long currentRoot, MemorySegment key,
+            int keyLen, int leafClass) {
+        return deferredGetOrCreateImpl(ctx, currentRoot, key, keyLen, leafClass, true, true);
+    }
+
+    private static CowEngine.DeferredResult deferredGetOrCreateImpl(
+            CowContext ctx, long currentRoot, MemorySegment key,
+            int keyLen, int leafClass, boolean copyExisting, boolean forceCopy) {
         if (NodePtr.isEmpty(currentRoot)) {
             long leafPtr = ctx.allocateLeaf(key, keyLen, leafClass);
             long wrapped = ctx.wrapInPrefix(key, 0, keyLen, leafPtr);
             return new CowEngine.DeferredResult(leafPtr, true, wrapped, 1, LongList.empty());
         }
 
-        var path = new CowEngine.PathStack();
+        var path = CowEngine.PATH_STACK_CACHE.get();
+        path.reset();
         long node = currentRoot;
         int depth = 0;
 
@@ -31,7 +63,19 @@ final class CowInsert {
 
             if (type == NodePtr.LEAF) {
                 if (ctx.leafKeyMatches(node, key, keyLen)) {
-                    return CowEngine.DeferredResult.unchanged(node);
+                    if (!copyExisting) {
+                        return CowEngine.DeferredResult.unchanged(node);
+                    }
+                    // If the leaf is already arena-allocated (private from a
+                    // prior mutation in this scope), no need to copy again —
+                    // unless forceCopy is set (rebase against a published tree
+                    // where arena-allocated leaves belong to another writer).
+                    if (!forceCopy && WriterArena.isArenaAllocated(node)) {
+                        return CowEngine.DeferredResult.unchanged(node);
+                    }
+                    // COW-copy the existing leaf to give the writer a private copy
+                    long newLeaf = ctx.copyLeaf(node, leafClass);
+                    return buildUp(ctx, path, newLeaf, newLeaf, node, 0);
                 }
                 var result = expandLeaf(ctx, node, key, keyLen, depth, leafClass);
                 return buildUp(ctx, path, result.subtree(), result.leafPtr(), node, 1);

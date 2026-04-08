@@ -109,6 +109,28 @@ public final class CowEngine {
     }
 
     /**
+     * Insert a key using COW path-copy with leaf-copy semantics.
+     * When the key already exists, the leaf is COW-copied into the arena so the
+     * caller gets a private mutable copy (invisible to readers until publication).
+     */
+    public DeferredResult deferredGetOrCreateCopy(WriterArena arena, long currentRoot,
+                                                  MemorySegment key, int keyLen, int leafClass) {
+        var ctx = contextWithArena(arena);
+        return CowInsert.deferredGetOrCreateCopy(ctx, currentRoot, key, keyLen, leafClass);
+    }
+
+    /**
+     * Like {@link #deferredGetOrCreateCopy}, but forces a COW-copy even for
+     * arena-allocated leaves. Used during rebase where the published tree may
+     * contain arena-allocated leaves from another writer's arena.
+     */
+    public DeferredResult deferredGetOrCreateForceCopy(WriterArena arena, long currentRoot,
+                                                       MemorySegment key, int keyLen, int leafClass) {
+        var ctx = contextWithArena(arena);
+        return CowInsert.deferredGetOrCreateForceCopy(ctx, currentRoot, key, keyLen, leafClass);
+    }
+
+    /**
      * Delete a key using COW path-copy, without publishing.
      * Uses the engine's default arena.
      */
@@ -136,6 +158,14 @@ public final class CowEngine {
     // Path stack — lightweight traversal recorder (used by insert + delete)
     // -----------------------------------------------------------------------
 
+    /**
+     * Cached per-thread PathStack — allocated once per thread, reset before each use.
+     * Eliminates the 3-array heap allocation that would otherwise happen on every
+     * {@code getOrCreate} / {@code delete} call.
+     */
+    static final ThreadLocal<PathStack> PATH_STACK_CACHE =
+            ThreadLocal.withInitial(PathStack::new);
+
     static final class PathStack {
         private static final int MAX_DEPTH = 128;
 
@@ -143,6 +173,8 @@ public final class CowEngine {
         final byte[] keyBytes = new byte[MAX_DEPTH];
         final int[] nodeTypes = new int[MAX_DEPTH];
         int depth;
+
+        void reset() { depth = 0; }
 
         void push(long nodePtr, byte keyByte, int nodeType) {
             nodePtrs[depth] = nodePtr;

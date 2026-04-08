@@ -146,24 +146,108 @@ public class GbifTracker {
             if (extras != null) leaf.set(EXTRAS, extras);
             return 1;
         } else {
+            int taxon     = safeInt(rows, "taxonkey");
+            int species   = safeInt(rows, "specieskey");
+            int ind       = safeInt(rows, "individualcount");
+            String locality   = nullSafe(rows, "locality");
+            String recordedBy = nullSafe(rows, "recordedby");
             leaf.set(COUNT, existingCount + 1);
-            if (year > leaf.get(YEAR)
-                || (year == leaf.get(YEAR) && month > leaf.get(MONTH))) {
+            // Fast-path: compare all fields except extras first to avoid building
+            // the extras JSON for the ~98% of updates that lose without reaching
+            // the extras tiebreaker.
+            int cmp = compareExceptExtras(year, month, day, lat, lon, taxon, species, ind, locality, recordedBy,
+                        leaf.get(YEAR), leaf.get(MONTH), leaf.get(DAY),
+                        leaf.get(LAT), leaf.get(LON),
+                        leaf.get(TAXON_K), leaf.get(SPECIES_K), leaf.get(IND_CNT),
+                        leaf.get(LOCALITY), leaf.get(RECORDED));
+            if (cmp < 0) return 0;  // existing wins; skip buildExtras entirely
+            // New obs wins on numeric/string fields, or full tie — need extras now.
+            String extras = buildExtras(rows);
+            if (cmp > 0 || compareNullable(extras, leaf.get(EXTRAS)) > 0) {
                 leaf.set(YEAR, year).set(MONTH, month).set(DAY, day)
                     .set(LAT, lat).set(LON, lon).set(ELEV, elev)
-                    .set(IND_CNT, safeInt(rows, "individualcount"))
-                    .set(TAXON_K, safeInt(rows, "taxonkey"))
-                    .set(SPECIES_K, safeInt(rows, "specieskey"));
-                String locality = nullSafe(rows, "locality");
-                if (locality != null) leaf.set(LOCALITY, locality);
-                String recordedBy = nullSafe(rows, "recordedby");
-                if (recordedBy != null) leaf.set(RECORDED, recordedBy);
-                String extras = buildExtras(rows);
-                if (extras != null) leaf.set(EXTRAS, extras);
+                    .set(IND_CNT, ind)
+                    .set(TAXON_K, taxon)
+                    .set(SPECIES_K, species);
+                // Always write all string fields together so the leaf reflects a single
+                // winning observation; write "" to clear fields the new winner lacks.
+                leaf.set(LOCALITY,  locality   != null ? locality   : "");
+                leaf.set(RECORDED,  recordedBy != null ? recordedBy : "");
+                leaf.set(EXTRAS,    extras     != null ? extras     : "");
                 return 1;
             }
             return 0;
         }
+    }
+
+    /**
+     * Total-order comparison for duplicate-key merge.
+     *
+     * <p>Compares year → month → day → lat → lon → taxonKey → speciesKey →
+     * individualCount → locality → recordedBy lexicographically so that exactly
+     * one observation wins regardless of thread interleaving. This makes the merge
+     * commutative: merge(A,B) == merge(B,A).
+     *
+     * <p>NaN coordinates sort below any real value (via {@link Double#compare}).
+     * Null strings sort below any non-null string. The string tiebreakers handle
+     * the rare case where two observations share the same date, coordinates, and
+     * taxon identifiers; without them the winner would depend on processing order,
+     * breaking multi-threaded reproducibility.
+     */
+    static boolean isNewer(int y, int m, int d, double lat, double lon,
+                           int taxon, int species, int ind,
+                           String loc, String rec, String ext,
+                           int ey, int em, int ed, double elat, double elon,
+                           int etaxon, int especies, int eind,
+                           String eloc, String erec, String eext) {
+        if (y != ey) return y > ey;
+        if (m != em) return m > em;
+        if (d != ed) return d > ed;
+        int c = Double.compare(lat, elat);
+        if (c != 0) return c > 0;
+        c = Double.compare(lon, elon);
+        if (c != 0) return c > 0;
+        if (taxon != etaxon) return taxon > etaxon;
+        if (species != especies) return species > especies;
+        if (ind != eind) return ind > eind;
+        c = compareNullable(loc, eloc);
+        if (c != 0) return c > 0;
+        c = compareNullable(rec, erec);
+        if (c != 0) return c > 0;
+        return compareNullable(ext, eext) > 0;
+    }
+
+    /** Returns negative/zero/positive like compareTo, but excludes the extras field. */
+    private static int compareExceptExtras(int y, int m, int d, double lat, double lon,
+                                           int taxon, int species, int ind,
+                                           String loc, String rec,
+                                           int ey, int em, int ed, double elat, double elon,
+                                           int etaxon, int especies, int eind,
+                                           String eloc, String erec) {
+        if (y != ey) return y > ey ? 1 : -1;
+        if (m != em) return m > em ? 1 : -1;
+        if (d != ed) return d > ed ? 1 : -1;
+        int c = Double.compare(lat, elat);
+        if (c != 0) return c;
+        c = Double.compare(lon, elon);
+        if (c != 0) return c;
+        if (taxon != etaxon) return taxon > etaxon ? 1 : -1;
+        if (species != especies) return species > especies ? 1 : -1;
+        if (ind != eind) return ind > eind ? 1 : -1;
+        c = compareNullable(loc, eloc);
+        if (c != 0) return c;
+        return compareNullable(rec, erec);
+    }
+
+    private static int compareNullable(String a, String b) {
+        // Treat empty strings the same as null: a zero-initialized TaoString leaf
+        // returns "" rather than null, so we normalize to avoid false asymmetries.
+        String na = (a == null || a.isEmpty()) ? null : a;
+        String nb = (b == null || b.isEmpty()) ? null : b;
+        if (na == null && nb == null) return 0;
+        if (na == null) return -1;
+        if (nb == null) return 1;
+        return na.compareTo(nb);
     }
 
     // -----------------------------------------------------------------------
@@ -306,7 +390,8 @@ public class GbifTracker {
     static String nullSafe(RowReader rows, String field) {
         if (rows.isNull(field)) return null;
         try {
-            return rows.getString(field);
+            String v = rows.getString(field);
+            return (v == null || v.isEmpty()) ? null : v;
         } catch (IllegalArgumentException | ClassCastException e) {
             // Field is a LIST<STRING> — join elements
             try {

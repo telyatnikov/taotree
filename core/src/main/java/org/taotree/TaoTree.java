@@ -1193,7 +1193,21 @@ public final class TaoTree implements AutoCloseable {
      */
     public WriteScope write() {
         ensureCowEngine();
-        return new WriteScope();
+        return new WriteScope(null);
+    }
+
+    /**
+     * Open a write scope with a conflict resolver for deferred-commit rebase.
+     *
+     * <p>If another writer publishes between this scope's snapshot and commit,
+     * the resolver is called for each conflicting key to decide which value
+     * wins. Without a resolver ({@link #write()}), last-writer-wins.
+     *
+     * @see ConflictResolver
+     */
+    public WriteScope write(ConflictResolver resolver) {
+        ensureCowEngine();
+        return new WriteScope(resolver);
     }
 
     /** Lazy-init CowEngine + reclaimer for child trees on first write(). */
@@ -1414,11 +1428,22 @@ public final class TaoTree implements AutoCloseable {
 
     /**
      * Read-write scope of the TaoTree. Multiple write scopes can be open
-     * concurrently. The first mutation performs optimistic COW outside any
-     * lock, then acquires the commit lock to publish. The commit lock is
-     * held until close, serializing the value-write + publish sequence.
-     * Concurrent writers overlap on the first mutation's COW (the expensive
-     * part). User code before the first mutation runs with no lock.
+     * concurrently. All COW mutations operate on a <b>private copy</b> of the
+     * tree root (ZFS-inspired deferred-commit model). The commit lock is
+     * acquired only at {@link #close()} time, not during mutations:
+     *
+     * <ol>
+     *   <li>On scope open: snapshot the published root.</li>
+     *   <li>Each {@code getOrCreate}: COW against the private root (no lock).
+     *       Existing leaves are COW-copied into the WriterArena so all
+     *       returned leaf pointers are writer-private.</li>
+     *   <li>On {@code close()}: acquire commit lock, check for conflict.
+     *       If another writer published since our snapshot, replay the
+     *       mutation log against the new root. Then publish.</li>
+     * </ol>
+     *
+     * <p>For child trees (no ChunkStore), falls back to immediate commit-lock
+     * acquisition on first mutation (the old model).
      *
      * <p>All returned leaf references and {@link MemorySegment} slices are
      * valid only while this scope is open.
@@ -1429,13 +1454,32 @@ public final class TaoTree implements AutoCloseable {
         private final Thread ownerThread = Thread.currentThread();
         private final WriterArena scopeArena; // per-thread arena (null for child trees)
         private boolean commitLockHeld;
+        private final ConflictResolver resolver; // null for last-writer-wins
 
-        private WriteScope() {
+        // Deferred-commit state (file-backed mode only)
+        private final PublicationState scopeSnapshot;   // snapshot at open time
+        private long scopeRoot;                          // private COW root
+        private long scopeSize;                          // private size counter
+        private final org.taotree.internal.cow.LongList scopeRetirees;
+        private org.taotree.internal.cow.MutationLog mutationLog;
+        private java.util.HashSet<Long> seenLeafPtrs;   // dedup for mutation log
+        private boolean scopeMutated;                    // any mutation happened?
+        private boolean lockedMode;                      // transitioned to locked mode?
+
+        private WriteScope(ConflictResolver resolver) {
+            this.resolver = resolver;
             if (chunkStore != null) {
                 this.scopeArena = threadArena();
                 this.scopeArena.beginScope();
+                // Snapshot published state for deferred commit
+                this.scopeSnapshot = publishedState();
+                this.scopeRoot = scopeSnapshot.root();
+                this.scopeSize = scopeSnapshot.size();
+                this.scopeRetirees = new org.taotree.internal.cow.LongList();
             } else {
                 this.scopeArena = null;
+                this.scopeSnapshot = null;
+                this.scopeRetirees = null;
             }
         }
 
@@ -1444,23 +1488,19 @@ public final class TaoTree implements AutoCloseable {
         public long lookup(MemorySegment key, int keyLen) {
             checkAccess();
             validateKeyLen(keyLen);
-            // If we hold the commit lock, read from the live root (our latest mutation)
-            long r = commitLockHeld ? root : publishedState().root();
-            return lookupFrom(r, key, keyLen);
+            return lookupFrom(currentRoot(), key, keyLen);
         }
 
         /** Point lookup (uses the tree's key length). */
         public long lookup(MemorySegment key) {
             checkAccess();
-            long r = commitLockHeld ? root : publishedState().root();
-            return lookupFrom(r, key, TaoTree.this.keyLen);
+            return lookupFrom(currentRoot(), key, TaoTree.this.keyLen);
         }
 
         public long lookup(byte[] key) {
             checkAccess();
             validateKeyLen(key.length);
-            long r = commitLockHeld ? root : publishedState().root();
-            return lookupFrom(r, MemorySegment.ofArray(key), key.length);
+            return lookupFrom(currentRoot(), MemorySegment.ofArray(key), key.length);
         }
 
         /**
@@ -1475,11 +1515,25 @@ public final class TaoTree implements AutoCloseable {
 
         public long size() {
             checkAccess();
-            return commitLockHeld ? size : publishedState().size();
+            return currentSize();
         }
         public boolean isEmpty() {
             checkAccess();
-            return (commitLockHeld ? size : publishedState().size()) == 0;
+            return currentSize() == 0;
+        }
+
+        /** Current root for this scope's view of the tree. */
+        private long currentRoot() {
+            if (scopeSnapshot != null && !lockedMode) return scopeRoot;
+            if (commitLockHeld) return root;
+            return publishedState().root();
+        }
+
+        /** Current size for this scope's view of the tree. */
+        private long currentSize() {
+            if (scopeSnapshot != null && !lockedMode) return scopeSize;
+            if (commitLockHeld) return size;
+            return publishedState().size();
         }
 
         /**
@@ -1558,7 +1612,8 @@ public final class TaoTree implements AutoCloseable {
         public void copyFrom(ReadScope sourceScope) {
             checkAccess();
             sourceScope.checkAccess();
-            ensureCommitLock();
+            if (scopeSnapshot != null && !lockedMode) transitionToLocked();
+            else ensureCommitLock();
             var ws = new WriteState(root, size);
             TaoTree.this.copyFromImpl(sourceScope.tree(), ws);
             root = ws.root;
@@ -1573,32 +1628,67 @@ public final class TaoTree implements AutoCloseable {
             }
         }
 
-        // -- Per-mutation optimistic COW + commit --
+        // -- Per-mutation deferred COW --
 
         /**
-         * First mutation: optimistic COW outside lock, then acquire commit lock
-         * to check for conflict and publish. Subsequent mutations: COW under
-         * commit lock (no conflict possible).
+         * Deferred-commit getOrCreate (file-backed mode): COW against the
+         * writer-private root, no lock held. Records mutations in the log
+         * for potential rebase at close().
+         *
+         * <p>Child-tree mode (no ChunkStore): falls back to the old
+         * commit-lock-on-first-mutation model.
          */
         private long optimisticGetOrCreate(MemorySegment key, int keyLen, int leafClass) {
+            if (scopeSnapshot != null && !lockedMode) {
+                // File-backed deferred-commit mode: COW against private root
+                scopeMutated = true;
+                if (seenLeafPtrs == null) seenLeafPtrs = new java.util.HashSet<>();
+
+                var result = cowEngine.deferredGetOrCreateCopy(
+                        scopeArena, scopeRoot, key, keyLen, leafClass);
+                long ptr = result.leafPtr();
+
+                // If the leaf was returned unchanged (arena-allocated), check
+                // whether it's from THIS scope or from the published tree
+                // (stale arena allocation from another writer's rebase).
+                // Force-copy stale leaves to get a truly private copy.
+                if (!result.mutated() && !seenLeafPtrs.contains(ptr)) {
+                    result = cowEngine.deferredGetOrCreateForceCopy(
+                            scopeArena, scopeRoot, key, keyLen, leafClass);
+                    ptr = result.leafPtr();
+                }
+
+                if (result.mutated()) {
+                    scopeRoot = result.newRoot();
+                    scopeSize += result.sizeDelta();
+                    collectRetirees(result);
+                }
+                // Record for potential rebase (de-duplicated by leafPtr).
+                // Snapshot the leaf value BEFORE the application modifies it
+                // so the conflict resolver can compute deltas for accumulators.
+                if (seenLeafPtrs.add(ptr)) {
+                    if (mutationLog == null) {
+                        mutationLog = new org.taotree.internal.cow.MutationLog();
+                    }
+                    MemorySegment snapshotValue = leafValueImpl(ptr);
+                    int classId = leafClassIds[leafClass];
+                    int valueSize = slab.segmentSize(classId) - keySlotSize;
+                    mutationLog.record(key, keyLen, leafClass, ptr, snapshotValue, valueSize);
+                }
+                return ptr;
+            }
+
+            // Child-tree mode: old model (commit lock on first mutation)
             if (commitLockHeld) {
-                // Subsequent mutation: COW under commit lock, publish immediately
-                // Re-publish first to ensure prior leaf value writes are visible
                 publishRoot();
                 return lockedGetOrCreate(key, keyLen, leafClass);
             }
-
-            // First mutation: optimistic COW outside the lock
             var snapshot = publishedState();
             CowEngine.DeferredResult result = doCow(key, keyLen, leafClass, snapshot.root());
-
-            // Acquire commit lock and publish
             commitLock.lock();
             commitLockHeld = true;
             var current = publishedState();
             if (current != snapshot && result.mutated()) {
-                // Conflict: redo one COW against the new root
-                // Don't retire stale retirees — they overlap with the winner's
                 result = doCow(key, keyLen, leafClass, current.root());
             }
             if (result.mutated()) {
@@ -1608,14 +1698,20 @@ public final class TaoTree implements AutoCloseable {
         }
 
         private boolean optimisticDelete(MemorySegment key, int keyLen) {
+            if (scopeSnapshot != null && !lockedMode) {
+                // Transition from deferred to locked mode: commit any pending
+                // deferred mutations first, then delete under the commit lock.
+                transitionToLocked();
+                return lockedDelete(key, keyLen);
+            }
+
+            // Child-tree mode
             if (commitLockHeld) {
                 publishRoot();
                 return lockedDelete(key, keyLen);
             }
-
             var snapshot = publishedState();
             CowEngine.DeferredResult result = doDeleteCow(key, keyLen, snapshot.root());
-
             commitLock.lock();
             commitLockHeld = true;
             var current = publishedState();
@@ -1628,7 +1724,7 @@ public final class TaoTree implements AutoCloseable {
             return result.mutated();
         }
 
-        /** COW under commit lock (second+ mutation in scope). */
+        /** COW under commit lock (child-tree mode, second+ mutation in scope). */
         private long lockedGetOrCreate(MemorySegment key, int keyLen, int leafClass) {
             var result = doCow(key, keyLen, leafClass, root);
             if (result.mutated()) {
@@ -1662,12 +1758,18 @@ public final class TaoTree implements AutoCloseable {
             return cowEngine.deferredDelete(currentRoot, key, keyLen);
         }
 
-        /** Apply a mutation result: update root/size, retire old nodes. */
+        /** Collect retirees from a deferred result into the scope's retiree list. */
+        private void collectRetirees(CowEngine.DeferredResult result) {
+            var retirees = result.retirees();
+            for (int i = 0, n = retirees.size(); i < n; i++) {
+                scopeRetirees.add(retirees.get(i));
+            }
+        }
+
+        /** Apply a mutation result to the outer tree's root/size (child-tree mode). */
         private void applyResult(CowEngine.DeferredResult result) {
             root = result.newRoot();
             size += result.sizeDelta();
-            // Don't publish yet — caller may write leaf values first.
-            // Publication happens on next mutation (via publishRoot()) or close().
             if (reclaimer != null) {
                 var retirees = result.retirees();
                 for (int i = 0, n = retirees.size(); i < n; i++) {
@@ -1675,6 +1777,21 @@ public final class TaoTree implements AutoCloseable {
                 }
                 reclaimer.advanceGeneration();
             }
+        }
+
+        /**
+         * Transition from deferred-commit mode to locked mode.
+         * Commits any pending deferred mutations under the commit lock,
+         * then operates in locked mode for subsequent mutations (deletes).
+         */
+        private void transitionToLocked() {
+            if (scopeMutated) {
+                deferredCommitImpl(true); // commit + keep lock held
+            } else {
+                ensureCommitLock();
+            }
+            lockedMode = true;
+            scopeMutated = false; // already committed
         }
 
         private void ensureCommitLock() {
@@ -1693,15 +1810,139 @@ public final class TaoTree implements AutoCloseable {
             if (!closed) {
                 checkThread();
                 closed = true;
-                if (commitLockHeld) {
-                    // Final publish: ensures all leaf value writes from the last
-                    // mutation are visible to readers via JMM setRelease transitivity
+                if (scopeSnapshot != null && scopeMutated) {
+                    // Deferred-commit mode: acquire lock, check conflict, publish
+                    deferredCommit();
+                } else if (commitLockHeld) {
+                    // Child-tree mode: publish and release
                     publishRoot();
                     commitLock.unlock();
                 }
                 if (scopeArena != null) {
                     scopeArena.endScope();
                 }
+            }
+        }
+
+        /**
+         * Deferred commit: acquire the commit lock, check for conflict with
+         * concurrent writers, rebase if needed, and publish.
+         */
+        private void deferredCommit() {
+            deferredCommitImpl(false);
+        }
+
+        private void deferredCommitImpl(boolean keepLock) {
+            if (!commitLockHeld) {
+                commitLock.lock();
+                commitLockHeld = true;
+            }
+            try {
+                var current = publishedState();
+                if (current == scopeSnapshot) {
+                    // No conflict — publish our private root directly
+                    root = scopeRoot;
+                    size = scopeSize;
+                    publishRoot();
+                    retireScope(scopeRetirees);
+                } else {
+                    // Conflict: another writer published since our snapshot.
+                    // Replay mutation log against the new root.
+                    rebase(current);
+                }
+            } finally {
+                if (!keepLock) {
+                    commitLock.unlock();
+                    commitLockHeld = false;
+                }
+            }
+        }
+
+        /**
+         * Replay the mutation log against a new root, copying leaf values
+         * from our private COW copies to the rebased copies.
+         *
+         * <p>For keys that already existed in the published tree (sizeDelta == 0),
+         * a {@link ConflictResolver} is consulted (if provided) to decide whether
+         * the pending value should replace the published value.
+         */
+        private void rebase(PublicationState current) {
+            // The stale COW copies from our original mutation phase are
+            // arena-allocated and will be reclaimed with the arena pages.
+            // We don't need to explicitly retire them — they're in our
+            // WriterArena which lives beyond the scope.
+
+            long rebaseRoot = current.root();
+            long rebaseSize = current.size();
+            var rebaseRetirees = new org.taotree.internal.cow.LongList();
+
+            // Reusable LeafAccessors for the conflict resolver (avoids allocation per entry)
+            LeafAccessor targetAcc = resolver != null
+                    ? new LeafAccessor(MemorySegment.ofArray(new byte[1]), boundLeafLayout, TaoTree.this) : null;
+            LeafAccessor pendingAcc = resolver != null
+                    ? new LeafAccessor(MemorySegment.ofArray(new byte[1]), boundLeafLayout, TaoTree.this) : null;
+            LeafAccessor snapshotAcc = resolver != null
+                    ? new LeafAccessor(MemorySegment.ofArray(new byte[1]), boundLeafLayout, TaoTree.this) : null;
+
+            // Mutation log is already de-duplicated by leafPtr at recording time
+            for (int i = 0, n = mutationLog.size(); i < n; i++) {
+                byte[] keyBytes = mutationLog.key(i);
+                int kl = mutationLog.keyLen(i);
+                int lc = mutationLog.leafClass(i);
+                long oldLeafPtr = mutationLog.leafPtr(i);
+
+                var keySeg = MemorySegment.ofArray(keyBytes);
+                // Force-copy during rebase: the published tree may contain
+                // arena-allocated leaves from another writer's arena.
+                var result = cowEngine.deferredGetOrCreateForceCopy(
+                        scopeArena, rebaseRoot, keySeg, kl, lc);
+
+                if (result.mutated()) {
+                    rebaseRoot = result.newRoot();
+                    rebaseSize += result.sizeDelta();
+                    var rets = result.retirees();
+                    for (int j = 0, rn = rets.size(); j < rn; j++) {
+                        rebaseRetirees.add(rets.get(j));
+                    }
+                }
+
+                // Merge leaf values from the old private leaf into the rebased leaf
+                MemorySegment oldValue = leafValueImpl(oldLeafPtr);
+                MemorySegment newValue = leafValueImpl(result.leafPtr());
+                int classId = leafClassIds[lc];
+                int valueSize = slab.segmentSize(classId) - keySlotSize;
+
+                if (result.sizeDelta() > 0) {
+                    // New key created during rebase — always copy our value
+                    MemorySegment.copy(oldValue, 0, newValue, 0, valueSize);
+                } else if (resolver != null) {
+                    // Existing key — let the resolver merge using all three values
+                    targetAcc.rebind(newValue);
+                    pendingAcc.rebind(oldValue.asReadOnly());
+                    snapshotAcc.rebind(MemorySegment.ofArray(mutationLog.snapshotValue(i)));
+                    resolver.merge(targetAcc, pendingAcc, snapshotAcc);
+                } else {
+                    // No resolver — last-writer-wins (overwrite)
+                    MemorySegment.copy(oldValue, 0, newValue, 0, valueSize);
+                }
+            }
+
+            root = rebaseRoot;
+            size = rebaseSize;
+            publishRoot();
+            // Retire nodes from the rebase (nodes from the published tree that
+            // were replaced). Also retire nodes from the original stale COW phase
+            // that are slab-allocated (arena-allocated ones don't need retirement).
+            retireScope(rebaseRetirees);
+            retireScope(scopeRetirees);
+        }
+
+        private void retireScope(org.taotree.internal.cow.LongList retirees) {
+            if (reclaimer != null && retirees != null) {
+                for (int i = 0, n = retirees.size(); i < n; i++) {
+                    reclaimer.retire(retirees.get(i));
+                }
+                reclaimer.advanceGeneration();
             }
         }
 

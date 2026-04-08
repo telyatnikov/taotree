@@ -9,8 +9,8 @@ import java.lang.foreign.ValueLayout;
  *
  * <p>File layout:
  * <ul>
- *   <li>Pages 0-1: Checkpoint slot A (8 KB)</li>
- *   <li>Pages 2-3: Checkpoint slot B (8 KB)</li>
+ *   <li>Pages 0-3: Checkpoint slot A (16 KB)</li>
+ *   <li>Pages 4-7: Checkpoint slot B (16 KB)</li>
  * </ul>
  *
  * <p>Each checkpoint slot contains:
@@ -33,7 +33,7 @@ import java.lang.foreign.ValueLayout;
  * </pre>
  *
  * <p>Followed by {@code sectionCount} {@link SectionRef} entries (44 bytes each),
- * then the inline data area (variable size, up to fill the 8 KB slot).
+ * then the inline data area (variable size, up to fill the 16 KB slot).
  */
 public final class CheckpointV2 {
 
@@ -45,10 +45,10 @@ public final class CheckpointV2 {
 
     /** Page offset of checkpoint slot A. */
     public static final int SLOT_A_PAGE = 0;
-    /** Page offset of checkpoint slot B. */
-    public static final int SLOT_B_PAGE = 2;
-    /** Number of pages per checkpoint slot (8 KB at 4 KB page size). */
-    public static final int SLOT_SIZE_PAGES = 2;
+    /** Page offset of checkpoint slot B (= SLOT_A_PAGE + SLOT_SIZE_PAGES). */
+    public static final int SLOT_B_PAGE = 4;
+    /** Number of pages per checkpoint slot (16 KB at 4 KB page size). */
+    public static final int SLOT_SIZE_PAGES = 4;
 
     // -----------------------------------------------------------------------
     // Incompatible feature bits
@@ -141,6 +141,13 @@ public final class CheckpointV2 {
         // --- Inline data ---
         long inlineStart = sectionStart + (long) sectionCount * SECTION_REF_SIZE;
         int inlineLength = data.inlineData != null ? data.inlineData.length : 0;
+        long slotCapacity = (long) SLOT_SIZE_PAGES * 4096L; // PAGE_SIZE = 4096
+        if (inlineStart + inlineLength > slotCapacity) {
+            throw new IllegalStateException(
+                    "Checkpoint inline data too large: " + inlineLength
+                    + " bytes at offset " + inlineStart
+                    + " exceeds slot capacity of " + slotCapacity + " bytes");
+        }
         if (inlineLength > 0) {
             MemorySegment.copy(
                     MemorySegment.ofArray(data.inlineData), 0,
