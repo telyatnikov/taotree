@@ -7,8 +7,10 @@ import org.taotree.layout.*;
 
 import java.io.File;
 import java.lang.foreign.Arena;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.LongAdder;
@@ -109,6 +111,7 @@ public class GbifBenchmark {
             }
 
             double elapsedSec = (System.nanoTime() - startNs) / 1e9;
+            vacuumStore(storePath);
 
             // Reopen read-only for metrics
             tree = TaoTree.open(storePath, GbifTracker.KEY_LAYOUT, GbifTracker.LEAF_LAYOUT);
@@ -145,6 +148,47 @@ public class GbifBenchmark {
                 fileSize, slabBytes, segsInUse, overflowBytes, overflowPages, ok);
         } finally {
             Files.deleteIfExists(storePath);
+        }
+    }
+
+    private static void vacuumStore(Path storePath) throws Exception {
+        Path compactedPath = storePath.resolveSibling(storePath.getFileName() + ".vacuum");
+        Files.deleteIfExists(compactedPath);
+        try {
+            try (var source = TaoTree.open(storePath, GbifTracker.KEY_LAYOUT, GbifTracker.LEAF_LAYOUT);
+                 var compacted = GbifTracker.createFresh(compactedPath)) {
+                copyDictionaries(source.keyLayout(), compacted.keyLayout());
+                compacted.copyFrom(source);
+                compacted.sync();
+            }
+            try {
+                Files.move(compactedPath, storePath,
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException ignored) {
+                Files.move(compactedPath, storePath, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } finally {
+            Files.deleteIfExists(compactedPath);
+        }
+    }
+
+    private static void copyDictionaries(KeyLayout sourceLayout, KeyLayout targetLayout) {
+        if (sourceLayout.fieldCount() != targetLayout.fieldCount()) {
+            throw new IllegalArgumentException(
+                "Key layout field count mismatch: source=" + sourceLayout.fieldCount()
+                + " target=" + targetLayout.fieldCount());
+        }
+        for (int i = 0; i < sourceLayout.fieldCount(); i++) {
+            KeyField sourceField = sourceLayout.field(i);
+            KeyField targetField = targetLayout.field(i);
+            if (sourceField instanceof KeyField.DictU16 sourceDict
+                    && targetField instanceof KeyField.DictU16 targetDict) {
+                targetDict.dict().copyFrom(sourceDict.dict());
+            } else if (sourceField instanceof KeyField.DictU32 sourceDict
+                    && targetField instanceof KeyField.DictU32 targetDict) {
+                targetDict.dict().copyFrom(sourceDict.dict());
+            }
         }
     }
 

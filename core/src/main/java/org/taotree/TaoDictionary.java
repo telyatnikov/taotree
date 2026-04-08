@@ -128,9 +128,14 @@ public final class TaoDictionary {
      * @throws IllegalStateException if the dictionary is full
      */
     public int intern(String value) {
+        byte[] padded = encodeAndPad(value);
+        int existing = resolveEncoded(padded);
+        if (existing != -1) {
+            return existing;
+        }
         dictLock.lock();
         try {
-            return internImpl(value);
+            return internEncoded(value, padded);
         } finally {
             dictLock.unlock();
         }
@@ -178,7 +183,7 @@ public final class TaoDictionary {
     /** Write scope of the dictionary. Holds the per-dictionary lock. */
     public final class WriteScope implements AutoCloseable {
         /** Intern a string: return its code, assigning a new one if not yet known. */
-        public int intern(String value) { return internImpl(value); }
+        public int intern(String value) { return internEncoded(value, encodeAndPad(value)); }
 
         /** Resolve a string to its code. Returns -1 if not found. */
         public int resolve(String value) { return resolveImpl(value); }
@@ -242,7 +247,10 @@ public final class TaoDictionary {
     }
 
     private int internImpl(String value) {
-        byte[] padded = encodeAndPad(value);
+        return internEncoded(value, encodeAndPad(value));
+    }
+
+    private int internEncoded(String value, byte[] padded) {
         var ws = tree.beginWrite();
         long leafRef = tree.getOrCreateWith(ws, MemorySegment.ofArray(padded), MAX_KEY_LEN, 0);
         MemorySegment leaf = tree.leafValueImpl(leafRef);
@@ -265,7 +273,10 @@ public final class TaoDictionary {
     }
 
     private int resolveImpl(String value) {
-        byte[] padded = encodeAndPad(value);
+        return resolveEncoded(encodeAndPad(value));
+    }
+
+    private int resolveEncoded(byte[] padded) {
         // Lock-free lookup via acquire on published state
         long leafRef = tree.lookupLockFree(MemorySegment.ofArray(padded), MAX_KEY_LEN);
         if (NodePtr.isEmpty(leafRef)) return -1;

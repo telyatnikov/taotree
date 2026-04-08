@@ -168,7 +168,7 @@ public final class TaoTree implements AutoCloseable {
     private LeafLayout boundLeafLayout;
 
     // String layouts per slab class ID (for copyFrom out-of-line string handling)
-    private final java.util.Map<Integer, TaoString.Layout> stringLayouts = new java.util.HashMap<>();
+    private final java.util.Map<Integer, java.util.List<TaoString.Layout>> stringLayouts = new java.util.HashMap<>();
 
     // Per-thread WriterArena reuse: each thread gets a dedicated arena that persists
     // across WriteScopes, avoiding wasteful batch re-reservation on every scope open.
@@ -519,7 +519,8 @@ public final class TaoTree implements AutoCloseable {
      * @param layout         the string layout descriptor
      */
     public void registerStringLayout(int leafClassIndex, TaoString.Layout layout) {
-        stringLayouts.put(leafClassIds[leafClassIndex], layout);
+        stringLayouts.computeIfAbsent(leafClassIds[leafClassIndex], ignored -> new java.util.ArrayList<>())
+            .add(layout);
     }
 
     // -----------------------------------------------------------------------
@@ -2439,23 +2440,23 @@ public final class TaoTree implements AutoCloseable {
             MemorySegment srcValue = srcFull.asSlice(source.keySlotSize);
             MemorySegment tgtValue = target.leafValueImpl(tgtLeafPtr);
 
-            TaoString.Layout layout = target.stringLayouts.get(target.leafClassIds[leafClassIdx]);
-            if (layout != null) {
-                int len = srcValue.get(ValueLayout.JAVA_INT_UNALIGNED, layout.lenOffset());
-                if (len > layout.inlineThreshold()) {
+            MemorySegment.copy(srcValue, 0, tgtValue, 0, srcValue.byteSize());
+            var layouts = target.stringLayouts.get(target.leafClassIds[leafClassIdx]);
+            if (layouts != null) {
+                for (var layout : layouts) {
+                    int len = srcValue.get(ValueLayout.JAVA_INT_UNALIGNED, layout.lenOffset());
+                    if (len <= layout.inlineThreshold()) {
+                        continue;
+                    }
                     long srcRef = srcValue.get(ValueLayout.JAVA_LONG_UNALIGNED, layout.ptrOffset());
                     MemorySegment srcData = source.bump.resolve(srcRef, len);
 
                     long tgtRef = target.bump.allocate(len);
                     MemorySegment tgtData = target.bump.resolve(tgtRef, len);
                     MemorySegment.copy(srcData, 0, tgtData, 0, len);
-
-                    MemorySegment.copy(srcValue, 0, tgtValue, 0, srcValue.byteSize());
                     tgtValue.set(ValueLayout.JAVA_LONG_UNALIGNED, layout.ptrOffset(), tgtRef);
-                    return;
                 }
             }
-            MemorySegment.copy(srcValue, 0, tgtValue, 0, srcValue.byteSize());
         }
     }
 

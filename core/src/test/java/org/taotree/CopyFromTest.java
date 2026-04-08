@@ -2,8 +2,15 @@ package org.taotree;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.taotree.layout.KeyBuilder;
+import org.taotree.layout.KeyField;
+import org.taotree.layout.KeyLayout;
+import org.taotree.layout.LeafField;
+import org.taotree.layout.LeafHandle;
+import org.taotree.layout.LeafLayout;
 
 import java.io.IOException;
+import java.lang.foreign.Arena;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Path;
 
@@ -16,6 +23,15 @@ class CopyFromTest {
 
     private static final int KEY_LEN = 4;
     private static final int VALUE_SIZE = 8;
+    private static final KeyLayout MULTI_STR_KEY_LAYOUT = KeyLayout.of(KeyField.uint32("id"));
+    private static final LeafLayout MULTI_STR_LEAF_LAYOUT = LeafLayout.of(
+        LeafField.string("a"),
+        LeafField.string("b"),
+        LeafField.json("c")
+    );
+    private static final LeafHandle.Str FIELD_A = MULTI_STR_LEAF_LAYOUT.string("a");
+    private static final LeafHandle.Str FIELD_B = MULTI_STR_LEAF_LAYOUT.string("b");
+    private static final LeafHandle.Json FIELD_C = MULTI_STR_LEAF_LAYOUT.json("c");
 
     @TempDir Path tmp;
     private int fc;
@@ -180,6 +196,40 @@ class CopyFromTest {
                     long leaf = r.lookup(intKey(i));
                     assertNotEquals(TaoTree.NOT_FOUND, leaf);
                     assertEquals(longString(i), TaoString.read(r.leafValue(leaf), tgt));
+                }
+            }
+        }
+    }
+
+    @Test
+    void copyWithMultipleOverflowStringFields() throws IOException {
+        try (var src = TaoTree.create(tmp.resolve(fc++ + ".tao"), MULTI_STR_KEY_LAYOUT, MULTI_STR_LEAF_LAYOUT);
+             var tgt = TaoTree.create(tmp.resolve(fc++ + ".tao"), MULTI_STR_KEY_LAYOUT, MULTI_STR_LEAF_LAYOUT);
+             var arena = Arena.ofConfined()) {
+
+            KeyBuilder kb = src.newKeyBuilder(arena);
+            try (var w = src.write()) {
+                for (int i = 0; i < 10; i++) {
+                    kb.setU32(0, i);
+                    var leaf = w.getOrCreate(kb);
+                    leaf.set(FIELD_A, longString(i) + "_a");
+                    leaf.set(FIELD_B, longString(i) + "_b");
+                    leaf.set(FIELD_C, "{\"value\":" + i + ",\"text\":\"" + longString(i) + "_c\"}");
+                }
+            }
+
+            tgt.copyFrom(src);
+
+            try (var r = tgt.read()) {
+                KeyBuilder readKey = tgt.newKeyBuilder(arena);
+                for (int i = 0; i < 10; i++) {
+                    readKey.setU32(0, i);
+                    var leaf = r.lookup(readKey);
+                    assertNotNull(leaf);
+                    assertEquals(longString(i) + "_a", leaf.get(FIELD_A));
+                    assertEquals(longString(i) + "_b", leaf.get(FIELD_B));
+                    assertEquals("{\"value\":" + i + ",\"text\":\"" + longString(i) + "_c\"}",
+                        leaf.get(FIELD_C));
                 }
             }
         }
