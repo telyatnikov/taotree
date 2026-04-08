@@ -10,6 +10,8 @@ import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 import org.taotree.TaoTree;
@@ -414,6 +416,57 @@ class BumpAllocatorTest {
             // Verify all
             for (int i = 0; i < 100; i++) {
                 assertEquals((byte) i, bump.resolve(ptrs[i], 500).get(ValueLayout.JAVA_BYTE, 0));
+            }
+        }
+    }
+
+    @Test
+    void concurrentAllocationsPreserveData() throws Exception {
+        try (var arena = Arena.ofShared()) {
+            Path tmp = Files.createTempFile("bump-test-", ".dat");
+            tmp.toFile().deleteOnExit();
+            Files.delete(tmp);
+            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var bump = new BumpAllocator(arena, cs, 4096);
+
+            int threads = 4;
+            int allocationsPerThread = 64;
+            long[][] ptrs = new long[threads][allocationsPerThread];
+            var failure = new AtomicReference<Throwable>();
+            var done = new CountDownLatch(threads);
+
+            for (int t = 0; t < threads; t++) {
+                final int threadId = t;
+                Thread.ofPlatform().start(() -> {
+                    try {
+                        for (int i = 0; i < allocationsPerThread; i++) {
+                            long ptr = bump.allocate(256);
+                            ptrs[threadId][i] = ptr;
+                            MemorySegment seg = bump.resolve(ptr, 256);
+                            seg.fill((byte) (threadId + 1));
+                            seg.set(ValueLayout.JAVA_INT_UNALIGNED, 0, threadId);
+                            seg.set(ValueLayout.JAVA_INT_UNALIGNED, 4, i);
+                        }
+                    } catch (Throwable t1) {
+                        failure.compareAndSet(null, t1);
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+
+            done.await();
+            if (failure.get() != null) {
+                throw new AssertionError(failure.get());
+            }
+
+            for (int t = 0; t < threads; t++) {
+                for (int i = 0; i < allocationsPerThread; i++) {
+                    MemorySegment seg = bump.resolve(ptrs[t][i], 256);
+                    assertEquals(t, seg.get(ValueLayout.JAVA_INT_UNALIGNED, 0));
+                    assertEquals(i, seg.get(ValueLayout.JAVA_INT_UNALIGNED, 4));
+                    assertEquals((byte) (t + 1), seg.get(ValueLayout.JAVA_BYTE, 16));
+                }
             }
         }
     }

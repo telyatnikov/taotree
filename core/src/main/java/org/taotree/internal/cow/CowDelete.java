@@ -67,7 +67,8 @@ final class CowDelete {
             CowContext ctx, CowEngine.PathStack path, long replacement,
             long originalTarget) {
         long current = replacement;
-        var retirees = new LongList();
+        var retirees = CowEngine.RETIREE_CACHE.get();
+        retirees.clear();
         ctx.addIfSlabAllocated(retirees, originalTarget);
 
         for (int i = path.depth - 1; i >= 0; i--) {

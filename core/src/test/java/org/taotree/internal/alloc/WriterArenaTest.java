@@ -38,10 +38,9 @@ class WriterArenaTest {
             var wa = new WriterArena(cs);
             wa.beginScope();
 
-            var result = wa.alloc(64, NodePtr.NODE_4, 1);
-            assertNotNull(result.segment());
-            assertNotEquals(0, result.nodePtr());
-            assertTrue(WriterArena.isArenaAllocated(result.nodePtr()));
+            long ptr = wa.alloc(64, NodePtr.NODE_4, 1);
+            assertNotEquals(0, ptr);
+            assertTrue(WriterArena.isArenaAllocated(ptr));
             assertEquals(1, wa.allocCount());
 
             wa.endScope();
@@ -59,9 +58,9 @@ class WriterArenaTest {
             var ptrs = new HashSet<Long>();
             int count = 100;
             for (int i = 0; i < count; i++) {
-                var result = wa.alloc(40, NodePtr.LEAF, 2);
-                assertTrue(ptrs.add(result.nodePtr()), "Duplicate pointer at iteration " + i);
-                assertTrue(WriterArena.isArenaAllocated(result.nodePtr()));
+                long ptr = wa.alloc(40, NodePtr.LEAF, 2);
+                assertTrue(ptrs.add(ptr), "Duplicate pointer at iteration " + i);
+                assertTrue(WriterArena.isArenaAllocated(ptr));
             }
 
             assertEquals(count, wa.allocCount());
@@ -112,17 +111,18 @@ class WriterArenaTest {
             wa.beginScope();
 
             // Allocate and write data
-            var result = wa.alloc(32, NodePtr.LEAF, 0);
-            result.segment().set(ValueLayout.JAVA_LONG, 0, 0xDEAD_BEEF_CAFE_BABEL);
-            result.segment().set(ValueLayout.JAVA_INT, 8, 42);
+            long ptr = wa.alloc(32, NodePtr.LEAF, 0);
+            MemorySegment seg = wa.resolve(ptr, 32);
+            seg.set(ValueLayout.JAVA_LONG, 0, 0xDEAD_BEEF_CAFE_BABEL);
+            seg.set(ValueLayout.JAVA_INT, 8, 42);
 
             // Resolve via static method with the ChunkStore
-            MemorySegment resolved = WriterArena.resolve(cs, result.nodePtr(), 32);
+            MemorySegment resolved = WriterArena.resolve(cs, ptr, 32);
             assertEquals(0xDEAD_BEEF_CAFE_BABEL, resolved.get(ValueLayout.JAVA_LONG, 0));
             assertEquals(42, resolved.get(ValueLayout.JAVA_INT, 8));
 
             // Resolve via instance method
-            MemorySegment resolved2 = wa.resolve(result.nodePtr(), 32);
+            MemorySegment resolved2 = wa.resolve(ptr, 32);
             assertEquals(0xDEAD_BEEF_CAFE_BABEL, resolved2.get(ValueLayout.JAVA_LONG, 0));
 
             wa.endScope();
@@ -137,8 +137,7 @@ class WriterArenaTest {
             var wa = new WriterArena(cs);
             wa.beginScope();
 
-            var result = wa.alloc(64, NodePtr.NODE_16, 3);
-            long ptr = result.nodePtr();
+            long ptr = wa.alloc(64, NodePtr.NODE_16, 3);
 
             // Verify arena flag in metadata
             assertTrue(WriterArena.isArenaAllocated(ptr));
@@ -151,7 +150,8 @@ class WriterArenaTest {
             assertEquals(3, NodePtr.slabClassId(ptr));
 
             // Write and read back through resolve
-            result.segment().set(ValueLayout.JAVA_LONG, 0, 0xABCD_1234_5678_9ABCL);
+            MemorySegment seg = wa.resolve(ptr, 64);
+            seg.set(ValueLayout.JAVA_LONG, 0, 0xABCD_1234_5678_9ABCL);
             MemorySegment resolved = WriterArena.resolve(cs, ptr, 64);
             assertEquals(0xABCD_1234_5678_9ABCL, resolved.get(ValueLayout.JAVA_LONG, 0));
 
@@ -174,9 +174,10 @@ class WriterArenaTest {
             int count = 500;
             long[] ptrs = new long[count];
             for (int i = 0; i < count; i++) {
-                var result = wa.alloc(512, NodePtr.LEAF, 0);
-                result.segment().set(ValueLayout.JAVA_INT, 0, i);
-                ptrs[i] = result.nodePtr();
+                long ptr = wa.alloc(512, NodePtr.LEAF, 0);
+                MemorySegment seg = wa.resolve(ptr, 512);
+                seg.set(ValueLayout.JAVA_INT, 0, i);
+                ptrs[i] = ptr;
             }
 
             assertEquals(count, wa.allocCount());
@@ -227,15 +228,15 @@ class WriterArenaTest {
             wa.beginScope();
 
             // Allocate an odd-sized node; should be 8-byte aligned internally
-            var r1 = wa.alloc(13, NodePtr.LEAF, 0);
-            var r2 = wa.alloc(13, NodePtr.LEAF, 0);
+            long r1 = wa.alloc(13, NodePtr.LEAF, 0);
+            long r2 = wa.alloc(13, NodePtr.LEAF, 0);
 
             // Both should be different pointers (different offsets)
-            assertNotEquals(r1.nodePtr(), r2.nodePtr());
+            assertNotEquals(r1, r2);
 
             // Packed offsets should be 8-byte aligned
-            int off1 = NodePtr.offset(r1.nodePtr()) & 0xFFF;
-            int off2 = NodePtr.offset(r2.nodePtr()) & 0xFFF;
+            int off1 = NodePtr.offset(r1) & 0xFFF;
+            int off2 = NodePtr.offset(r2) & 0xFFF;
             assertEquals(0, off1 % 8, "First allocation offset not 8-byte aligned");
             assertEquals(0, off2 % 8, "Second allocation offset not 8-byte aligned");
 

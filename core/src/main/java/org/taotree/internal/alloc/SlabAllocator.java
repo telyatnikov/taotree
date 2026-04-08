@@ -124,6 +124,14 @@ public final class SlabAllocator implements AutoCloseable {
     }
 
     /**
+     * Return the backing slab segment for a pointer without creating a slice.
+     */
+    public MemorySegment backingSegment(long ptr) {
+        int classId = NodePtr.slabClassId(ptr);
+        return classes[classId].backingSegment(ptr);
+    }
+
+    /**
      * Resolve a pointer to a {@link MemorySegment} slice of the given length.
      * Useful when only a prefix of the segment is needed.
      */
@@ -313,6 +321,10 @@ public final class SlabAllocator implements AutoCloseable {
             int slabId = NodePtr.slabId(ptr);
             int offset = NodePtr.offset(ptr);
             return slabs[slabId].asSlice(offset, segmentSize);
+        }
+
+        MemorySegment backingSegment(long ptr) {
+            return slabs[NodePtr.slabId(ptr)];
         }
 
         MemorySegment resolve(long ptr, int length) {

@@ -126,6 +126,20 @@ class TaoKeyTest {
     }
 
     @Test
+    void encodeStringIntoWritesEscapedBytesIntoProvidedBuffer() {
+        byte[] buffer = new byte[8];
+        int len = TaoKey.encodeStringInto("\u0000\u0001A", buffer);
+
+        assertEquals(6, len);
+        assertArrayEquals(new byte[]{0x01, 0x00, 0x01, 0x01, 0x41, 0x00, 0x00, 0x00}, buffer);
+    }
+
+    @Test
+    void encodeStringIntoReportsOverflow() {
+        assertEquals(-1, TaoKey.encodeStringInto("abc", new byte[3]));
+    }
+
+    @Test
     void encodeStringOrdering() {
         byte[] abc = TaoKey.encodeString("abc");
         byte[] abd = TaoKey.encodeString("abd");

@@ -42,22 +42,38 @@ public final class Node4 {
 
     /** Get the number of children. */
     public static int count(MemorySegment seg) {
-        return Byte.toUnsignedInt(seg.get(ValueLayout.JAVA_BYTE, OFF_COUNT));
+        return count(seg, 0);
+    }
+
+    public static int count(MemorySegment seg, long baseOffset) {
+        return Byte.toUnsignedInt(seg.get(ValueLayout.JAVA_BYTE, baseOffset + OFF_COUNT));
     }
 
     /** Get the key byte at position {@code pos} (0-based, within count). */
     public static byte keyAt(MemorySegment seg, int pos) {
-        return seg.get(ValueLayout.JAVA_BYTE, OFF_KEYS + pos);
+        return keyAt(seg, 0, pos);
+    }
+
+    public static byte keyAt(MemorySegment seg, long baseOffset, int pos) {
+        return seg.get(ValueLayout.JAVA_BYTE, baseOffset + OFF_KEYS + pos);
     }
 
     /** Get the child pointer at position {@code pos}. */
     public static long childAt(MemorySegment seg, int pos) {
-        return seg.get(ValueLayout.JAVA_LONG, OFF_CHILDREN + (long) pos * 8);
+        return childAt(seg, 0, pos);
+    }
+
+    public static long childAt(MemorySegment seg, long baseOffset, int pos) {
+        return seg.get(ValueLayout.JAVA_LONG, baseOffset + OFF_CHILDREN + (long) pos * 8);
     }
 
     /** Set the child pointer at position {@code pos}. */
     public static void setChildAt(MemorySegment seg, int pos, long childPtr) {
-        seg.set(ValueLayout.JAVA_LONG, OFF_CHILDREN + (long) pos * 8, childPtr);
+        setChildAt(seg, 0, pos, childPtr);
+    }
+
+    public static void setChildAt(MemorySegment seg, long baseOffset, int pos, long childPtr) {
+        seg.set(ValueLayout.JAVA_LONG, baseOffset + OFF_CHILDREN + (long) pos * 8, childPtr);
     }
 
     /**
@@ -66,13 +82,24 @@ public final class Node4 {
      * @return the child {@link NodePtr}, or {@link NodePtr#EMPTY_PTR} if not found
      */
     public static long findChild(MemorySegment seg, byte key) {
-        int n = count(seg);
-        for (int i = 0; i < n; i++) {
-            if (keyAt(seg, i) == key) {
-                return childAt(seg, i);
-            }
-        }
-        return NodePtr.EMPTY_PTR;
+        return findChild(seg, 0, key);
+    }
+
+    public static long findChild(MemorySegment seg, long baseOffset, byte key) {
+        int n = count(seg, baseOffset);
+        long keysOffset = baseOffset + OFF_KEYS;
+        long childrenOffset = baseOffset + OFF_CHILDREN;
+        return switch (n) {
+            case 4 -> seg.get(ValueLayout.JAVA_BYTE, keysOffset + 3) == key
+                    ? seg.get(ValueLayout.JAVA_LONG, childrenOffset + 24)
+                    : findChildUpTo(seg, keysOffset, childrenOffset, key, 3);
+            case 3 -> findChildUpTo(seg, keysOffset, childrenOffset, key, 3);
+            case 2 -> findChildUpTo(seg, keysOffset, childrenOffset, key, 2);
+            case 1 -> seg.get(ValueLayout.JAVA_BYTE, keysOffset) == key
+                    ? seg.get(ValueLayout.JAVA_LONG, childrenOffset)
+                    : NodePtr.EMPTY_PTR;
+            default -> NodePtr.EMPTY_PTR;
+        };
     }
 
     /**
@@ -81,13 +108,19 @@ public final class Node4 {
      * @return the position (0..count-1), or -1 if not found
      */
     public static int findPos(MemorySegment seg, byte key) {
-        int n = count(seg);
-        for (int i = 0; i < n; i++) {
-            if (keyAt(seg, i) == key) {
-                return i;
-            }
-        }
-        return -1;
+        return findPos(seg, 0, key);
+    }
+
+    public static int findPos(MemorySegment seg, long baseOffset, byte key) {
+        int n = count(seg, baseOffset);
+        long keysOffset = baseOffset + OFF_KEYS;
+        return switch (n) {
+            case 4 -> seg.get(ValueLayout.JAVA_BYTE, keysOffset + 3) == key ? 3 : findPosUpTo(seg, keysOffset, key, 3);
+            case 3 -> findPosUpTo(seg, keysOffset, key, 3);
+            case 2 -> findPosUpTo(seg, keysOffset, key, 2);
+            case 1 -> seg.get(ValueLayout.JAVA_BYTE, keysOffset) == key ? 0 : -1;
+            default -> -1;
+        };
     }
 
     /**
@@ -183,5 +216,23 @@ public final class Node4 {
                                     byte newKey, long newChild) {
         Node16.copyFromNode4(dst16, src4);
         Node16.insertChild(dst16, newKey, newChild);
+    }
+
+    private static long findChildUpTo(MemorySegment seg, long keysOffset, long childrenOffset, byte key, int limit) {
+        for (int i = 0; i < limit; i++) {
+            if (seg.get(ValueLayout.JAVA_BYTE, keysOffset + i) == key) {
+                return seg.get(ValueLayout.JAVA_LONG, childrenOffset + (long) i * 8);
+            }
+        }
+        return NodePtr.EMPTY_PTR;
+    }
+
+    private static int findPosUpTo(MemorySegment seg, long keysOffset, byte key, int limit) {
+        for (int i = 0; i < limit; i++) {
+            if (seg.get(ValueLayout.JAVA_BYTE, keysOffset + i) == key) {
+                return i;
+            }
+        }
+        return -1;
     }
 }

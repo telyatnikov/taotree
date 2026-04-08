@@ -1,7 +1,6 @@
 package org.taotree.internal.cow;
 
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import org.taotree.internal.alloc.ChunkStore;
 import org.taotree.internal.alloc.SlabAllocator;
 import org.taotree.internal.alloc.WriterArena;
@@ -23,7 +22,7 @@ import org.taotree.internal.art.PrefixNode;
 final class CowContext {
 
     final SlabAllocator slab;
-    final WriterArena arena;       // null for child tree mode
+    WriterArena arena;             // null for child tree mode; mutable for thread-local reuse
     final ChunkStore chunkStore;   // null for child tree mode
 
     final int prefixClassId;
@@ -53,11 +52,17 @@ final class CowContext {
         this.leafClassIds = leafClassIds;
     }
 
+    /** Swap the arena for thread-local context reuse. */
+    CowContext withArena(WriterArena arena) {
+        this.arena = arena;
+        return this;
+    }
+
     // -- Allocation --
 
     long cowAlloc(int classId, int nodeType) {
         if (arena != null) {
-            return arena.alloc(slab.segmentSize(classId), nodeType, classId).nodePtr();
+            return arena.alloc(slab.segmentSize(classId), nodeType, classId);
         }
         return slab.allocate(classId, nodeType);
     }
@@ -66,7 +71,7 @@ final class CowContext {
         int classId = leafClassIds[leafClass];
         long ptr;
         if (arena != null) {
-            ptr = arena.alloc(slab.segmentSize(classId), NodePtr.LEAF, classId).nodePtr();
+            ptr = arena.alloc(slab.segmentSize(classId), NodePtr.LEAF, classId);
         } else {
             ptr = slab.allocate(classId);
         }
@@ -86,7 +91,7 @@ final class CowContext {
         int segSize = slab.segmentSize(classId);
         long newPtr;
         if (arena != null) {
-            newPtr = arena.alloc(segSize, NodePtr.LEAF, classId).nodePtr();
+            newPtr = arena.alloc(segSize, NodePtr.LEAF, classId);
         } else {
             newPtr = slab.allocate(classId);
         }
@@ -197,4 +202,5 @@ final class CowContext {
             retirees.add(nodePtr);
         }
     }
+
 }

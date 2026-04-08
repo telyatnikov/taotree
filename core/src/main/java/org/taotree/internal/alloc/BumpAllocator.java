@@ -4,6 +4,8 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import org.taotree.TaoString;
 
 /**
@@ -20,9 +22,10 @@ import org.taotree.TaoString;
  * <p>Deallocation is deferred: deleted payloads become dead space, reclaimed only during
  * compaction (vacuum).
  *
- * <p><b>Thread safety:</b> not thread-safe on its own. Must be accessed under the
- * owning tree's {@code ReentrantReadWriteLock}. Write operations (allocate) require
- * the write lock. Read operations (resolve) require at least the read lock.
+ * <p><b>Thread safety:</b> regular allocations use a thread-local cursor, so
+ * concurrent writers do not serialize on every {@link #allocate(int)} call.
+ * Threads only synchronize when they need to reserve a new backing page or map
+ * an oversized payload.
  */
 public final class BumpAllocator implements AutoCloseable {
 
@@ -35,13 +38,20 @@ public final class BumpAllocator implements AutoCloseable {
     private final ChunkStore chunkStore;
     private final int pageSize;
 
-    private MemorySegment[] pages;
-    private int[] pageStartPages;     // ChunkStore start page for each bump page
-    private int[] pageSizesInPages;   // number of ChunkStore pages per bump page
-    private int pageCount;            // number of allocated pages
-    private int currentPage;          // index of the page currently being bumped into
-    private int bumpOffset;           // next free byte in currentPage
-    private long bytesAllocated;      // total payload bytes allocated
+    private volatile MemorySegment[] pages;
+    private volatile int[] pageStartPages;     // ChunkStore start page for each bump page
+    private volatile int[] pageSizesInPages;   // number of ChunkStore pages per bump page
+    private volatile int pageCount;            // number of allocated pages
+    private volatile int currentPage;          // persisted continuation page (best-effort)
+    private volatile int bumpOffset;           // persisted continuation offset (best-effort)
+    private final AtomicLong bytesAllocated;
+
+    // After restore we allow exactly one thread to continue from the persisted tail.
+    // Other threads start with a fresh page reservation to avoid sharing the tail page.
+    private volatile int restoredTailPage = -1;
+    private volatile int restoredTailOffset;
+    private final AtomicBoolean restoredTailAvailable = new AtomicBoolean(false);
+    private final ThreadLocal<Cursor> cursors = ThreadLocal.withInitial(Cursor::new);
 
     // -----------------------------------------------------------------------
     // Construction
@@ -64,34 +74,34 @@ public final class BumpAllocator implements AutoCloseable {
         this.pageCount = 0;
         this.currentPage = -1;
         this.bumpOffset = 0;
-        this.bytesAllocated = 0;
+        this.bytesAllocated = new AtomicLong();
     }
 
     /**
      * Allocate space for a payload of the given length.
      *
-     * <p>Thread-safe: synchronized to support concurrent writer scopes that
-     * may write TaoString overflow data simultaneously.
-     *
      * @param length payload size in bytes (must be positive)
      * @return an {@link OverflowPtr}-encoded pointer to the allocated space
      */
-    public synchronized long allocate(int length) {
+    public long allocate(int length) {
         if (length <= 0) throw new IllegalArgumentException("length must be positive: " + length);
 
-        // Oversized payload: allocate a dedicated page
         if (length > pageSize) {
             return allocateOversized(length);
         }
 
-        // Common path: bump within the current page
-        if (currentPage < 0 || bumpOffset + length > pageSize) {
-            growPage();
+        Cursor cursor = attachCursor();
+        if (cursor.pageId < 0 || cursor.offset + length > pageSize) {
+            reserveRegularPage(cursor);
         }
 
-        long ptr = OverflowPtr.pack(currentPage, bumpOffset);
-        bumpOffset += length;
-        bytesAllocated += length;
+        int pageId = cursor.pageId;
+        int offset = cursor.offset;
+        cursor.offset += length;
+        bytesAllocated.addAndGet(length);
+        currentPage = pageId;
+        bumpOffset = cursor.offset;
+        long ptr = OverflowPtr.pack(pageId, offset);
         return ptr;
     }
 
@@ -109,7 +119,7 @@ public final class BumpAllocator implements AutoCloseable {
 
     /** Total payload bytes allocated (including dead space from deleted leaves). */
     public long bytesAllocated() {
-        return bytesAllocated;
+        return bytesAllocated.get();
     }
 
     /** Total pages allocated. */
@@ -135,8 +145,10 @@ public final class BumpAllocator implements AutoCloseable {
     /** Total backing memory committed (pages × pageSize, plus oversized pages). */
     public long totalCommittedBytes() {
         long total = 0;
-        for (int i = 0; i < pageCount; i++) {
-            total += pages[i].byteSize();
+        var localPages = pages;
+        int count = pageCount;
+        for (int i = 0; i < count; i++) {
+            total += localPages[i].byteSize();
         }
         return total;
     }
@@ -157,8 +169,9 @@ public final class BumpAllocator implements AutoCloseable {
      */
     public int[] exportPageLocations() {
         if (pageStartPages == null) return new int[0];
-        int[] result = new int[pageCount];
-        System.arraycopy(pageStartPages, 0, result, 0, pageCount);
+        int count = pageCount;
+        int[] result = new int[count];
+        System.arraycopy(pageStartPages, 0, result, 0, count);
         return result;
     }
 
@@ -169,8 +182,9 @@ public final class BumpAllocator implements AutoCloseable {
      */
     public int[] exportPageSizes() {
         if (pageSizesInPages == null) return new int[0];
-        int[] result = new int[pageCount];
-        System.arraycopy(pageSizesInPages, 0, result, 0, pageCount);
+        int count = pageCount;
+        int[] result = new int[count];
+        System.arraycopy(pageSizesInPages, 0, result, 0, count);
         return result;
     }
 
@@ -182,7 +196,7 @@ public final class BumpAllocator implements AutoCloseable {
      * @param sizeInPages the number of ChunkStore pages
      */
     public void restorePage(int startPage, int sizeInPages) {
-        ensureCapacity();
+        ensureCapacityForAppend();
         int id = pageCount;
         pages[id] = chunkStore.resolve(startPage, sizeInPages);
         pageStartPages[id] = startPage;
@@ -200,39 +214,52 @@ public final class BumpAllocator implements AutoCloseable {
     public void restoreState(int currentPage, int bumpOffset, long bytesAllocated) {
         this.currentPage = currentPage;
         this.bumpOffset = bumpOffset;
-        this.bytesAllocated = bytesAllocated;
+        this.bytesAllocated.set(bytesAllocated);
+        this.restoredTailPage = currentPage;
+        this.restoredTailOffset = bumpOffset;
+        this.restoredTailAvailable.set(currentPage >= 0);
     }
 
     // ---- Internals ----
 
-    private void growPage() {
+    private Cursor attachCursor() {
+        Cursor cursor = cursors.get();
+        if (cursor.pageId < 0 && restoredTailAvailable.compareAndSet(true, false)) {
+            cursor.pageId = restoredTailPage;
+            cursor.offset = restoredTailOffset;
+        }
+        return cursor;
+    }
+
+    private synchronized void reserveRegularPage(Cursor cursor) {
         if (pageCount >= MAX_PAGES) {
             throw new OutOfMemoryError("BumpAllocator exhausted (" + MAX_PAGES + " pages)");
         }
-        ensureCapacity();
+        ensureCapacityForAppend();
 
         try {
             int chunkPages = pageSize / ChunkStore.PAGE_SIZE;
+            int pageId = pageCount;
             int startPage = chunkStore.allocPages(chunkPages);
-            pages[pageCount] = chunkStore.resolve(startPage, chunkPages);
-            pageStartPages[pageCount] = startPage;
-            pageSizesInPages[pageCount] = chunkPages;
+            pages[pageId] = chunkStore.resolve(startPage, chunkPages);
+            pageStartPages[pageId] = startPage;
+            pageSizesInPages[pageId] = chunkPages;
+            pageCount++;
+            cursor.pageId = pageId;
+            // Reserve byte 0 on the very first regular page so pack(0,0) is never returned.
+            cursor.offset = (pageId == 0) ? 1 : 0;
+            currentPage = pageId;
+            bumpOffset = cursor.offset;
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to grow bump allocator", e);
         }
-
-        currentPage = pageCount;
-        pageCount++;
-        // Reserve byte 0 on the very first page so that pack(0,0) is never returned
-        // (pack(0,0) == 0 == EMPTY_PTR). Subsequent pages start at offset 0.
-        bumpOffset = (currentPage == 0) ? 1 : 0;
     }
 
-    private long allocateOversized(int length) {
+    private synchronized long allocateOversized(int length) {
         if (pageCount >= MAX_PAGES) {
             throw new OutOfMemoryError("BumpAllocator exhausted (" + MAX_PAGES + " pages)");
         }
-        ensureCapacity();
+        ensureCapacityForAppend();
 
         int oversizedPageId = pageCount;
 
@@ -247,12 +274,12 @@ public final class BumpAllocator implements AutoCloseable {
         }
 
         pageCount++;
-        bytesAllocated += length;
+        bytesAllocated.addAndGet(length);
         // Don't update currentPage/bumpOffset — the oversized page is a one-off
         return OverflowPtr.pack(oversizedPageId, 0);
     }
 
-    private void ensureCapacity() {
+    private void ensureCapacityForAppend() {
         if (pageCount >= pages.length) {
             int newCap = Math.min(pages.length * 2, MAX_PAGES);
             MemorySegment[] newPages = new MemorySegment[newCap];
@@ -265,5 +292,10 @@ public final class BumpAllocator implements AutoCloseable {
             System.arraycopy(pageSizesInPages, 0, newSip, 0, pageCount);
             pageSizesInPages = newSip;
         }
+    }
+
+    private static final class Cursor {
+        int pageId = -1;
+        int offset;
     }
 }

@@ -60,22 +60,38 @@ public final class PrefixNode {
 
     /** Get the number of prefix bytes. */
     public static int count(MemorySegment seg) {
-        return Byte.toUnsignedInt(seg.get(ValueLayout.JAVA_BYTE, OFF_COUNT));
+        return count(seg, 0);
+    }
+
+    public static int count(MemorySegment seg, long baseOffset) {
+        return Byte.toUnsignedInt(seg.get(ValueLayout.JAVA_BYTE, baseOffset + OFF_COUNT));
     }
 
     /** Get the prefix byte at the given position. */
     public static byte keyAt(MemorySegment seg, int pos) {
-        return seg.get(ValueLayout.JAVA_BYTE, OFF_KEYS + pos);
+        return keyAt(seg, 0, pos);
+    }
+
+    public static byte keyAt(MemorySegment seg, long baseOffset, int pos) {
+        return seg.get(ValueLayout.JAVA_BYTE, baseOffset + OFF_KEYS + pos);
     }
 
     /** Get the child pointer. */
     public static long child(MemorySegment seg) {
-        return seg.get(ValueLayout.JAVA_LONG, OFF_CHILD);
+        return child(seg, 0);
+    }
+
+    public static long child(MemorySegment seg, long baseOffset) {
+        return seg.get(ValueLayout.JAVA_LONG, baseOffset + OFF_CHILD);
     }
 
     /** Set the child pointer. */
     public static void setChild(MemorySegment seg, long child) {
-        seg.set(ValueLayout.JAVA_LONG, OFF_CHILD, child);
+        setChild(seg, 0, child);
+    }
+
+    public static void setChild(MemorySegment seg, long baseOffset, long child) {
+        seg.set(ValueLayout.JAVA_LONG, baseOffset + OFF_CHILD, child);
     }
 
     /**
@@ -88,10 +104,16 @@ public final class PrefixNode {
      * @return the number of matching bytes (0 to count). If equal to count, it's a full match.
      */
     public static int matchKey(MemorySegment seg, MemorySegment key, int keyLen, int depth) {
-        int prefixLen = count(seg);
+        return matchKey(seg, 0, key, keyLen, depth);
+    }
+
+    public static int matchKey(MemorySegment seg, long baseOffset, MemorySegment key, int keyLen, int depth) {
+        int prefixLen = count(seg, baseOffset);
         int maxMatch = Math.min(prefixLen, keyLen - depth);
+        if (maxMatch <= 0) return 0;
         for (int i = 0; i < maxMatch; i++) {
-            if (keyAt(seg, i) != key.get(ValueLayout.JAVA_BYTE, depth + i)) {
+            if (seg.get(ValueLayout.JAVA_BYTE, baseOffset + OFF_KEYS + i)
+                    != key.get(ValueLayout.JAVA_BYTE, depth + i)) {
                 return i;
             }
         }
@@ -102,10 +124,15 @@ public final class PrefixNode {
      * Same as {@link #matchKey} but with a byte array key.
      */
     public static int matchKey(MemorySegment seg, byte[] key, int keyLen, int depth) {
-        int prefixLen = count(seg);
+        return matchKey(seg, 0, key, keyLen, depth);
+    }
+
+    public static int matchKey(MemorySegment seg, long baseOffset, byte[] key, int keyLen, int depth) {
+        int prefixLen = count(seg, baseOffset);
         int maxMatch = Math.min(prefixLen, keyLen - depth);
+        if (maxMatch <= 0) return 0;
         for (int i = 0; i < maxMatch; i++) {
-            if (keyAt(seg, i) != key[depth + i]) {
+            if (seg.get(ValueLayout.JAVA_BYTE, baseOffset + OFF_KEYS + i) != key[depth + i]) {
                 return i;
             }
         }

@@ -42,26 +42,43 @@ public final class Node48 {
     }
 
     public static int count(MemorySegment seg) {
-        return Byte.toUnsignedInt(seg.get(ValueLayout.JAVA_BYTE, OFF_COUNT));
+        return count(seg, 0);
+    }
+
+    public static int count(MemorySegment seg, long baseOffset) {
+        return Byte.toUnsignedInt(seg.get(ValueLayout.JAVA_BYTE, baseOffset + OFF_COUNT));
     }
 
     /** Get the child pointer for the given key byte, or EMPTY_PTR. */
     public static long findChild(MemorySegment seg, byte key) {
-        int idx = Byte.toUnsignedInt(seg.get(ValueLayout.JAVA_BYTE, OFF_CHILD_IDX + Byte.toUnsignedInt(key)));
+        return findChild(seg, 0, key);
+    }
+
+    public static long findChild(MemorySegment seg, long baseOffset, byte key) {
+        int idx = Byte.toUnsignedInt(seg.get(ValueLayout.JAVA_BYTE,
+                baseOffset + OFF_CHILD_IDX + Byte.toUnsignedInt(key)));
         if (idx == Byte.toUnsignedInt(EMPTY_MARKER)) {
             return NodePtr.EMPTY_PTR;
         }
-        return seg.get(ValueLayout.JAVA_LONG, OFF_CHILDREN + (long) idx * 8);
+        return seg.get(ValueLayout.JAVA_LONG, baseOffset + OFF_CHILDREN + (long) idx * 8);
     }
 
     /** Get the child pointer at the given slot index (0-47). */
     public static long childAtSlot(MemorySegment seg, int slot) {
-        return seg.get(ValueLayout.JAVA_LONG, OFF_CHILDREN + (long) slot * 8);
+        return childAtSlot(seg, 0, slot);
+    }
+
+    public static long childAtSlot(MemorySegment seg, long baseOffset, int slot) {
+        return seg.get(ValueLayout.JAVA_LONG, baseOffset + OFF_CHILDREN + (long) slot * 8);
     }
 
     /** Set the child pointer at the given slot index (0-47). */
     public static void setChildAtSlot(MemorySegment seg, int slot, long childPtr) {
-        seg.set(ValueLayout.JAVA_LONG, OFF_CHILDREN + (long) slot * 8, childPtr);
+        setChildAtSlot(seg, 0, slot, childPtr);
+    }
+
+    public static void setChildAtSlot(MemorySegment seg, long baseOffset, int slot, long childPtr) {
+        seg.set(ValueLayout.JAVA_LONG, baseOffset + OFF_CHILDREN + (long) slot * 8, childPtr);
     }
 
     /**

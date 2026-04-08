@@ -148,12 +148,32 @@ public final class CowEngine {
         return CowDelete.deferredDelete(ctx, currentRoot, key, keyLen);
     }
 
-    /** Create a CowContext with a per-scope arena (reuses immutable config). */
+    /** Create a CowContext with a per-scope arena (reuses thread-local instance). */
     private CowContext contextWithArena(WriterArena arena) {
-        return new CowContext(slab, arena, chunkStore,
-            prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
-            keyLen, keySlotSize, leafClassIds);
+        CowContext ctx = ARENA_CTX_CACHE.get();
+        if (ctx == null || ctx.slab != slab) {
+            ctx = new CowContext(slab, arena, chunkStore,
+                prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
+                keyLen, keySlotSize, leafClassIds);
+            ARENA_CTX_CACHE.set(ctx);
+            return ctx;
+        }
+        return ctx.withArena(arena);
     }
+
+    /**
+     * Per-thread CowContext cache — allocated once per thread, arena swapped before each use.
+     * Eliminates object allocation on every {@code deferredGetOrCreate} / {@code deferredDelete}.
+     */
+    private static final ThreadLocal<CowContext> ARENA_CTX_CACHE = new ThreadLocal<>();
+
+    /**
+     * Per-thread LongList cache for retiree tracking — allocated once per thread,
+     * cleared before each use. Eliminates {@code new LongList() + new long[8]}
+     * on every insert / delete.
+     */
+    static final ThreadLocal<LongList> RETIREE_CACHE =
+            ThreadLocal.withInitial(LongList::new);
 
     // -----------------------------------------------------------------------
     // Path stack — lightweight traversal recorder (used by insert + delete)

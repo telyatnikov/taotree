@@ -278,19 +278,22 @@ public final class TaoDictionary {
 
     private int resolveEncoded(byte[] padded) {
         // Lock-free lookup via acquire on published state
-        long leafRef = tree.lookupLockFree(MemorySegment.ofArray(padded), MAX_KEY_LEN);
+        long leafRef = tree.lookupLockFree(padded, MAX_KEY_LEN);
         if (NodePtr.isEmpty(leafRef)) return -1;
         return tree.leafValueImpl(leafRef).get(ValueLayout.JAVA_INT_UNALIGNED, 0);
     }
 
+    private static final ThreadLocal<byte[]> PAD_BUFFER =
+            ThreadLocal.withInitial(() -> new byte[MAX_KEY_LEN]);
+
     private byte[] encodeAndPad(String value) {
-        byte[] encoded = TaoKey.encodeString(value);
-        if (encoded.length > MAX_KEY_LEN) {
+        byte[] padded = PAD_BUFFER.get();
+        int encodedLen = TaoKey.encodeStringInto(value, padded);
+        if (encodedLen < 0) {
             throw new IllegalArgumentException(
-                "Encoded string too long (" + encoded.length + " > " + MAX_KEY_LEN + "): " + value);
+                "Encoded string too long (> " + MAX_KEY_LEN + "): " + value);
         }
-        byte[] padded = new byte[MAX_KEY_LEN];
-        System.arraycopy(encoded, 0, padded, 0, encoded.length);
+        java.util.Arrays.fill(padded, encodedLen, MAX_KEY_LEN, (byte) 0);
         return padded;
     }
 }

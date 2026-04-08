@@ -82,9 +82,6 @@ public final class WriterArena {
     // Allocation
     // -----------------------------------------------------------------------
 
-    /** Result of an arena allocation: a writable segment and the encoded {@link NodePtr}. */
-    public record AllocResult(MemorySegment segment, long nodePtr) {}
-
     /**
      * Bump-allocate space for a node.
      *
@@ -92,13 +89,18 @@ public final class WriterArena {
      * size, the allocator advances to the next page (reserving a new batch from
      * the {@link ChunkStore} if necessary).
      *
+     * <p>Returns the encoded {@link NodePtr}. Callers resolve the writable
+     * segment via {@link #resolve(long, int)} or
+     * {@link ChunkStore#resolveBytes} — this avoids allocating a wrapper
+     * object on every call.
+     *
      * @param size        required size in bytes (will be 8-byte aligned)
      * @param nodeType    {@link NodePtr} node type tag
      * @param slabClassId slab class ID (preserved in the pointer for type resolution)
-     * @return the allocation result containing the writable segment and encoded pointer
+     * @return the encoded {@link NodePtr}
      * @throws IllegalArgumentException if the aligned size exceeds {@link ChunkStore#PAGE_SIZE}
      */
-    public AllocResult alloc(int size, int nodeType, int slabClassId) {
+    public long alloc(int size, int nodeType, int slabClassId) {
         int aligned = (size + 7) & ~7;
         if (aligned > PAGE_SIZE) {
             throw new IllegalArgumentException(
@@ -119,9 +121,7 @@ public final class WriterArena {
         offsetInPage += aligned;
         allocCount++;
 
-        MemorySegment seg = chunkStore.resolveBytes(page, off, aligned);
-        long ptr = encodeArenaPtr(nodeType, slabClassId, page, off);
-        return new AllocResult(seg, ptr);
+        return encodeArenaPtr(nodeType, slabClassId, page, off);
     }
 
     // -----------------------------------------------------------------------
@@ -244,11 +244,19 @@ public final class WriterArena {
      * @param size the segment size in bytes
      */
     public static MemorySegment resolve(ChunkStore cs, long ptr, int size) {
+        return cs.resolveBytes(page(ptr), offsetInPage(ptr), size);
+    }
+
+    /** Decode the page number from an arena-encoded pointer. */
+    public static int page(long ptr) {
         int pageHigh = NodePtr.slabId(ptr);
         int offsetField = NodePtr.offset(ptr);
-        int page = (pageHigh << PAGE_LOW_BITS) | ((offsetField >>> PAGE_SHIFT) & PAGE_LOW_MASK);
-        int off = offsetField & PAGE_MASK;
-        return cs.resolveBytes(page, off, size);
+        return (pageHigh << PAGE_LOW_BITS) | ((offsetField >>> PAGE_SHIFT) & PAGE_LOW_MASK);
+    }
+
+    /** Decode the byte offset within the page from an arena-encoded pointer. */
+    public static int offsetInPage(long ptr) {
+        return NodePtr.offset(ptr) & PAGE_MASK;
     }
 
     // -----------------------------------------------------------------------

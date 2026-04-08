@@ -35,12 +35,21 @@ public final class Node256 {
     }
 
     public static int count(MemorySegment seg) {
-        return Short.toUnsignedInt(seg.get(ValueLayout.JAVA_SHORT, OFF_COUNT));
+        return count(seg, 0);
+    }
+
+    public static int count(MemorySegment seg, long baseOffset) {
+        return Short.toUnsignedInt(seg.get(ValueLayout.JAVA_SHORT, baseOffset + OFF_COUNT));
     }
 
     /** Get the child pointer for the given key byte, or EMPTY_PTR. */
     public static long findChild(MemorySegment seg, byte key) {
-        return seg.get(ValueLayout.JAVA_LONG, OFF_CHILDREN + (long) Byte.toUnsignedInt(key) * 8);
+        return findChild(seg, 0, key);
+    }
+
+    public static long findChild(MemorySegment seg, long baseOffset, byte key) {
+        return seg.get(ValueLayout.JAVA_LONG,
+                baseOffset + OFF_CHILDREN + (long) Byte.toUnsignedInt(key) * 8);
     }
 
     /** Set the child pointer for the given key byte. */

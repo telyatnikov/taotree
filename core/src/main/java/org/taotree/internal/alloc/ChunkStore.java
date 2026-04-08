@@ -7,7 +7,9 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.BitSet;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.taotree.internal.persist.Superblock;
 
 /**
@@ -24,11 +26,13 @@ import org.taotree.internal.persist.Superblock;
  * pages are guaranteed to be contiguous within a single chunk mapping, so the caller can
  * slice them as a single {@link MemorySegment}.
  *
- * <p><b>Thread safety:</b> {@link #allocPages} is synchronized to support concurrent
- * writer arenas. Resolution methods ({@link #resolve}, {@link #resolvePage},
- * {@link #resolveBytes}) are safe for concurrent reads once the chunk is mapped.
- * {@link #sync()}, {@link #syncDirty()}, and {@link #close()} must be called under
- * external serialization (e.g., the tree's write lock or commit lock).
+ * <p><b>Thread safety:</b> {@link #allocPages} uses an atomic fast path for runs that
+ * fit in the currently mapped file region and do not cross a chunk boundary. Only the
+ * slow path (chunk-boundary skip or file growth) synchronizes. Resolution methods
+ * ({@link #resolve}, {@link #resolvePage}, {@link #resolveBytes}) are safe for concurrent
+ * reads once the chunk is mapped. {@link #sync()}, {@link #syncDirty()}, and
+ * {@link #close()} must be called under external serialization (e.g., the tree's
+ * write lock or commit lock).
  */
 public final class ChunkStore implements AutoCloseable {
 
@@ -50,13 +54,13 @@ public final class ChunkStore implements AutoCloseable {
     private final int pagesPerChunk;
     private final boolean preallocate;
 
-    private MemorySegment[] chunks;   // mapped chunk windows
-    private int chunkCount;           // number of mapped chunks
-    private int totalPages;           // total committed pages (file size = totalPages × PAGE_SIZE)
-    private int nextPage;             // next page to allocate (bump pointer)
+    private volatile MemorySegment[] chunks;   // mapped chunk windows
+    private volatile int chunkCount;           // number of mapped chunks
+    private volatile int totalPages;           // total committed pages (file size = totalPages × PAGE_SIZE)
+    private final AtomicInteger nextPage;      // next page to allocate (bump pointer)
 
     // Dirty tracking: which chunks have been written to since the last syncDirty()
-    private final BitSet dirtyChunks = new BitSet();
+    private final Set<Integer> dirtyChunks = ConcurrentHashMap.newKeySet();
 
     // -----------------------------------------------------------------------
     // Construction
@@ -73,7 +77,7 @@ public final class ChunkStore implements AutoCloseable {
         this.chunks = new MemorySegment[8];
         this.chunkCount = 0;
         this.totalPages = 0;
-        this.nextPage = 0;
+        this.nextPage = new AtomicInteger();
     }
 
     /**
@@ -94,7 +98,7 @@ public final class ChunkStore implements AutoCloseable {
         var store = new ChunkStore(path, channel, arena, chunkSize, preallocate);
         // Reserve pages 0-1 for the superblock (8 KB)
         store.growFile(2);
-        store.nextPage = 2;
+        store.nextPage.set(2);
         return store;
     }
 
@@ -120,7 +124,7 @@ public final class ChunkStore implements AutoCloseable {
             StandardOpenOption.WRITE);
         var store = new ChunkStore(path, channel, arena, chunkSize, preallocate);
         store.growFile(V2_RESERVED_PAGES);
-        store.nextPage = V2_RESERVED_PAGES;
+        store.nextPage.set(V2_RESERVED_PAGES);
         return store;
     }
 
@@ -149,7 +153,7 @@ public final class ChunkStore implements AutoCloseable {
             StandardOpenOption.WRITE);
         var store = new ChunkStore(path, channel, arena, chunkSize, Preallocator.isSupported());
         store.totalPages = totalPages;
-        store.nextPage = nextPage;
+        store.nextPage.set(nextPage);
         // Map all existing chunks
         int chunksNeeded = (totalPages + store.pagesPerChunk - 1) / store.pagesPerChunk;
         for (int i = 0; i < chunksNeeded; i++) {
@@ -168,41 +172,28 @@ public final class ChunkStore implements AutoCloseable {
      * <p>The returned pages are guaranteed to reside within a single chunk mapping,
      * so the caller can obtain a contiguous {@link MemorySegment} via {@link #resolve}.
      *
-     * <p>Thread-safe: synchronized to support concurrent {@link WriterArena} instances.
-     *
      * @param pageCount number of consecutive pages to allocate
      * @return the global page number of the first page in the run
      * @throws IOException if the file cannot be grown
      */
-    public synchronized int allocPages(int pageCount) throws IOException {
+    public int allocPages(int pageCount) throws IOException {
         if (pageCount <= 0) throw new IllegalArgumentException("pageCount must be positive");
         if (pageCount > pagesPerChunk) {
             throw new IllegalArgumentException(
                 "Cannot allocate " + pageCount + " pages; exceeds chunk capacity " + pagesPerChunk);
         }
-
-        // Check if the run fits in the current chunk
-        int currentChunkIdx = nextPage / pagesPerChunk;
-        int offsetInChunk = nextPage % pagesPerChunk;
-        if (offsetInChunk + pageCount > pagesPerChunk) {
-            // Would straddle a chunk boundary — skip to the start of the next chunk
-            nextPage = (currentChunkIdx + 1) * pagesPerChunk;
+        while (true) {
+            int startPage = nextPage.get();
+            int offsetInChunk = startPage % pagesPerChunk;
+            int endPage = startPage + pageCount;
+            if (offsetInChunk + pageCount > pagesPerChunk || endPage > totalPages) {
+                return allocPagesSlow(pageCount);
+            }
+            if (nextPage.compareAndSet(startPage, endPage)) {
+                dirtyChunks.add(startPage / pagesPerChunk);
+                return startPage;
+            }
         }
-
-        int startPage = nextPage;
-        int endPage = startPage + pageCount;
-
-        // Grow file if needed
-        if (endPage > totalPages) {
-            growFile(endPage);
-        }
-
-        nextPage = endPage;
-
-        // Mark the containing chunk as dirty
-        dirtyChunks.set(startPage / pagesPerChunk);
-
-        return startPage;
     }
 
     // -----------------------------------------------------------------------
@@ -235,6 +226,20 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     /**
+     * Return the backing chunk segment for the given page without creating a slice.
+     */
+    public MemorySegment chunkSegment(int page) {
+        return chunks[page / pagesPerChunk];
+    }
+
+    /**
+     * Compute the byte offset within a chunk for the given page-relative byte offset.
+     */
+    public long chunkByteOffset(int page, long byteOffset) {
+        return (long) (page % pagesPerChunk) * PAGE_SIZE + byteOffset;
+    }
+
+    /**
      * Resolve a byte range within the file.
      *
      * @param startPage global page number
@@ -242,10 +247,7 @@ public final class ChunkStore implements AutoCloseable {
      * @param byteLength number of bytes
      */
     public MemorySegment resolveBytes(int startPage, long byteOffset, long byteLength) {
-        int chunkIdx = startPage / pagesPerChunk;
-        int offsetInChunk = startPage % pagesPerChunk;
-        long base = (long) offsetInChunk * PAGE_SIZE + byteOffset;
-        return chunks[chunkIdx].asSlice(base, byteLength);
+        return chunkSegment(startPage).asSlice(chunkByteOffset(startPage, byteOffset), byteLength);
     }
 
     // -----------------------------------------------------------------------
@@ -287,7 +289,7 @@ public final class ChunkStore implements AutoCloseable {
      * @param page the global page number of any page within the chunk to mark
      */
     public void markDirty(int page) {
-        dirtyChunks.set(page / pagesPerChunk);
+        dirtyChunks.add(page / pagesPerChunk);
     }
 
     /**
@@ -302,7 +304,7 @@ public final class ChunkStore implements AutoCloseable {
      * compaction or before close).
      */
     public void syncDirty() throws IOException {
-        for (int i = dirtyChunks.nextSetBit(0); i >= 0; i = dirtyChunks.nextSetBit(i + 1)) {
+        for (int i : dirtyChunks) {
             if (i < chunkCount) {
                 chunks[i].force();
             }
@@ -342,7 +344,7 @@ public final class ChunkStore implements AutoCloseable {
     public int totalPages() { return totalPages; }
 
     /** Next page that will be allocated. */
-    public int nextPage() { return nextPage; }
+    public int nextPage() { return nextPage.get(); }
 
     /** Chunk size in bytes. */
     public long chunkSize() { return chunkSize; }
@@ -354,7 +356,7 @@ public final class ChunkStore implements AutoCloseable {
     public int chunkCount() { return chunkCount; }
 
     /** Number of chunks currently marked dirty. */
-    public int dirtyChunkCount() { return dirtyChunks.cardinality(); }
+    public int dirtyChunkCount() { return dirtyChunks.size(); }
 
     /** The file path. */
     public Path path() { return path; }
@@ -362,6 +364,22 @@ public final class ChunkStore implements AutoCloseable {
     // -----------------------------------------------------------------------
     // Internals
     // -----------------------------------------------------------------------
+
+    private synchronized int allocPagesSlow(int pageCount) throws IOException {
+        int startPage = nextPage.get();
+        int currentChunkIdx = startPage / pagesPerChunk;
+        int offsetInChunk = startPage % pagesPerChunk;
+        if (offsetInChunk + pageCount > pagesPerChunk) {
+            startPage = (currentChunkIdx + 1) * pagesPerChunk;
+        }
+        int endPage = startPage + pageCount;
+        if (endPage > totalPages) {
+            growFile(endPage);
+        }
+        nextPage.set(endPage);
+        dirtyChunks.add(startPage / pagesPerChunk);
+        return startPage;
+    }
 
     /**
      * Grow the file so that it contains at least {@code minPages} pages.
@@ -387,12 +405,11 @@ public final class ChunkStore implements AutoCloseable {
             channel.truncate(newFileSize);
         }
 
-        totalPages = newTotalPages;
-
         // Map any new chunks
         for (int i = chunkCount; i < chunksNeeded; i++) {
             mapChunk(i);
         }
+        totalPages = newTotalPages;
     }
 
     private void mapChunk(int chunkIdx) throws IOException {

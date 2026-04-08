@@ -120,4 +120,25 @@ public final class TaoKey {
         key[pos] = 0x00; // null terminator
         return key;
     }
+
+    static int encodeStringInto(String value, byte[] dst) {
+        byte[] raw = value.getBytes(StandardCharsets.UTF_8);
+        int maxPayload = dst.length - 1;
+        int pos = 0;
+        for (byte b : raw) {
+            int needed = ((b & 0xFF) <= 1) ? 2 : 1;
+            if (pos + needed > maxPayload) {
+                return -1;
+            }
+            if ((b & 0xFF) <= 1) {
+                dst[pos++] = 0x01;
+            }
+            dst[pos++] = b;
+        }
+        if (pos >= dst.length) {
+            return -1;
+        }
+        dst[pos++] = 0x00;
+        return pos;
+    }
 }

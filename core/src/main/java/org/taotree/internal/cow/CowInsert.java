@@ -124,7 +124,8 @@ final class CowInsert {
             CowContext ctx, CowEngine.PathStack path, long newSubtree,
             long leafPtr, long originalTarget, int sizeDelta, long originalLeafPtr) {
         long current = newSubtree;
-        var retirees = new LongList();
+        var retirees = CowEngine.RETIREE_CACHE.get();
+        retirees.clear();
         ctx.addIfSlabAllocated(retirees, originalTarget);
 
         for (int i = path.depth - 1; i >= 0; i--) {

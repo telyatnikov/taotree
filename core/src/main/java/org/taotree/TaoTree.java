@@ -91,6 +91,8 @@ public final class TaoTree implements AutoCloseable {
      * Equivalent to {@code 0L}.
      */
     public static final long NOT_FOUND = 0L;
+    private static final int MAX_WRITE_BACK_ENTRIES = 2_048;
+    private static final int MAX_WRITE_BACK_BYTES = 512 * 1024;
 
     // -- Shared infrastructure --
     private final Arena arena;
@@ -898,34 +900,11 @@ public final class TaoTree implements AutoCloseable {
      * plain loads for the entire traversal.
      */
     long lookupLockFree(MemorySegment key, int keyLen) {
-        long node = publishedState().root();
-        int depth = 0;
+        return lookupFrom(publishedState().root(), key, keyLen);
+    }
 
-        while (!NodePtr.isEmpty(node)) {
-            int type = NodePtr.nodeType(node);
-
-            if (type == NodePtr.LEAF) {
-                return leafKeyMatches(node, key, keyLen) ? node : NodePtr.EMPTY_PTR;
-            }
-
-            if (type == NodePtr.PREFIX) {
-                MemorySegment prefSeg = resolveNode(node);
-                int prefLen = PrefixNode.count(prefSeg);
-                int matched = PrefixNode.matchKey(prefSeg, key, keyLen, depth);
-                if (matched < prefLen) {
-                    return NodePtr.EMPTY_PTR;
-                }
-                depth += prefLen;
-                node = PrefixNode.child(prefSeg);
-                continue;
-            }
-
-            if (depth >= keyLen) return NodePtr.EMPTY_PTR;
-            byte keyByte = key.get(ValueLayout.JAVA_BYTE, depth);
-            node = findChild(node, type, keyByte);
-            depth++;
-        }
-        return NodePtr.EMPTY_PTR;
+    long lookupLockFree(byte[] key, int keyLen) {
+        return lookupFrom(publishedState().root(), key, keyLen);
     }
 
     // -----------------------------------------------------------------------
@@ -1268,7 +1247,7 @@ public final class TaoTree implements AutoCloseable {
         public long lookup(byte[] key) {
             checkAccess();
             validateKeyLen(key.length);
-            return lookupFrom(snapshotRoot, MemorySegment.ofArray(key), key.length);
+            return lookupFrom(snapshotRoot, key, key.length);
         }
 
         /**
@@ -1463,7 +1442,7 @@ public final class TaoTree implements AutoCloseable {
         private long scopeSize;                          // private size counter
         private final org.taotree.internal.cow.LongList scopeRetirees;
         private org.taotree.internal.cow.MutationLog mutationLog;
-        private java.util.HashSet<Long> seenLeafPtrs;   // dedup for mutation log
+        private org.taotree.internal.cow.LongOpenHashSet seenLeafPtrs; // dedup for mutation log
         private boolean scopeMutated;                    // any mutation happened?
         private boolean lockedMode;                      // transitioned to locked mode?
 
@@ -1501,7 +1480,7 @@ public final class TaoTree implements AutoCloseable {
         public long lookup(byte[] key) {
             checkAccess();
             validateKeyLen(key.length);
-            return lookupFrom(currentRoot(), MemorySegment.ofArray(key), key.length);
+            return lookupFrom(currentRoot(), key, key.length);
         }
 
         /**
@@ -1550,7 +1529,7 @@ public final class TaoTree implements AutoCloseable {
         public LeafAccessor getOrCreate(MemorySegment key, LeafLayout layout) {
             checkAccess();
             long ptr = optimisticGetOrCreate(key, TaoTree.this.keyLen, 0);
-            return new LeafAccessor(leafValueImpl(ptr), layout, TaoTree.this);
+            return new LeafAccessor(leafValue(ptr), layout, TaoTree.this);
         }
 
         public LeafAccessor getOrCreate(KeyBuilder kb, LeafLayout layout) {
@@ -1643,7 +1622,7 @@ public final class TaoTree implements AutoCloseable {
             if (scopeSnapshot != null && !lockedMode) {
                 // File-backed deferred-commit mode: COW against private root
                 scopeMutated = true;
-                if (seenLeafPtrs == null) seenLeafPtrs = new java.util.HashSet<>();
+                if (seenLeafPtrs == null) seenLeafPtrs = new org.taotree.internal.cow.LongOpenHashSet();
 
                 var result = cowEngine.deferredGetOrCreateCopy(
                         scopeArena, scopeRoot, key, keyLen, leafClass);
@@ -1827,6 +1806,7 @@ public final class TaoTree implements AutoCloseable {
                     // Child-tree mode: publish and release
                     publishRoot();
                     commitLock.unlock();
+                    commitLockHeld = false;
                 }
                 if (scopeArena != null) {
                     scopeArena.endScope();
@@ -1843,6 +1823,9 @@ public final class TaoTree implements AutoCloseable {
         }
 
         private void deferredCommitImpl(boolean keepLock) {
+            org.taotree.internal.cow.LongList retireAfterPublish = null;
+            org.taotree.internal.cow.LongList retireStaleAfterPublish = null;
+            boolean resetArenaAfterPublish = false;
             if (!commitLockHeld) {
                 commitLock.lock();
                 commitLockHeld = true;
@@ -1850,48 +1833,31 @@ public final class TaoTree implements AutoCloseable {
             try {
                 var current = publishedState();
                 if (current == scopeSnapshot) {
-                    // No conflict — check if we can write-back existing keys
-                    // instead of publishing the full scopeRoot with arena copies.
-                    boolean hasWriteBack = mutationLog != null
-                            && mutationLog.allHaveOriginals();
-                    if (hasWriteBack) {
-                        // Write-back: copy values from arena copies to original leaves.
-                        // The published tree structure doesn't change for these keys,
-                        // so we avoid keeping arena copies referenced by the published tree.
-                        for (int i = 0, n = mutationLog.size(); i < n; i++) {
-                            long origPtr = mutationLog.originalLeafPtr(i);
-                            if (origPtr == 0) continue; // new key — no write-back
-                            long arenaPtr = mutationLog.leafPtr(i);
-                            int classId = leafClassIds[mutationLog.leafClass(i)];
-                            int valueSize = slab.segmentSize(classId) - keySlotSize;
-                            MemorySegment arenaVal = leafValueImpl(arenaPtr);
-                            MemorySegment origVal = leafValueImpl(origPtr);
-                            MemorySegment.copy(arenaVal, 0, origVal, 0, valueSize);
-                        }
+                    if (shouldWriteBack()) {
+                        // Write-back is only worthwhile for small pure-update scopes.
+                        // Large copies monopolize the commit lock longer than simply
+                        // publishing the scope root and reclaiming arena pages later.
+                        writeBackMutations();
                         if (scopeSize == scopeSnapshot.size()) {
-                            // Pure write-back (no new keys): publish original root and reset arena
                             root = scopeSnapshot.root();
                             size = scopeSize;
                             publishRoot();
-                            scopeArena.resetToScopeStart();
+                            resetArenaAfterPublish = true;
                         } else {
-                            // Mixed: new keys exist, must publish scopeRoot for structure changes
                             root = scopeRoot;
                             size = scopeSize;
                             publishRoot();
-                            retireScope(scopeRetirees);
+                            retireAfterPublish = scopeRetirees;
                         }
                     } else {
-                        // Standard publish: use scopeRoot with arena nodes
                         root = scopeRoot;
                         size = scopeSize;
                         publishRoot();
-                        retireScope(scopeRetirees);
+                        retireAfterPublish = scopeRetirees;
                     }
                 } else {
-                    // Conflict: another writer published since our snapshot.
-                    // Replay mutation log against the new root.
-                    rebase(current);
+                    retireAfterPublish = rebaseLocked(current);
+                    retireStaleAfterPublish = scopeRetirees;
                 }
             } finally {
                 if (!keepLock) {
@@ -1899,6 +1865,11 @@ public final class TaoTree implements AutoCloseable {
                     commitLockHeld = false;
                 }
             }
+            if (resetArenaAfterPublish) {
+                scopeArena.resetToScopeStart();
+            }
+            retireScope(retireAfterPublish);
+            retireScope(retireStaleAfterPublish);
         }
 
         /**
@@ -1909,7 +1880,7 @@ public final class TaoTree implements AutoCloseable {
          * a {@link ConflictResolver} is consulted (if provided) to decide whether
          * the pending value should replace the published value.
          */
-        private void rebase(PublicationState current) {
+        private org.taotree.internal.cow.LongList rebaseLocked(PublicationState current) {
             // The stale COW copies from our original mutation phase are
             // arena-allocated and will be reclaimed with the arena pages.
             // We don't need to explicitly retire them — they're in our
@@ -1973,20 +1944,31 @@ public final class TaoTree implements AutoCloseable {
             root = rebaseRoot;
             size = rebaseSize;
             publishRoot();
-            // Retire nodes from the rebase (nodes from the published tree that
-            // were replaced). Also retire nodes from the original stale COW phase
-            // that are slab-allocated (arena-allocated ones don't need retirement).
-            retireScope(rebaseRetirees);
-            retireScope(scopeRetirees);
+            return rebaseRetirees;
+        }
+
+        private boolean shouldWriteBack() {
+            return mutationLog != null
+                    && mutationLog.allHaveOriginals()
+                    && mutationLog.size() <= MAX_WRITE_BACK_ENTRIES
+                    && mutationLog.totalValueBytes() <= MAX_WRITE_BACK_BYTES;
+        }
+
+        private void writeBackMutations() {
+            for (int i = 0, n = mutationLog.size(); i < n; i++) {
+                long origPtr = mutationLog.originalLeafPtr(i);
+                if (origPtr == 0) continue;
+                long arenaPtr = mutationLog.leafPtr(i);
+                int classId = leafClassIds[mutationLog.leafClass(i)];
+                int valueSize = slab.segmentSize(classId) - keySlotSize;
+                MemorySegment arenaVal = leafValueImpl(arenaPtr);
+                MemorySegment origVal = leafValueImpl(origPtr);
+                MemorySegment.copy(arenaVal, 0, origVal, 0, valueSize);
+            }
         }
 
         private void retireScope(org.taotree.internal.cow.LongList retirees) {
-            if (reclaimer != null && retirees != null) {
-                for (int i = 0, n = retirees.size(); i < n; i++) {
-                    reclaimer.retire(retirees.get(i));
-                }
-                reclaimer.advanceGeneration();
-            }
+            retireNodes(retirees);
         }
 
         private void checkAccess() {
@@ -2090,11 +2072,8 @@ public final class TaoTree implements AutoCloseable {
             if (type == NodePtr.LEAF) {
                 // Leaf: check if its key matches the prefix
                 MemorySegment leafSeg = resolveNode(node);
-                for (int i = depth; i < prefixLen; i++) {
-                    if (leafSeg.get(ValueLayout.JAVA_BYTE, i) !=
-                        prefix.get(ValueLayout.JAVA_BYTE, i)) {
-                        return true; // prefix doesn't match this leaf
-                    }
+                if (MemorySegment.mismatch(leafSeg, depth, prefixLen, prefix, depth, prefixLen) >= 0) {
+                    return true; // prefix doesn't match this leaf
                 }
                 return visitor.test(node);
             }
@@ -2104,11 +2083,8 @@ public final class TaoTree implements AutoCloseable {
                 int prefLen = PrefixNode.count(seg);
                 // Compare prefix bytes against compressed prefix bytes
                 int toMatch = Math.min(prefLen, prefixLen - depth);
-                for (int i = 0; i < toMatch; i++) {
-                    if (PrefixNode.keyAt(seg, i) !=
-                        prefix.get(ValueLayout.JAVA_BYTE, depth + i)) {
-                        return true; // mismatch in compressed prefix
-                    }
+                if (toMatch > 0 && MemorySegment.mismatch(seg, PrefixNode.OFF_KEYS, PrefixNode.OFF_KEYS + toMatch, prefix, depth, depth + toMatch) >= 0) {
+                    return true; // mismatch in compressed prefix
                 }
                 depth += prefLen;
                 node = PrefixNode.child(seg);
@@ -2221,6 +2197,7 @@ public final class TaoTree implements AutoCloseable {
         } finally {
             commitLock.unlock();
         }
+        retireNodes(ws.retirees);
     }
 
     /**
@@ -2230,8 +2207,10 @@ public final class TaoTree implements AutoCloseable {
         root = ws.root;
         size = ws.size;
         publishRoot();
-        if (reclaimer != null) {
-            var retirees = ws.retirees;
+    }
+
+    private void retireNodes(org.taotree.internal.cow.LongList retirees) {
+        if (reclaimer != null && retirees != null) {
             for (int i = 0, n = retirees.size(); i < n; i++) {
                 reclaimer.retire(retirees.get(i));
             }
@@ -2270,21 +2249,55 @@ public final class TaoTree implements AutoCloseable {
                 return leafKeyMatches(node, key, keyLen) ? node : NodePtr.EMPTY_PTR;
             }
 
+            MemorySegment seg = nodeBaseSegment(node);
+            long segOffset = nodeBaseOffset(node);
+
             if (type == NodePtr.PREFIX) {
-                MemorySegment prefSeg = resolveNode(node);
-                int prefLen = PrefixNode.count(prefSeg);
-                int matched = PrefixNode.matchKey(prefSeg, key, keyLen, depth);
+                int prefLen = PrefixNode.count(seg, segOffset);
+                int matched = PrefixNode.matchKey(seg, segOffset, key, keyLen, depth);
                 if (matched < prefLen) {
                     return NodePtr.EMPTY_PTR;
                 }
                 depth += prefLen;
-                node = PrefixNode.child(prefSeg);
+                node = PrefixNode.child(seg, segOffset);
                 continue;
             }
 
             if (depth >= keyLen) return NodePtr.EMPTY_PTR;
             byte keyByte = key.get(ValueLayout.JAVA_BYTE, depth);
-            node = findChild(node, type, keyByte);
+            node = findChild(seg, segOffset, type, keyByte);
+            depth++;
+        }
+        return NodePtr.EMPTY_PTR;
+    }
+
+    private long lookupFrom(long startRoot, byte[] key, int keyLen) {
+        long node = startRoot;
+        int depth = 0;
+
+        while (!NodePtr.isEmpty(node)) {
+            int type = NodePtr.nodeType(node);
+
+            if (type == NodePtr.LEAF) {
+                return leafKeyMatches(node, key, keyLen) ? node : NodePtr.EMPTY_PTR;
+            }
+
+            MemorySegment seg = nodeBaseSegment(node);
+            long segOffset = nodeBaseOffset(node);
+
+            if (type == NodePtr.PREFIX) {
+                int prefLen = PrefixNode.count(seg, segOffset);
+                int matched = PrefixNode.matchKey(seg, segOffset, key, keyLen, depth);
+                if (matched < prefLen) {
+                    return NodePtr.EMPTY_PTR;
+                }
+                depth += prefLen;
+                node = PrefixNode.child(seg, segOffset);
+                continue;
+            }
+
+            if (depth >= keyLen) return NodePtr.EMPTY_PTR;
+            node = findChild(seg, segOffset, type, key[depth]);
             depth++;
         }
         return NodePtr.EMPTY_PTR;
@@ -2325,25 +2338,78 @@ public final class TaoTree implements AutoCloseable {
         return slab.resolve(ptr, length);
     }
 
+    private MemorySegment nodeBaseSegment(long ptr) {
+        if (chunkStore != null && WriterArena.isArenaAllocated(ptr)) {
+            return chunkStore.chunkSegment(WriterArena.page(ptr));
+        }
+        return slab.backingSegment(ptr);
+    }
+
+    private long nodeBaseOffset(long ptr) {
+        if (chunkStore != null && WriterArena.isArenaAllocated(ptr)) {
+            int page = WriterArena.page(ptr);
+            return chunkStore.chunkByteOffset(page, WriterArena.offsetInPage(ptr));
+        }
+        return Integer.toUnsignedLong(NodePtr.offset(ptr));
+    }
+
     // =======================================================================
     // Internal: helpers
     // =======================================================================
 
     private long findChild(long nodePtr, int type, byte keyByte) {
-        MemorySegment seg = resolveNode(nodePtr);
+        MemorySegment seg = nodeBaseSegment(nodePtr);
+        long segOffset = nodeBaseOffset(nodePtr);
+        return findChild(seg, segOffset, type, keyByte);
+    }
+
+    private long findChild(MemorySegment seg, long segOffset, int type, byte keyByte) {
         return switch (type) {
-            case NodePtr.NODE_4   -> Node4.findChild(seg, keyByte);
-            case NodePtr.NODE_16  -> Node16.findChild(seg, keyByte);
-            case NodePtr.NODE_48  -> Node48.findChild(seg, keyByte);
-            case NodePtr.NODE_256 -> Node256.findChild(seg, keyByte);
+            case NodePtr.NODE_4   -> Node4.findChild(seg, segOffset, keyByte);
+            case NodePtr.NODE_16  -> Node16.findChild(seg, segOffset, keyByte);
+            case NodePtr.NODE_48  -> Node48.findChild(seg, segOffset, keyByte);
+            case NodePtr.NODE_256 -> Node256.findChild(seg, segOffset, keyByte);
             default -> NodePtr.EMPTY_PTR;
         };
     }
 
     private boolean leafKeyMatches(long leafPtr, MemorySegment key, int keyLen) {
         if (keyLen != this.keyLen) return false;
-        MemorySegment leafKey = resolveNode(leafPtr, this.keyLen);
-        return leafKey.mismatch(key.asSlice(0, this.keyLen)) == -1;
+        MemorySegment seg = nodeBaseSegment(leafPtr);
+        long segOffset = nodeBaseOffset(leafPtr);
+        return bytesEqual(seg, segOffset, key, keyLen);
+    }
+
+    private boolean leafKeyMatches(long leafPtr, byte[] key, int keyLen) {
+        if (keyLen != this.keyLen) return false;
+        MemorySegment seg = nodeBaseSegment(leafPtr);
+        long segOffset = nodeBaseOffset(leafPtr);
+        return bytesEqual(seg, segOffset, key, keyLen);
+    }
+
+    private static boolean bytesEqual(MemorySegment seg, long segOffset, MemorySegment key, int keyLen) {
+        int i = 0;
+        for (; i + Long.BYTES <= keyLen; i += Long.BYTES) {
+            if (seg.get(ValueLayout.JAVA_LONG_UNALIGNED, segOffset + i)
+                    != key.get(ValueLayout.JAVA_LONG_UNALIGNED, i)) {
+                return false;
+            }
+        }
+        for (; i < keyLen; i++) {
+            if (seg.get(ValueLayout.JAVA_BYTE, segOffset + i) != key.get(ValueLayout.JAVA_BYTE, i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean bytesEqual(MemorySegment seg, long segOffset, byte[] key, int keyLen) {
+        for (int i = 0; i < keyLen; i++) {
+            if (seg.get(ValueLayout.JAVA_BYTE, segOffset + i) != key[i]) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // =======================================================================

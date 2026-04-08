@@ -21,7 +21,6 @@ import java.lang.foreign.MemorySegment;
 public final class MutationLog {
 
     private static final int INITIAL_CAPACITY = 64;
-
     private byte[][] keys;
     private int[] keyLens;
     private int[] leafClasses;
@@ -30,6 +29,7 @@ public final class MutationLog {
     private long[] originalLeafPtrs; // original leaf ptr before force-copy (0 if new key or normal COW)
     private int count;
     private boolean allHaveOriginals = true; // track whether all entries have original ptrs
+    private long totalValueBytes;
 
     public MutationLog() {
         keys = new byte[INITIAL_CAPACITY][];
@@ -62,6 +62,7 @@ public final class MutationLog {
         snapshotValues[count] = snapCopy;
         originalLeafPtrs[count] = originalLeafPtr;
         if (originalLeafPtr == 0) allHaveOriginals = false;
+        totalValueBytes += valueSize;
         count++;
     }
 
@@ -73,6 +74,7 @@ public final class MutationLog {
     public long leafPtr(int i) { return leafPtrs[i]; }
     public byte[] snapshotValue(int i) { return snapshotValues[i]; }
     public long originalLeafPtr(int i) { return originalLeafPtrs[i]; }
+    public long totalValueBytes() { return totalValueBytes; }
 
     /**
      * Returns true if all entries have a non-zero original leaf ptr,

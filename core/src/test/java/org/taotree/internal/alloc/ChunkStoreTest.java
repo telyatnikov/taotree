@@ -6,6 +6,10 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -424,6 +428,55 @@ class ChunkStoreTest {
             var seg = store.resolvePage(startPage);
             assertEquals(0xDEADBEEFL, seg.get(ValueLayout.JAVA_LONG, 0));
             assertEquals(0xCAFEBABEL, seg.get(ValueLayout.JAVA_LONG, 8));
+        }
+    }
+
+    @Test
+    void concurrentAllocationsDoNotOverlap() throws Exception {
+        Path file = tmp.resolve("concurrent_alloc.tao");
+        try (var arena = Arena.ofShared();
+             var store = ChunkStore.create(file, arena)) {
+
+            int threads = 4;
+            int allocationsPerThread = 64;
+            int[][] starts = new int[threads][allocationsPerThread];
+            Set<Integer> uniqueStarts = ConcurrentHashMap.newKeySet();
+            var failure = new AtomicReference<Throwable>();
+            var done = new CountDownLatch(threads);
+
+            for (int t = 0; t < threads; t++) {
+                final int threadId = t;
+                Thread.ofPlatform().start(() -> {
+                    try {
+                        for (int i = 0; i < allocationsPerThread; i++) {
+                            int start = store.allocPages(1);
+                            if (!uniqueStarts.add(start)) {
+                                throw new AssertionError("duplicate page allocation: " + start);
+                            }
+                            starts[threadId][i] = start;
+                            store.resolvePage(start).set(
+                                ValueLayout.JAVA_LONG, 0, ((long) threadId << 32) | i);
+                        }
+                    } catch (Throwable t1) {
+                        failure.compareAndSet(null, t1);
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+
+            done.await();
+            if (failure.get() != null) {
+                throw new AssertionError(failure.get());
+            }
+
+            assertEquals(threads * allocationsPerThread, uniqueStarts.size());
+            for (int t = 0; t < threads; t++) {
+                for (int i = 0; i < allocationsPerThread; i++) {
+                    long value = store.resolvePage(starts[t][i]).get(ValueLayout.JAVA_LONG, 0);
+                    assertEquals(((long) t << 32) | i, value);
+                }
+            }
         }
     }
 
