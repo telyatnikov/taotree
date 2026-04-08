@@ -1647,12 +1647,14 @@ public final class TaoTree implements AutoCloseable {
                 var result = cowEngine.deferredGetOrCreateCopy(
                         scopeArena, scopeRoot, key, keyLen, leafClass);
                 long ptr = result.leafPtr();
+                long originalPtr = result.originalLeafPtr();
 
                 // If the leaf was returned unchanged (arena-allocated), check
                 // whether it's from THIS scope or from the published tree
                 // (stale arena allocation from another writer's rebase).
                 // Force-copy stale leaves to get a truly private copy.
                 if (!result.mutated() && !seenLeafPtrs.contains(ptr)) {
+                    originalPtr = ptr;
                     result = cowEngine.deferredGetOrCreateForceCopy(
                             scopeArena, scopeRoot, key, keyLen, leafClass);
                     ptr = result.leafPtr();
@@ -1663,17 +1665,24 @@ public final class TaoTree implements AutoCloseable {
                     scopeSize += result.sizeDelta();
                     collectRetirees(result);
                 }
-                // Record for potential rebase (de-duplicated by leafPtr).
-                // Snapshot the leaf value BEFORE the application modifies it
-                // so the conflict resolver can compute deltas for accumulators.
-                if (seenLeafPtrs.add(ptr)) {
+                // Track seen leaf ptrs for force-copy dedup.
+                // Always record mutations for rebase capability.
+                boolean firstSeen = seenLeafPtrs.add(ptr);
+                if (firstSeen) {
                     if (mutationLog == null) {
                         mutationLog = new org.taotree.internal.cow.MutationLog();
                     }
-                    MemorySegment snapshotValue = leafValueImpl(ptr);
                     int classId = leafClassIds[leafClass];
                     int valueSize = slab.segmentSize(classId) - keySlotSize;
-                    mutationLog.record(key, keyLen, leafClass, ptr, snapshotValue, valueSize);
+                    if (resolver != null) {
+                        // Capture snapshot value for conflict resolver delta computation
+                        MemorySegment snapshotValue = leafValueImpl(ptr);
+                        mutationLog.record(key, keyLen, leafClass, ptr, snapshotValue, valueSize, originalPtr);
+                    } else {
+                        // No resolver — skip snapshot (saves a copy per key)
+                        mutationLog.record(key, keyLen, leafClass, ptr,
+                            MemorySegment.ofArray(new byte[0]), 0, originalPtr);
+                    }
                 }
                 return ptr;
             }
@@ -1840,11 +1849,44 @@ public final class TaoTree implements AutoCloseable {
             try {
                 var current = publishedState();
                 if (current == scopeSnapshot) {
-                    // No conflict — publish our private root directly
-                    root = scopeRoot;
-                    size = scopeSize;
-                    publishRoot();
-                    retireScope(scopeRetirees);
+                    // No conflict — check if we can write-back existing keys
+                    // instead of publishing the full scopeRoot with arena copies.
+                    boolean hasWriteBack = mutationLog != null
+                            && mutationLog.allHaveOriginals();
+                    if (hasWriteBack) {
+                        // Write-back: copy values from arena copies to original leaves.
+                        // The published tree structure doesn't change for these keys,
+                        // so we avoid keeping arena copies referenced by the published tree.
+                        for (int i = 0, n = mutationLog.size(); i < n; i++) {
+                            long origPtr = mutationLog.originalLeafPtr(i);
+                            if (origPtr == 0) continue; // new key — no write-back
+                            long arenaPtr = mutationLog.leafPtr(i);
+                            int classId = leafClassIds[mutationLog.leafClass(i)];
+                            int valueSize = slab.segmentSize(classId) - keySlotSize;
+                            MemorySegment arenaVal = leafValueImpl(arenaPtr);
+                            MemorySegment origVal = leafValueImpl(origPtr);
+                            MemorySegment.copy(arenaVal, 0, origVal, 0, valueSize);
+                        }
+                        if (scopeSize == scopeSnapshot.size()) {
+                            // Pure write-back (no new keys): publish original root and reset arena
+                            root = scopeSnapshot.root();
+                            size = scopeSize;
+                            publishRoot();
+                            scopeArena.resetToScopeStart();
+                        } else {
+                            // Mixed: new keys exist, must publish scopeRoot for structure changes
+                            root = scopeRoot;
+                            size = scopeSize;
+                            publishRoot();
+                            retireScope(scopeRetirees);
+                        }
+                    } else {
+                        // Standard publish: use scopeRoot with arena nodes
+                        root = scopeRoot;
+                        size = scopeSize;
+                        publishRoot();
+                        retireScope(scopeRetirees);
+                    }
                 } else {
                     // Conflict: another writer published since our snapshot.
                     // Replay mutation log against the new root.

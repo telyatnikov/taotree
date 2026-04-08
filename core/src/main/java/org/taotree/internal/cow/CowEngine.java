@@ -78,10 +78,11 @@ public final class CowEngine {
         boolean mutated,
         long newRoot,
         int sizeDelta,
-        LongList retirees
+        LongList retirees,
+        long originalLeafPtr // original leaf ptr before COW-copy (0 if new key)
     ) {
         static DeferredResult unchanged(long leafPtr) {
-            return new DeferredResult(leafPtr, false, NodePtr.EMPTY_PTR, 0, LongList.empty());
+            return new DeferredResult(leafPtr, false, NodePtr.EMPTY_PTR, 0, LongList.empty(), 0);
         }
     }
 

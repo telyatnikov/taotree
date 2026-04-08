@@ -101,6 +101,6 @@ final class CowDelete {
             ctx.addIfSlabAllocated(retirees, oldNode);
         }
 
-        return new CowEngine.DeferredResult(0, true, current, -1, retirees);
+        return new CowEngine.DeferredResult(0, true, current, -1, retirees, 0);
     }
 }

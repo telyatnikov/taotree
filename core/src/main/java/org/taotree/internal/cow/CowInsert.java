@@ -50,7 +50,7 @@ final class CowInsert {
         if (NodePtr.isEmpty(currentRoot)) {
             long leafPtr = ctx.allocateLeaf(key, keyLen, leafClass);
             long wrapped = ctx.wrapInPrefix(key, 0, keyLen, leafPtr);
-            return new CowEngine.DeferredResult(leafPtr, true, wrapped, 1, LongList.empty());
+            return new CowEngine.DeferredResult(leafPtr, true, wrapped, 1, LongList.empty(), 0);
         }
 
         var path = CowEngine.PATH_STACK_CACHE.get();
@@ -74,11 +74,12 @@ final class CowInsert {
                         return CowEngine.DeferredResult.unchanged(node);
                     }
                     // COW-copy the existing leaf to give the writer a private copy
+                    long originalLeaf = node;
                     long newLeaf = ctx.copyLeaf(node, leafClass);
-                    return buildUp(ctx, path, newLeaf, newLeaf, node, 0);
+                    return buildUp(ctx, path, newLeaf, newLeaf, node, 0, originalLeaf);
                 }
                 var result = expandLeaf(ctx, node, key, keyLen, depth, leafClass);
-                return buildUp(ctx, path, result.subtree(), result.leafPtr(), node, 1);
+                return buildUp(ctx, path, result.subtree(), result.leafPtr(), node, 1, 0);
             }
 
             if (type == NodePtr.PREFIX) {
@@ -89,7 +90,7 @@ final class CowInsert {
                 if (matched < prefLen) {
                     var result = splitPrefix(ctx, node, prefSeg, key, keyLen,
                         depth, matched, leafClass);
-                    return buildUp(ctx, path, result.subtree(), result.leafPtr(), node, 1);
+                    return buildUp(ctx, path, result.subtree(), result.leafPtr(), node, 1, 0);
                 }
 
                 depth += prefLen;
@@ -108,7 +109,7 @@ final class CowInsert {
                 long leafPtr = ctx.allocateLeaf(key, keyLen, leafClass);
                 long wrapped = ctx.wrapInPrefix(key, depth + 1, keyLen, leafPtr);
                 long newNode = CowNodeOps.insertChild(ctx, node, type, keyByte, wrapped);
-                return buildUp(ctx, path, newNode, leafPtr, node, 1);
+                return buildUp(ctx, path, newNode, leafPtr, node, 1, 0);
             }
 
             path.push(node, keyByte, type);
@@ -121,7 +122,7 @@ final class CowInsert {
 
     private static CowEngine.DeferredResult buildUp(
             CowContext ctx, CowEngine.PathStack path, long newSubtree,
-            long leafPtr, long originalTarget, int sizeDelta) {
+            long leafPtr, long originalTarget, int sizeDelta, long originalLeafPtr) {
         long current = newSubtree;
         var retirees = new LongList();
         ctx.addIfSlabAllocated(retirees, originalTarget);
@@ -135,7 +136,7 @@ final class CowInsert {
             ctx.addIfSlabAllocated(retirees, oldNode);
         }
 
-        return new CowEngine.DeferredResult(leafPtr, true, current, sizeDelta, retirees);
+        return new CowEngine.DeferredResult(leafPtr, true, current, sizeDelta, retirees, originalLeafPtr);
     }
 
     // -- Leaf expansion and prefix split --

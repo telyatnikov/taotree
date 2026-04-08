@@ -59,6 +59,12 @@ public final class WriterArena {
     private int scopeStartPage;
     private int allocCount;
 
+    // Saved state for arena reset after write-back (no-conflict publish)
+    private int savedPage;
+    private int savedOffset;
+    private int savedBatchStart;
+    private int savedBatchEnd;
+
     // -----------------------------------------------------------------------
     // Construction
     // -----------------------------------------------------------------------
@@ -131,6 +137,10 @@ public final class WriterArena {
      */
     public void beginScope() {
         scopeStartPage = currentPage;
+        savedPage = currentPage;
+        savedOffset = offsetInPage;
+        savedBatchStart = batchStart;
+        savedBatchEnd = batchEnd;
         allocCount = 0;
     }
 
@@ -165,6 +175,22 @@ public final class WriterArena {
      */
     public void endScope() {
         scopeStartPage = currentPage;
+        allocCount = 0;
+    }
+
+    /**
+     * Reset the arena to the state captured at {@link #beginScope()}.
+     *
+     * <p>Used after a write-back commit (no-conflict, no new keys) where the
+     * scope's arena allocations are dead (not published). The next scope reuses
+     * the same page range, preventing cumulative file growth.
+     */
+    public void resetToScopeStart() {
+        currentPage = savedPage;
+        offsetInPage = savedOffset;
+        batchStart = savedBatchStart;
+        batchEnd = savedBatchEnd;
+        scopeStartPage = savedPage;
         allocCount = 0;
     }
 
