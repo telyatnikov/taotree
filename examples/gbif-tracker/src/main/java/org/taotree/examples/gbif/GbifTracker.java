@@ -421,59 +421,42 @@ public class GbifTracker {
         }
     }
 
-    /** Read a nullable string field. For array fields (e.g. recordedBy), joins elements with "; ". */
+    /** Read a nullable string field. For list fields (e.g. recordedBy), joins elements with "; ". */
     static String nullSafe(RowReader rows, String field) {
         if (rows.isNull(field)) return null;
         try {
             String v = rows.getString(field);
             return (v == null || v.isEmpty()) ? null : v;
-        } catch (IllegalArgumentException | ClassCastException e) {
-            // Field is a LIST<STRING> — join elements
-            try {
-                var list = rows.getList(field);
-                if (list == null || list.isEmpty()) return null;
-                var sb = new StringBuilder();
-                for (var s : list.strings()) {
-                    if (s != null) {
-                        if (!sb.isEmpty()) sb.append("; ");
-                        sb.append(s);
-                    }
-                }
-                return sb.isEmpty() ? null : sb.toString();
-            } catch (Exception e2) {
-                return null;
-            }
-        }
+        } catch (RuntimeException ignored) {}
+        // Field is a LIST<STRING> — join elements
+        try { return joinList(rows.getList(field)); } catch (RuntimeException ignored) {}
+        return null;
     }
 
+    /** Read a nullable int field; handles INT32, INT64, and STRING Parquet column types. */
     static int safeInt(RowReader rows, String field) {
         if (rows.isNull(field)) return 0;
-        try {
-            return rows.getInt(field);
-        } catch (ClassCastException e) {
-            try {
-                return (int) rows.getLong(field);
-            } catch (ClassCastException e2) {
-                try {
-                    return Integer.parseInt(rows.getString(field));
-                } catch (NumberFormatException e3) {
-                    return 0;
-                }
-            }
-        }
+        try { return rows.getInt(field);                } catch (RuntimeException ignored) {}
+        try { return (int) rows.getLong(field);         } catch (RuntimeException ignored) {}
+        try { return Integer.parseInt(rows.getString(field)); } catch (RuntimeException ignored) {}
+        return 0;
     }
 
+    /** Read a nullable double field; handles DOUBLE and STRING Parquet column types. */
     static double safeDouble(RowReader rows, String field) {
         if (rows.isNull(field)) return Double.NaN;
-        try {
-            return rows.getDouble(field);
-        } catch (ClassCastException e) {
-            try {
-                return Double.parseDouble(rows.getString(field));
-            } catch (NumberFormatException e2) {
-                return Double.NaN;
-            }
+        try { return rows.getDouble(field);                    } catch (RuntimeException ignored) {}
+        try { return Double.parseDouble(rows.getString(field)); } catch (RuntimeException ignored) {}
+        return Double.NaN;
+    }
+
+    private static String joinList(dev.hardwood.row.PqList list) {
+        if (list == null || list.isEmpty()) return null;
+        var sb = new StringBuilder();
+        for (var s : list.strings()) {
+            if (s != null) { if (!sb.isEmpty()) sb.append("; "); sb.append(s); }
         }
+        return sb.isEmpty() ? null : sb.toString();
     }
 
     static String buildExtrasJson(RowReader rows) {
