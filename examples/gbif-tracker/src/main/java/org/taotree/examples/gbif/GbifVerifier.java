@@ -39,13 +39,13 @@ public class GbifVerifier {
         KeyField.dict16("countryCode"), KeyField.dict16("stateProvince")
     );
     static final LeafLayout LEAF_LAYOUT = LeafLayout.of(
-        LeafField.int32("count"), LeafField.int32("year"),
-        LeafField.int32("month"), LeafField.int32("day"),
-        LeafField.float64("decimalLatitude"), LeafField.float64("decimalLongitude"),
-        LeafField.float64("elevation"), LeafField.int32("individualCount"),
-        LeafField.int32("taxonKey"), LeafField.int32("speciesKey"),
-        LeafField.string("locality"), LeafField.string("recordedBy"),
-        LeafField.json("extras")
+        LeafField.int32("count"), LeafField.int32("year").nullable(),
+        LeafField.int32("month").nullable(), LeafField.int32("day").nullable(),
+        LeafField.float64("decimalLatitude").nullable(), LeafField.float64("decimalLongitude").nullable(),
+        LeafField.float64("elevation").nullable(), LeafField.int32("individualCount").nullable(),
+        LeafField.int32("taxonKey").nullable(), LeafField.int32("speciesKey").nullable(),
+        LeafField.string("locality").nullable(), LeafField.string("recordedBy").nullable(),
+        LeafField.extras("extras")
     );
 
     static final LeafHandle.Int32   COUNT = LEAF_LAYOUT.int32("count");
@@ -60,7 +60,7 @@ public class GbifVerifier {
     static final LeafHandle.Int32   SPK   = LEAF_LAYOUT.int32("speciesKey");
     static final LeafHandle.Str     LOC   = LEAF_LAYOUT.string("locality");
     static final LeafHandle.Str     REC   = LEAF_LAYOUT.string("recordedBy");
-    static final LeafHandle.Json    EXT   = LEAF_LAYOUT.json("extras");
+    static final LeafHandle.Extras  EXT   = LEAF_LAYOUT.extras("extras");
 
     record Expected(int count, int year, int month, int day,
                     double lat, double lon, double elev,
@@ -248,15 +248,15 @@ public class GbifVerifier {
                                 checked++;
 
                                 fieldErrors += cmp("count", exp.count, leaf.get(COUNT), mapKey, errors);
-                                fieldErrors += cmp("year", exp.year, leaf.get(YEAR), mapKey, errors);
-                                fieldErrors += cmp("month", exp.month, leaf.get(MONTH), mapKey, errors);
-                                fieldErrors += cmp("day", exp.day, leaf.get(DAY), mapKey, errors);
-                                fieldErrors += cmpD("lat", exp.lat, leaf.get(LAT), mapKey, errors);
-                                fieldErrors += cmpD("lon", exp.lon, leaf.get(LON), mapKey, errors);
-                                fieldErrors += cmpD("elev", exp.elev, leaf.get(ELEV), mapKey, errors);
-                                fieldErrors += cmp("indCnt", exp.indCnt, leaf.get(IND), mapKey, errors);
-                                fieldErrors += cmp("taxonKey", exp.taxonKey, leaf.get(TAX), mapKey, errors);
-                                fieldErrors += cmp("speciesKey", exp.speciesKey, leaf.get(SPK), mapKey, errors);
+                                fieldErrors += cmp("year", exp.year, readNullable(leaf, YEAR), mapKey, errors);
+                                fieldErrors += cmp("month", exp.month, readNullable(leaf, MONTH), mapKey, errors);
+                                fieldErrors += cmp("day", exp.day, readNullable(leaf, DAY), mapKey, errors);
+                                fieldErrors += cmpD("lat", exp.lat, readNullableD(leaf, LAT), mapKey, errors);
+                                fieldErrors += cmpD("lon", exp.lon, readNullableD(leaf, LON), mapKey, errors);
+                                fieldErrors += cmpD("elev", exp.elev, readNullableD(leaf, ELEV), mapKey, errors);
+                                fieldErrors += cmp("indCnt", exp.indCnt, readNullable(leaf, IND), mapKey, errors);
+                                fieldErrors += cmp("taxonKey", exp.taxonKey, readNullable(leaf, TAX), mapKey, errors);
+                                fieldErrors += cmp("speciesKey", exp.speciesKey, readNullable(leaf, SPK), mapKey, errors);
                                 if (exp.locality != null)
                                     fieldErrors += cmpS("locality", exp.locality, safeGet(leaf, LOC), mapKey, errors);
                                 if (exp.recordedBy != null)
@@ -395,7 +395,7 @@ public class GbifVerifier {
         catch (Exception e) { return null; }
     }
 
-    private static String safeGet(LeafAccessor leaf, LeafHandle.Json h) {
+    private static String safeGet(LeafAccessor leaf, LeafHandle.Extras h) {
         try { String v = leaf.get(h); return (v == null || v.isEmpty()) ? null : v; }
         catch (Exception e) { return null; }
     }
@@ -403,6 +403,16 @@ public class GbifVerifier {
     // -----------------------------------------------------------------------
     // Comparison helpers
     // -----------------------------------------------------------------------
+
+    /** Read a nullable int32 field, mapping null → 0 (the verifier's sentinel for null ints). */
+    private static int readNullable(LeafAccessor leaf, LeafHandle.Int32 h) {
+        return leaf.isNull(h) ? 0 : leaf.get(h);
+    }
+
+    /** Read a nullable float64 field, mapping null → NaN (the verifier's sentinel for null doubles). */
+    private static double readNullableD(LeafAccessor leaf, LeafHandle.Float64 h) {
+        return leaf.isNull(h) ? Double.NaN : leaf.get(h);
+    }
 
     private static int cmp(String f, int exp, int act, String key, List<String> errors) {
         if (exp == act) return 0;

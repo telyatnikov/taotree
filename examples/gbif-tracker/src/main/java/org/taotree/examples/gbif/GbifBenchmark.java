@@ -249,29 +249,29 @@ public class GbifBenchmark {
             // Keep the newer observation per the total-order comparison
             if (GbifTracker.isNewer(
                 pending.get(GbifTracker.YEAR), pending.get(GbifTracker.MONTH), pending.get(GbifTracker.DAY),
-                pending.get(GbifTracker.LAT), pending.get(GbifTracker.LON),
+                GbifTracker.getD(pending, GbifTracker.LAT), GbifTracker.getD(pending, GbifTracker.LON),
                 pending.get(GbifTracker.TAXON_K), pending.get(GbifTracker.SPECIES_K),
                 pending.get(GbifTracker.IND_CNT),
                 pending.get(GbifTracker.LOCALITY), pending.get(GbifTracker.RECORDED),
                 pending.get(GbifTracker.EXTRAS),
                 target.get(GbifTracker.YEAR), target.get(GbifTracker.MONTH), target.get(GbifTracker.DAY),
-                target.get(GbifTracker.LAT), target.get(GbifTracker.LON),
+                GbifTracker.getD(target, GbifTracker.LAT), GbifTracker.getD(target, GbifTracker.LON),
                 target.get(GbifTracker.TAXON_K), target.get(GbifTracker.SPECIES_K),
                 target.get(GbifTracker.IND_CNT),
                 target.get(GbifTracker.LOCALITY), target.get(GbifTracker.RECORDED),
                 target.get(GbifTracker.EXTRAS)
             )) {
-                target.set(GbifTracker.YEAR, pending.get(GbifTracker.YEAR));
-                target.set(GbifTracker.MONTH, pending.get(GbifTracker.MONTH));
-                target.set(GbifTracker.DAY, pending.get(GbifTracker.DAY));
-                target.set(GbifTracker.LAT, pending.get(GbifTracker.LAT));
-                target.set(GbifTracker.LON, pending.get(GbifTracker.LON));
-                target.set(GbifTracker.ELEV, pending.get(GbifTracker.ELEV));
-                target.set(GbifTracker.IND_CNT, pending.get(GbifTracker.IND_CNT));
-                target.set(GbifTracker.TAXON_K, pending.get(GbifTracker.TAXON_K));
-                target.set(GbifTracker.SPECIES_K, pending.get(GbifTracker.SPECIES_K));
-                target.set(GbifTracker.LOCALITY, pending.get(GbifTracker.LOCALITY));
-                target.set(GbifTracker.RECORDED, pending.get(GbifTracker.RECORDED));
+                copyNullable(pending, target, GbifTracker.YEAR);
+                copyNullable(pending, target, GbifTracker.MONTH);
+                copyNullable(pending, target, GbifTracker.DAY);
+                copyNullableD(pending, target, GbifTracker.LAT);
+                copyNullableD(pending, target, GbifTracker.LON);
+                copyNullableD(pending, target, GbifTracker.ELEV);
+                copyNullable(pending, target, GbifTracker.IND_CNT);
+                copyNullable(pending, target, GbifTracker.TAXON_K);
+                copyNullable(pending, target, GbifTracker.SPECIES_K);
+                copyNullableS(pending, target, GbifTracker.LOCALITY);
+                copyNullableS(pending, target, GbifTracker.RECORDED);
                 target.set(GbifTracker.EXTRAS, pending.get(GbifTracker.EXTRAS));
             }
         };
@@ -316,6 +316,25 @@ public class GbifBenchmark {
 
         latch.await();
         if (errors.sum() > 0) throw new RuntimeException(errors.sum() + " writer(s) failed");
+    }
+
+    // -----------------------------------------------------------------------
+    // Null-aware field copy helpers (preserve null bitmap during conflict resolution)
+    // -----------------------------------------------------------------------
+
+    private static void copyNullable(LeafAccessor src, LeafAccessor dst, LeafHandle.Int32 h) {
+        if (src.isNull(h)) dst.setNull(h);
+        else dst.set(h, src.get(h));
+    }
+
+    private static void copyNullableD(LeafAccessor src, LeafAccessor dst, LeafHandle.Float64 h) {
+        if (src.isNull(h)) dst.setNull(h);
+        else dst.set(h, src.get(h));
+    }
+
+    private static void copyNullableS(LeafAccessor src, LeafAccessor dst, LeafHandle.Str h) {
+        if (src.isNull(h)) dst.setNull(h);
+        else dst.set(h, src.get(h));
     }
 
     // -----------------------------------------------------------------------

@@ -15,6 +15,8 @@ import org.taotree.layout.KeyLayout;
 import org.taotree.layout.LeafField;
 import org.taotree.layout.LeafLayout;
 
+import org.taotree.layout.LeafHandle;
+
 /**
  * Tests for {@link LeafField}, {@link LeafLayout}, and {@link LeafAccessor}.
  */
@@ -532,6 +534,463 @@ class LeafLayoutTest {
             try (var r = dataTree.read()) {
                 long ptr = r.lookup(key);
                 assertEquals(0, r.leaf(ptr, layout).getDict16Code("d"));
+            }
+        }
+    }
+
+    // ====================================================================
+    // Nullable fields
+    // ====================================================================
+
+    @Test
+    void nullableFieldWidth() {
+        // Nullable wrapper delegates width to inner field
+        assertEquals(4, LeafField.int32("x").nullable().width());
+        assertEquals(8, LeafField.float64("x").nullable().width());
+        assertEquals(16, LeafField.string("x").nullable().width());
+    }
+
+    @Test
+    void nullableFieldName() {
+        assertEquals("year", LeafField.int32("year").nullable().name());
+    }
+
+    @Test
+    void doubleNullableThrows() {
+        var f = LeafField.int32("x").nullable();
+        assertThrows(IllegalArgumentException.class, f::nullable);
+    }
+
+    @Test
+    void nullBitmapSizeZeroWhenNoNullable() {
+        var layout = LeafLayout.of(LeafField.int32("a"), LeafField.int64("b"));
+        assertEquals(0, layout.nullBitmapSize());
+        assertEquals(12, layout.totalWidth()); // 4 + 8, no bitmap
+    }
+
+    @Test
+    void nullBitmapSizeOneByteForUpTo8() {
+        var layout = LeafLayout.of(
+            LeafField.int32("a").nullable(),
+            LeafField.int32("b").nullable(),
+            LeafField.int32("c")
+        );
+        assertEquals(1, layout.nullBitmapSize());
+        // 4+4+4 = 12 fields + 1 bitmap = 13
+        assertEquals(13, layout.totalWidth());
+    }
+
+    @Test
+    void nullBitmapSizeTwoBytesFor9() {
+        // 9 nullable fields → 2 bitmap bytes
+        var layout = LeafLayout.of(
+            LeafField.int8("a").nullable(),
+            LeafField.int8("b").nullable(),
+            LeafField.int8("c").nullable(),
+            LeafField.int8("d").nullable(),
+            LeafField.int8("e").nullable(),
+            LeafField.int8("f").nullable(),
+            LeafField.int8("g").nullable(),
+            LeafField.int8("h").nullable(),
+            LeafField.int8("i").nullable()
+        );
+        assertEquals(2, layout.nullBitmapSize());
+        assertEquals(9 + 2, layout.totalWidth());
+    }
+
+    @Test
+    void nullBitIndicesAssigned() {
+        var layout = LeafLayout.of(
+            LeafField.int32("a"),
+            LeafField.int32("b").nullable(),
+            LeafField.int32("c"),
+            LeafField.int32("d").nullable()
+        );
+        assertEquals(-1, layout.nullBitIndex(0)); // a: not nullable
+        assertEquals(0, layout.nullBitIndex(1));   // b: first nullable → bit 0
+        assertEquals(-1, layout.nullBitIndex(2)); // c: not nullable
+        assertEquals(1, layout.nullBitIndex(3));   // d: second nullable → bit 1
+    }
+
+    @Test
+    void nullableRoundTrip() throws IOException {
+        var layout = LeafLayout.of(
+            LeafField.int32("count"),
+            LeafField.int32("year").nullable(),
+            LeafField.float64("elevation").nullable(),
+            LeafField.string("locality").nullable()
+        );
+        var COUNT = layout.int32("count");
+        var YEAR  = layout.int32("year");
+        var ELEV  = layout.float64("elevation");
+        var LOC   = layout.string("locality");
+
+        assertTrue(YEAR.isNullable());
+        assertTrue(ELEV.isNullable());
+        assertTrue(LOC.isNullable());
+        assertFalse(COUNT.isNullable());
+
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
+            byte[] key = {0, 0, 0, 1};
+            try (var w = tree.write()) {
+                long ptr = w.getOrCreate(key);
+                var leaf = w.leaf(ptr, layout);
+                // Set count (non-nullable) and year (nullable)
+                leaf.set(COUNT, 42).set(YEAR, 2024);
+                // Set elevation, then null it
+                leaf.set(ELEV, 1897.5);
+                assertFalse(leaf.isNull(ELEV));
+                leaf.setNull(ELEV);
+                assertTrue(leaf.isNull(ELEV));
+                // Leave locality unset (zero-initialized → should be null if bitmap bit is set)
+                leaf.setNull(LOC);
+            }
+            try (var r = tree.read()) {
+                long ptr = r.lookup(key);
+                var leaf = r.leaf(ptr, layout);
+                assertEquals(42, leaf.get(COUNT));
+                assertFalse(leaf.isNull(COUNT)); // non-nullable always false
+                assertFalse(leaf.isNull(YEAR));
+                assertEquals(2024, leaf.get(YEAR));
+                assertTrue(leaf.isNull(ELEV));
+                assertTrue(leaf.isNull(LOC));
+            }
+        }
+    }
+
+    @Test
+    void setAutoClearsNullBit() throws IOException {
+        var layout = LeafLayout.of(LeafField.int32("x").nullable());
+        var X = layout.int32("x");
+
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
+            byte[] key = {0, 0, 0, 1};
+            try (var w = tree.write()) {
+                long ptr = w.getOrCreate(key);
+                var leaf = w.leaf(ptr, layout);
+                leaf.setNull(X);
+                assertTrue(leaf.isNull(X));
+                leaf.set(X, 99);
+                assertFalse(leaf.isNull(X));
+                assertEquals(99, leaf.get(X));
+            }
+        }
+    }
+
+    @Test
+    void setNullOnNonNullableThrows() throws IOException {
+        var layout = LeafLayout.of(LeafField.int32("x"));
+        var X = layout.int32("x");
+        assertFalse(X.isNullable());
+
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
+            byte[] key = {0, 0, 0, 1};
+            try (var w = tree.write()) {
+                long ptr = w.getOrCreate(key);
+                var leaf = w.leaf(ptr, layout);
+                assertThrows(IllegalStateException.class, () -> leaf.setNull(X));
+            }
+        }
+    }
+
+    @Test
+    void isNullAlwaysFalseForNonNullable() throws IOException {
+        var layout = LeafLayout.of(LeafField.int32("x"));
+        var X = layout.int32("x");
+
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
+            byte[] key = {0, 0, 0, 1};
+            try (var w = tree.write()) {
+                w.getOrCreate(key);
+            }
+            try (var r = tree.read()) {
+                long ptr = r.lookup(key);
+                var leaf = r.leaf(ptr, layout);
+                assertFalse(leaf.isNull(X));
+            }
+        }
+    }
+
+    @Test
+    void nullableHandleFactoriesForAllTypes() throws IOException {
+        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+            var d16 = TaoDictionary.u16(tree);
+            var d32 = TaoDictionary.u32(tree);
+
+            var layout = LeafLayout.of(
+                LeafField.int8("a").nullable(),
+                LeafField.int16("b").nullable(),
+                LeafField.int32("c").nullable(),
+                LeafField.int64("d").nullable(),
+                LeafField.float32("e").nullable(),
+                LeafField.float64("f").nullable(),
+                LeafField.string("g").nullable(),
+                LeafField.json("h").nullable(),
+                LeafField.dict16("i", d16).nullable(),
+                LeafField.dict32("j", d32).nullable()
+            );
+
+            assertTrue(layout.int8("a").isNullable());
+            assertTrue(layout.int16("b").isNullable());
+            assertTrue(layout.int32("c").isNullable());
+            assertTrue(layout.int64("d").isNullable());
+            assertTrue(layout.float32("e").isNullable());
+            assertTrue(layout.float64("f").isNullable());
+            assertTrue(layout.string("g").isNullable());
+            assertTrue(layout.json("h").isNullable());
+            assertTrue(layout.dict16("i").isNullable());
+            assertTrue(layout.dict32("j").isNullable());
+        }
+    }
+
+    @Test
+    void nullableFloat64RoundTrip() throws IOException {
+        var layout = LeafLayout.of(
+            LeafField.float64("lat").nullable(),
+            LeafField.float64("lon").nullable()
+        );
+        var LAT = layout.float64("lat");
+        var LON = layout.float64("lon");
+
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
+            byte[] key = {0, 0, 0, 1};
+            try (var w = tree.write()) {
+                long ptr = w.getOrCreate(key);
+                var leaf = w.leaf(ptr, layout);
+                leaf.set(LAT, 48.8566);
+                leaf.setNull(LON);
+            }
+            try (var r = tree.read()) {
+                long ptr = r.lookup(key);
+                var leaf = r.leaf(ptr, layout);
+                assertFalse(leaf.isNull(LAT));
+                assertEquals(48.8566, leaf.get(LAT));
+                assertTrue(leaf.isNull(LON));
+                assertEquals(0.0, leaf.get(LON)); // zeroed bytes → 0.0
+            }
+        }
+    }
+
+    // ====================================================================
+    // Extras (schemaless) fields
+    // ====================================================================
+
+    @Test
+    void extrasFieldWidth() {
+        assertEquals(TaoString.SIZE, LeafField.extras().width());
+        assertEquals(TaoString.SIZE, LeafField.extras("myExtras").width());
+    }
+
+    @Test
+    void extrasDefaultName() {
+        assertEquals("_extras", LeafField.extras().name());
+        assertEquals("myExtras", LeafField.extras("myExtras").name());
+    }
+
+    @Test
+    void multipleExtrasThrows() {
+        assertThrows(IllegalArgumentException.class, () ->
+            LeafLayout.of(LeafField.extras("a"), LeafField.extras("b")));
+    }
+
+    @Test
+    void extrasWriterReaderRoundTrip() throws IOException {
+        var layout = LeafLayout.of(
+            LeafField.int32("count"),
+            LeafField.extras("extras")
+        );
+        var COUNT  = layout.int32("count");
+        var EXTRAS = layout.extras("extras");
+
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
+            byte[] key = {0, 0, 0, 1};
+            try (var w = tree.write()) {
+                long ptr = w.getOrCreate(key);
+                var leaf = w.leaf(ptr, layout);
+                leaf.set(COUNT, 7);
+                leaf.extrasWriter(EXTRAS)
+                    .put("basisOfRecord", "HUMAN_OBSERVATION")
+                    .put("coordinateUncertainty", 50.0)
+                    .put("taxonKey", 12345)
+                    .put("verified", true)
+                    .write();
+            }
+            try (var r = tree.read()) {
+                long ptr = r.lookup(key);
+                var leaf = r.leaf(ptr, layout);
+                assertEquals(7, leaf.get(COUNT));
+
+                var er = leaf.extrasReader(EXTRAS);
+                assertFalse(er.isEmpty());
+                assertEquals("HUMAN_OBSERVATION", er.getString("basisOfRecord"));
+                assertEquals(50.0, er.getDouble("coordinateUncertainty"));
+                assertEquals(12345, er.getInt("taxonKey"));
+                assertEquals(true, er.getBoolean("verified"));
+                assertNull(er.getString("absent"));
+                assertFalse(er.has("absent"));
+                assertTrue(er.has("basisOfRecord"));
+            }
+        }
+    }
+
+    @Test
+    void extrasRawGetSet() throws IOException {
+        var layout = LeafLayout.of(LeafField.extras("e"));
+        var E = layout.extras("e");
+
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
+            byte[] key = {0, 0, 0, 1};
+            String json = "{\"foo\":\"bar\"}";
+            try (var w = tree.write()) {
+                long ptr = w.getOrCreate(key);
+                w.leaf(ptr, layout).set(E, json);
+            }
+            try (var r = tree.read()) {
+                long ptr = r.lookup(key);
+                assertEquals(json, r.leaf(ptr, layout).get(E));
+            }
+        }
+    }
+
+    @Test
+    void extrasEmptyWrite() throws IOException {
+        var layout = LeafLayout.of(LeafField.extras("e"));
+        var E = layout.extras("e");
+
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
+            byte[] key = {0, 0, 0, 1};
+            try (var w = tree.write()) {
+                long ptr = w.getOrCreate(key);
+                var leaf = w.leaf(ptr, layout);
+                var ew = leaf.extrasWriter(E);
+                assertTrue(ew.isEmpty());
+                ew.write(); // writes empty
+            }
+            try (var r = tree.read()) {
+                long ptr = r.lookup(key);
+                var er = r.leaf(ptr, layout).extrasReader(E);
+                assertTrue(er.isEmpty());
+                assertNull(er.getString("any"));
+            }
+        }
+    }
+
+    @Test
+    void extrasNullValuesSkipped() throws IOException {
+        var layout = LeafLayout.of(LeafField.extras("e"));
+        var E = layout.extras("e");
+
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
+            byte[] key = {0, 0, 0, 1};
+            try (var w = tree.write()) {
+                long ptr = w.getOrCreate(key);
+                w.leaf(ptr, layout).extrasWriter(E)
+                    .put("present", "yes")
+                    .put("absent", (String) null)
+                    .write();
+            }
+            try (var r = tree.read()) {
+                long ptr = r.lookup(key);
+                var er = r.leaf(ptr, layout).extrasReader(E);
+                assertEquals("yes", er.getString("present"));
+                assertNull(er.getString("absent"));
+            }
+        }
+    }
+
+    @Test
+    void extrasNanSkipped() throws IOException {
+        var layout = LeafLayout.of(LeafField.extras("e"));
+        var E = layout.extras("e");
+
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
+            byte[] key = {0, 0, 0, 1};
+            try (var w = tree.write()) {
+                long ptr = w.getOrCreate(key);
+                w.leaf(ptr, layout).extrasWriter(E)
+                    .put("real", 1.5)
+                    .put("nan", Double.NaN)
+                    .write();
+            }
+            try (var r = tree.read()) {
+                long ptr = r.lookup(key);
+                var er = r.leaf(ptr, layout).extrasReader(E);
+                assertEquals(1.5, er.getDouble("real"));
+                assertNull(er.getDouble("nan")); // NaN was skipped
+            }
+        }
+    }
+
+    @Test
+    void extrasNullable() throws IOException {
+        var layout = LeafLayout.of(LeafField.extras("e").nullable());
+        var E = layout.extras("e");
+        assertTrue(E.isNullable());
+
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
+            byte[] key = {0, 0, 0, 1};
+            try (var w = tree.write()) {
+                long ptr = w.getOrCreate(key);
+                var leaf = w.leaf(ptr, layout);
+                leaf.extrasWriter(E).put("a", "b").write();
+                assertFalse(leaf.isNull(E));
+                leaf.setNull(E);
+                assertTrue(leaf.isNull(E));
+            }
+        }
+    }
+
+    @Test
+    void extrasLongStringOverflow() throws IOException {
+        var layout = LeafLayout.of(LeafField.extras("e"));
+        var E = layout.extras("e");
+
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
+            byte[] key = {0, 0, 0, 1};
+            String longVal = "X".repeat(200);
+            try (var w = tree.write()) {
+                long ptr = w.getOrCreate(key);
+                w.leaf(ptr, layout).extrasWriter(E)
+                    .put("long", longVal)
+                    .write();
+            }
+            try (var r = tree.read()) {
+                long ptr = r.lookup(key);
+                var er = r.leaf(ptr, layout).extrasReader(E);
+                assertEquals(longVal, er.getString("long"));
+            }
+        }
+    }
+
+    @Test
+    void extrasStringLayoutsIncluded() {
+        var layout = LeafLayout.of(
+            LeafField.int32("count"),
+            LeafField.extras("extras")
+        );
+        assertTrue(layout.hasStringFields());
+        assertEquals(1, layout.stringLayouts().length);
+    }
+
+    @Test
+    void extrasEscapedStrings() throws IOException {
+        var layout = LeafLayout.of(LeafField.extras("e"));
+        var E = layout.extras("e");
+
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), 4, layout.totalWidth())) {
+            byte[] key = {0, 0, 0, 1};
+            try (var w = tree.write()) {
+                long ptr = w.getOrCreate(key);
+                w.leaf(ptr, layout).extrasWriter(E)
+                    .put("quote", "He said \"hello\"")
+                    .put("backslash", "path\\to\\file")
+                    .write();
+            }
+            try (var r = tree.read()) {
+                long ptr = r.lookup(key);
+                var er = r.leaf(ptr, layout).extrasReader(E);
+                assertEquals("He said \"hello\"", er.getString("quote"));
+                assertEquals("path\\to\\file", er.getString("backslash"));
             }
         }
     }

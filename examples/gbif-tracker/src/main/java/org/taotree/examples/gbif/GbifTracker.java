@@ -49,18 +49,18 @@ public class GbifTracker {
 
     static final LeafLayout LEAF_LAYOUT = LeafLayout.of(
         LeafField.int32("count"),
-        LeafField.int32("year"),
-        LeafField.int32("month"),
-        LeafField.int32("day"),
-        LeafField.float64("decimalLatitude"),
-        LeafField.float64("decimalLongitude"),
-        LeafField.float64("elevation"),
-        LeafField.int32("individualCount"),
-        LeafField.int32("taxonKey"),
-        LeafField.int32("speciesKey"),
-        LeafField.string("locality"),
-        LeafField.string("recordedBy"),
-        LeafField.json("extras")
+        LeafField.int32("year").nullable(),
+        LeafField.int32("month").nullable(),
+        LeafField.int32("day").nullable(),
+        LeafField.float64("decimalLatitude").nullable(),
+        LeafField.float64("decimalLongitude").nullable(),
+        LeafField.float64("elevation").nullable(),
+        LeafField.int32("individualCount").nullable(),
+        LeafField.int32("taxonKey").nullable(),
+        LeafField.int32("speciesKey").nullable(),
+        LeafField.string("locality").nullable(),
+        LeafField.string("recordedBy").nullable(),
+        LeafField.extras("extras")
     );
 
     static final LeafHandle.Int32   COUNT     = LEAF_LAYOUT.int32("count");
@@ -75,7 +75,7 @@ public class GbifTracker {
     static final LeafHandle.Int32   SPECIES_K = LEAF_LAYOUT.int32("speciesKey");
     static final LeafHandle.Str     LOCALITY  = LEAF_LAYOUT.string("locality");
     static final LeafHandle.Str     RECORDED  = LEAF_LAYOUT.string("recordedBy");
-    static final LeafHandle.Json    EXTRAS    = LEAF_LAYOUT.json("extras");
+    static final LeafHandle.Extras  EXTRAS    = LEAF_LAYOUT.extras("extras");
 
     // -----------------------------------------------------------------------
     // Reusable key-handle bundle (bound to a specific tree)
@@ -132,18 +132,21 @@ public class GbifTracker {
 
         int existingCount = leaf.get(COUNT);
         if (existingCount == 0) {
-            leaf.set(COUNT, 1)
-                .set(YEAR, year).set(MONTH, month).set(DAY, day)
-                .set(LAT, lat).set(LON, lon).set(ELEV, elev)
-                .set(IND_CNT, safeInt(rows, "individualcount"))
-                .set(TAXON_K, safeInt(rows, "taxonkey"))
-                .set(SPECIES_K, safeInt(rows, "specieskey"));
+            leaf.set(COUNT, 1);
+            setOrNull(leaf, YEAR, year, rows, "year");
+            setOrNull(leaf, MONTH, month, rows, "month");
+            setOrNull(leaf, DAY, day, rows, "day");
+            setOrNullDouble(leaf, LAT, lat, rows, "decimallatitude");
+            setOrNullDouble(leaf, LON, lon, rows, "decimallongitude");
+            setOrNullDouble(leaf, ELEV, elev, rows, "elevation");
+            setOrNull(leaf, IND_CNT, safeInt(rows, "individualcount"), rows, "individualcount");
+            setOrNull(leaf, TAXON_K, safeInt(rows, "taxonkey"), rows, "taxonkey");
+            setOrNull(leaf, SPECIES_K, safeInt(rows, "specieskey"), rows, "specieskey");
             String locality = nullSafe(rows, "locality");
-            if (locality != null) leaf.set(LOCALITY, locality);
+            if (locality != null) leaf.set(LOCALITY, locality); else leaf.setNull(LOCALITY);
             String recordedBy = nullSafe(rows, "recordedby");
-            if (recordedBy != null) leaf.set(RECORDED, recordedBy);
-            String extras = buildExtras(rows);
-            if (extras != null) leaf.set(EXTRAS, extras);
+            if (recordedBy != null) leaf.set(RECORDED, recordedBy); else leaf.setNull(RECORDED);
+            writeExtras(leaf, rows);
             return 1;
         } else {
             int taxon     = safeInt(rows, "taxonkey");
@@ -152,32 +155,64 @@ public class GbifTracker {
             String locality   = nullSafe(rows, "locality");
             String recordedBy = nullSafe(rows, "recordedby");
             leaf.set(COUNT, existingCount + 1);
-            // Fast-path: compare all fields except extras first to avoid building
-            // the extras JSON for the ~98% of updates that lose without reaching
-            // the extras tiebreaker.
             int cmp = compareExceptExtras(year, month, day, lat, lon, taxon, species, ind, locality, recordedBy,
                         leaf.get(YEAR), leaf.get(MONTH), leaf.get(DAY),
-                        leaf.get(LAT), leaf.get(LON),
+                        getD(leaf, LAT), getD(leaf, LON),
                         leaf.get(TAXON_K), leaf.get(SPECIES_K), leaf.get(IND_CNT),
                         leaf.get(LOCALITY), leaf.get(RECORDED));
-            if (cmp < 0) return 0;  // existing wins; skip buildExtras entirely
-            // New obs wins on numeric/string fields, or full tie — need extras now.
-            String extras = buildExtras(rows);
+            if (cmp < 0) return 0;
+            String extras = buildExtrasJson(rows);
             if (cmp > 0 || compareNullable(extras, leaf.get(EXTRAS)) > 0) {
-                leaf.set(YEAR, year).set(MONTH, month).set(DAY, day)
-                    .set(LAT, lat).set(LON, lon).set(ELEV, elev)
-                    .set(IND_CNT, ind)
-                    .set(TAXON_K, taxon)
-                    .set(SPECIES_K, species);
-                // Always write all string fields together so the leaf reflects a single
-                // winning observation; write "" to clear fields the new winner lacks.
-                leaf.set(LOCALITY,  locality   != null ? locality   : "");
-                leaf.set(RECORDED,  recordedBy != null ? recordedBy : "");
-                leaf.set(EXTRAS,    extras     != null ? extras     : "");
+                setOrNull(leaf, YEAR, year, rows, "year");
+                setOrNull(leaf, MONTH, month, rows, "month");
+                setOrNull(leaf, DAY, day, rows, "day");
+                setOrNullDouble(leaf, LAT, lat, rows, "decimallatitude");
+                setOrNullDouble(leaf, LON, lon, rows, "decimallongitude");
+                setOrNullDouble(leaf, ELEV, elev, rows, "elevation");
+                setOrNull(leaf, IND_CNT, ind, rows, "individualcount");
+                setOrNull(leaf, TAXON_K, taxon, rows, "taxonkey");
+                setOrNull(leaf, SPECIES_K, species, rows, "specieskey");
+                if (locality != null) leaf.set(LOCALITY, locality); else leaf.setNull(LOCALITY);
+                if (recordedBy != null) leaf.set(RECORDED, recordedBy); else leaf.setNull(RECORDED);
+                if (extras != null) leaf.set(EXTRAS, extras); else leaf.set(EXTRAS, "");
                 return 1;
             }
             return 0;
         }
+    }
+
+    private static void setOrNull(LeafAccessor leaf, LeafHandle.Int32 h, int value,
+                                  RowReader rows, String parquetField) {
+        if (rows.isNull(parquetField)) leaf.setNull(h);
+        else leaf.set(h, value);
+    }
+
+    private static void setOrNullDouble(LeafAccessor leaf, LeafHandle.Float64 h, double value,
+                                        RowReader rows, String parquetField) {
+        if (rows.isNull(parquetField)) leaf.setNull(h);
+        else leaf.set(h, value);
+    }
+
+    /** Read a nullable double from the tree, mapping null → NaN (matching safeDouble's sentinel). */
+    static double getD(LeafAccessor leaf, LeafHandle.Float64 h) {
+        return leaf.isNull(h) ? Double.NaN : leaf.get(h);
+    }
+
+    private static void writeExtras(LeafAccessor leaf, RowReader rows) {
+        var eb = leaf.extrasWriter(EXTRAS);
+        eb.put("class", nullSafe(rows, "class"));
+        eb.put("order", nullSafe(rows, "order"));
+        eb.put("basisOfRecord", nullSafe(rows, "basisofrecord"));
+        eb.put("license", nullSafe(rows, "license"));
+        eb.put("occurrenceStatus", nullSafe(rows, "occurrencestatus"));
+        eb.put("scientificName", nullSafe(rows, "scientificname"));
+        eb.put("institutionCode", nullSafe(rows, "institutioncode"));
+        eb.put("catalogNumber", nullSafe(rows, "catalognumber"));
+        eb.put("eventDate", nullSafe(rows, "eventdate"));
+        if (!rows.isNull("coordinateuncertaintyinmeters")) {
+            eb.put("coordinateUncertainty", rows.getDouble("coordinateuncertaintyinmeters"));
+        }
+        eb.write();
     }
 
     /**
@@ -441,7 +476,7 @@ public class GbifTracker {
         }
     }
 
-    static String buildExtras(RowReader rows) {
+    static String buildExtrasJson(RowReader rows) {
         var sb = new StringBuilder(64);
         sb.append('{');
         boolean first = true;
