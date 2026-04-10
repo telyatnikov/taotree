@@ -111,7 +111,11 @@ public final class ExtrasReader {
             int end = valStart + 1;
             while (end < raw.length()) {
                 char c = raw.charAt(end);
-                if (c == '\\') { end += 2; continue; }
+                if (c == '\\') {
+                    if (end + 1 >= raw.length()) break; // trailing escape — stop safely
+                    end += 2;
+                    continue;
+                }
                 if (c == '"') { end++; break; }
                 end++;
             }

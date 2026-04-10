@@ -90,6 +90,7 @@ class ConcurrencyTest {
             }
 
             writer.join(30_000);
+            assertFalse(writer.isAlive(), "Writer thread did not finish in time");
             for (var reader : readers) reader.join(30_000);
 
             assertTrue(errors.isEmpty(),
@@ -157,6 +158,7 @@ class ConcurrencyTest {
             }
 
             writer.join(30_000);
+            assertFalse(writer.isAlive(), "Writer thread did not finish in time");
             for (var reader : readers) reader.join(30_000);
 
             assertTrue(errors.isEmpty(),

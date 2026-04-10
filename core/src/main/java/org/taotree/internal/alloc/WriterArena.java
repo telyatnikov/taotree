@@ -207,17 +207,26 @@ public final class WriterArena {
      * byte offset within the page.
      */
     static long encodeArenaPtr(int nodeType, int slabClassId, int page, int offsetInPage) {
-        if (page < 0) {
-            throw new IllegalStateException("Negative page number: " + page);
-        }
-        if (offsetInPage < 0 || offsetInPage >= PAGE_SIZE) {
-            throw new IllegalArgumentException(
-                "offsetInPage out of range: " + offsetInPage + " (pageSize=" + PAGE_SIZE + ")");
-        }
+        if (page < 0) throwNegativePage(page);
+        if ((long) page >= (1L << 36)) throwPageOverflow(page);
+        if (offsetInPage < 0 || offsetInPage >= PAGE_SIZE) throwOffsetRange(offsetInPage);
         int metadata = (nodeType & 0x0F) | NodePtr.ARENA_FLAG;
         int pageHigh = (page >>> PAGE_LOW_BITS) & 0xFFFF;
         int packedOffset = ((page & PAGE_LOW_MASK) << PAGE_SHIFT) | (offsetInPage & PAGE_MASK);
         return NodePtr.packWithMetadata(metadata, slabClassId, pageHigh, packedOffset);
+    }
+
+    private static void throwNegativePage(int page) {
+        throw new IllegalStateException("Negative page number: " + page);
+    }
+
+    private static void throwPageOverflow(int page) {
+        throw new IllegalStateException("Page number " + page + " exceeds 36-bit limit");
+    }
+
+    private static void throwOffsetRange(int offsetInPage) {
+        throw new IllegalArgumentException(
+            "offsetInPage out of range: " + offsetInPage + " (pageSize=" + PAGE_SIZE + ")");
     }
 
     /** Test whether a {@link NodePtr} was allocated by an arena. */

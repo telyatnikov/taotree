@@ -172,9 +172,13 @@ public final class CheckpointV2 {
     /**
      * Validate and read a checkpoint from the given slot segment.
      *
+     * <p>Returns {@code null} if the payloadLength field is out of the valid range
+     * (indicating on-disk corruption), consistent with {@link CommitRecord#read}'s
+     * defensive contract. Other structural errors still throw.
+     *
      * @param slot the memory segment for the slot
-     * @return the parsed checkpoint data
-     * @throws IllegalStateException if header or payload validation fails
+     * @return the parsed checkpoint data, or {@code null} if payloadLength is corrupt
+     * @throws IllegalStateException if a non-corruption structural error is detected
      */
     public static CheckpointData read(MemorySegment slot) {
         if (!RecordHeader.validate(slot, 0)) {
@@ -190,6 +194,15 @@ public final class CheckpointV2 {
 
         int payloadLength = RecordHeader.payloadLength(slot, 0);
         long payloadStart = RecordHeader.HEADER_SIZE;
+
+        // Validate payloadLength is within legal bounds before using it.
+        // Return null on out-of-range (corruption) rather than throwing, consistent
+        // with CommitRecord.read()'s contract. isValid() already checks this, so the
+        // null path is only reachable if read() is called directly on a corrupt slot.
+        int maxPayloadLength = (int) ((long) SLOT_SIZE_PAGES * 4096L - RecordHeader.HEADER_SIZE);
+        if (payloadLength < PAYLOAD_HEADER_SIZE || payloadLength > maxPayloadLength) {
+            return null;
+        }
 
         // Verify payload CRC
         int storedPayloadCrc = RecordHeader.payloadCrc32c(slot, 0);
@@ -257,6 +270,10 @@ public final class CheckpointV2 {
             return false;
         }
         int payloadLength = RecordHeader.payloadLength(slot, 0);
+        int maxPayloadLength = (int) ((long) SLOT_SIZE_PAGES * 4096L - RecordHeader.HEADER_SIZE);
+        if (payloadLength < PAYLOAD_HEADER_SIZE || payloadLength > maxPayloadLength) {
+            return false;
+        }
         long payloadStart = RecordHeader.HEADER_SIZE;
         int storedPayloadCrc = RecordHeader.payloadCrc32c(slot, 0);
         int computedPayloadCrc = RecordHeader.crc32c(slot, payloadStart, payloadLength);
@@ -277,6 +294,8 @@ public final class CheckpointV2 {
         if (validA && validB) {
             long genA = RecordHeader.generation(slotA, 0);
             long genB = RecordHeader.generation(slotB, 0);
+            // Tie-break: if generations are equal, slot A wins (written last on the previous
+            // alternating-slot cycle, so it cannot be stale relative to slot B).
             return Long.compareUnsigned(genA, genB) >= 0 ? read(slotA) : read(slotB);
         } else if (validA) {
             return read(slotA);

@@ -4,6 +4,7 @@ import org.jetbrains.lincheck.datastructures.IntGen;
 import org.jetbrains.lincheck.datastructures.Operation;
 import org.jetbrains.lincheck.datastructures.Param;
 import org.jetbrains.lincheck.datastructures.StressOptions;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
@@ -12,7 +13,9 @@ import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Lincheck linearizability test for core TaoTree operations with raw byte keys.
@@ -32,6 +35,9 @@ public class LincheckTaoTreeTest {
     /** Chunk size must be >= slab size (1 MB default). */
     private static final long CHUNK_SIZE = 1024L * 1024;
 
+    /** All trees and paths created by Lincheck invocations — drained by @AfterEach. */
+    private static final List<Runnable> CLEANUPS = new CopyOnWriteArrayList<>();
+
     private final TaoTree tree;
     private final Path storePath;
 
@@ -41,17 +47,20 @@ public class LincheckTaoTreeTest {
             storePath.toFile().deleteOnExit();
             Files.delete(storePath);
             tree = TaoTree.create(storePath, KEY_LEN, VALUE_SIZE, CHUNK_SIZE, false);
+            CLEANUPS.add(() -> {
+                tree.close();
+                try { Files.deleteIfExists(storePath); } catch (IOException ignored) {}
+            });
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
     }
 
-    /** Eagerly release file resources so RAMDisk doesn't fill up across Lincheck invocations. */
-    @SuppressWarnings("deprecation")
-    @Override
-    protected void finalize() {
-        tree.close();
-        try { Files.deleteIfExists(storePath); } catch (IOException ignored) {}
+    @AfterEach
+    void cleanup() {
+        List<Runnable> toRun = List.copyOf(CLEANUPS);
+        CLEANUPS.clear();
+        toRun.forEach(Runnable::run);
     }
 
     private static byte[] encodeKey(int k) {

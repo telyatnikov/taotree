@@ -169,7 +169,7 @@ public class GbifVerifier {
                             indCnt, taxK, spK, loc, rec, ext));
                     } else {
                         int newCount = existing.count + 1;
-                        if (GbifTracker.isNewer(year, month, day, lat, lon, taxK, spK, indCnt,
+                        if (isNewer(year, month, day, lat, lon, taxK, spK, indCnt,
                                 loc, rec, ext,
                                 existing.year, existing.month, existing.day,
                                 existing.lat, existing.lon,
@@ -435,5 +435,39 @@ public class GbifVerifier {
             errors.add(f + ": exp=[" + e + "] act=[" + a + "] | " + key);
         }
         return 1;
+    }
+
+    /**
+     * Independent duplicate of the "is newer" comparison — does NOT delegate to
+     * {@link GbifTracker#isNewer} so that bugs in GbifTracker are detectable.
+     */
+    private static boolean isNewer(int y, int m, int d, double lat, double lon,
+                                   int taxon, int species, int ind,
+                                   String loc, String rec, String ext,
+                                   int ey, int em, int ed, double elat, double elon,
+                                   int etaxon, int especies, int eind,
+                                   String eloc, String erec, String eext) {
+        if (y != ey) return y > ey;
+        if (m != em) return m > em;
+        if (d != ed) return d > ed;
+        int c = Double.compare(lat, elat);
+        if (c != 0) return c > 0;
+        c = Double.compare(lon, elon);
+        if (c != 0) return c > 0;
+        if (taxon != etaxon) return taxon > etaxon;
+        if (species != especies) return species > especies;
+        if (ind != eind) return ind > eind;
+        c = compareNullable(loc, eloc);
+        if (c != 0) return c > 0;
+        c = compareNullable(rec, erec);
+        if (c != 0) return c > 0;
+        return compareNullable(ext, eext) > 0;
+    }
+
+    private static int compareNullable(String a, String b) {
+        if (a == null && b == null) return 0;
+        if (a == null) return -1;
+        if (b == null) return 1;
+        return a.compareTo(b);
     }
 }

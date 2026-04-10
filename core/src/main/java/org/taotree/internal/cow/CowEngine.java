@@ -198,10 +198,16 @@ public final class CowEngine {
         void reset() { depth = 0; }
 
         void push(long nodePtr, byte keyByte, int nodeType) {
+            if (depth >= MAX_DEPTH) throwOverflow(depth);
             nodePtrs[depth] = nodePtr;
             keyBytes[depth] = keyByte;
             nodeTypes[depth] = nodeType;
             depth++;
+        }
+
+        /** Cold-path helper — extracted so {@link #push} stays small for JIT inlining. */
+        private static void throwOverflow(int depth) {
+            throw new IllegalStateException("PathStack overflow at depth " + depth);
         }
     }
 }

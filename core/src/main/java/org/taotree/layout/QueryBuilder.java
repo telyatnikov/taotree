@@ -70,10 +70,14 @@ public final class QueryBuilder {
             TaoKey.encodeU16(buf, h.offset(), (short) 0);
             fieldResolved[fi] = true;
         } else {
+            if (h.dict() == null) throwDictNotBound(h.name());
             int code = h.dict().resolve(value);
             fieldResolved[fi] = (code >= 0);
             if (code > 0) {
                 TaoKey.encodeU16(buf, h.offset(), (short) code);
+            } else {
+                // Zero the slot so buffer bytes are defined even when unresolved.
+                TaoKey.encodeU16(buf, h.offset(), (short) 0);
             }
         }
         return this;
@@ -87,10 +91,14 @@ public final class QueryBuilder {
             TaoKey.encodeU32(buf, h.offset(), 0);
             fieldResolved[fi] = true;
         } else {
+            if (h.dict() == null) throwDictNotBound(h.name());
             int code = h.dict().resolve(value);
             fieldResolved[fi] = (code >= 0);
             if (code > 0) {
                 TaoKey.encodeU32(buf, h.offset(), code);
+            } else {
+                // Zero the slot so buffer bytes are defined even when unresolved.
+                TaoKey.encodeU32(buf, h.offset(), 0);
             }
         }
         return this;
@@ -169,5 +177,12 @@ public final class QueryBuilder {
         java.util.Arrays.fill(fieldSet, false);
         java.util.Arrays.fill(fieldResolved, false);
         return this;
+    }
+
+    /** Cold-path helper — extracted so dict-field setters stay small for JIT inlining. */
+    private static void throwDictNotBound(String name) {
+        throw new IllegalStateException(
+            "Dictionary not bound for field '" + name
+            + "' — call TaoTree.create() to bind dictionaries");
     }
 }

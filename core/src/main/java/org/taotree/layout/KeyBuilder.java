@@ -76,11 +76,13 @@ public final class KeyBuilder {
         KeyField field = layout.field(fieldIndex);
         return switch (field) {
             case KeyField.DictU16 d -> {
+                if (d.dict() == null) throwDictNotBound(field.name());
                 int code = (value != null) ? d.dict().intern(value) : 0;
                 TaoKey.encodeU16(buf, layout.offset(fieldIndex), (short) code);
                 yield this;
             }
             case KeyField.DictU32 d -> {
+                if (d.dict() == null) throwDictNotBound(field.name());
                 int code = (value != null) ? d.dict().intern(value) : 0;
                 TaoKey.encodeU32(buf, layout.offset(fieldIndex), code);
                 yield this;
@@ -156,6 +158,7 @@ public final class KeyBuilder {
 
     /** Set a dict16 field via a pre-computed handle. Interns the string automatically. */
     public KeyBuilder set(KeyHandle.Dict16 h, String value) {
+        if (h.dict() == null) throwDictNotBound(h.name());
         int code = (value != null) ? h.dict().intern(value) : 0;
         TaoKey.encodeU16(buf, h.offset(), (short) code);
         return this;
@@ -163,6 +166,7 @@ public final class KeyBuilder {
 
     /** Set a dict32 field via a pre-computed handle. Interns the string automatically. */
     public KeyBuilder set(KeyHandle.Dict32 h, String value) {
+        if (h.dict() == null) throwDictNotBound(h.name());
         int code = (value != null) ? h.dict().intern(value) : 0;
         TaoKey.encodeU32(buf, h.offset(), code);
         return this;
@@ -173,4 +177,11 @@ public final class KeyBuilder {
 
     /** The key length in bytes. */
     public int keyLen() { return layout.totalWidth(); }
+
+    /** Cold-path helper — extracted so dict-field setters stay small for JIT inlining. */
+    private static void throwDictNotBound(String name) {
+        throw new IllegalStateException(
+            "Dictionary not bound for field '" + name
+            + "' — call TaoTree.create() to bind dictionaries");
+    }
 }

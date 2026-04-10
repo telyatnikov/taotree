@@ -4,6 +4,7 @@ import org.jetbrains.lincheck.datastructures.IntGen;
 import org.jetbrains.lincheck.datastructures.Operation;
 import org.jetbrains.lincheck.datastructures.Param;
 import org.jetbrains.lincheck.datastructures.StressOptions;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
@@ -12,7 +13,9 @@ import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import org.taotree.layout.KeyBuilder;
 import org.taotree.layout.KeyField;
 import org.taotree.layout.KeyLayout;
@@ -33,6 +36,9 @@ public class LincheckDictTreeTest {
     private static final String[] CATEGORIES = {null, "Alpha", "Beta", "Gamma"};
     private static final long CHUNK_SIZE = 1024L * 1024;
 
+    /** All trees and paths created by Lincheck invocations — drained by @AfterEach. */
+    private static final List<Runnable> CLEANUPS = new CopyOnWriteArrayList<>();
+
     private final TaoTree tree;
     private final Path storePath;
     private final KeyLayout keyLayout;
@@ -46,6 +52,11 @@ public class LincheckDictTreeTest {
             storePath.toFile().deleteOnExit();
             Files.delete(storePath);
             tree = TaoTree.create(storePath, 6, leafLayout.totalWidth(), CHUNK_SIZE, false);
+            // Register cleanup immediately after create so dict/layout setup failures don't leak.
+            CLEANUPS.add(() -> {
+                tree.close();
+                try { Files.deleteIfExists(storePath); } catch (IOException ignored) {}
+            });
 
             var dict = TaoDictionary.u16(tree);
             keyLayout = KeyLayout.of(
@@ -57,12 +68,11 @@ public class LincheckDictTreeTest {
         }
     }
 
-    /** Eagerly release file resources so RAMDisk doesn't fill up across Lincheck invocations. */
-    @SuppressWarnings("deprecation")
-    @Override
-    protected void finalize() {
-        tree.close();
-        try { Files.deleteIfExists(storePath); } catch (IOException ignored) {}
+    @AfterEach
+    void cleanup() {
+        List<Runnable> toRun = List.copyOf(CLEANUPS);
+        CLEANUPS.clear();
+        toRun.forEach(Runnable::run);
     }
 
     private long compositeValue(int cat, int id) {

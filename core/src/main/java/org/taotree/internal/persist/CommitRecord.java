@@ -158,6 +158,10 @@ public final class CommitRecord {
 
         // Verify payload CRC
         int payloadLen = RecordHeader.payloadLength(page, 0);
+        // Validate payloadLength before use to catch corruption early.
+        if (payloadLen < FIXED_PAYLOAD_SIZE || payloadLen > MAX_PAYLOAD_SIZE) {
+            return null;
+        }
         int storedPayloadCrc = RecordHeader.payloadCrc32c(page, 0);
         int computedPayloadCrc = RecordHeader.crc32c(page, RecordHeader.HEADER_SIZE, payloadLen);
         if (storedPayloadCrc != computedPayloadCrc) {
@@ -178,6 +182,12 @@ public final class CommitRecord {
         data.arenaEndPage = page.get(ValueLayout.JAVA_INT_UNALIGNED, pOff + OFF_ARENA_END_PAGE);
 
         int dictCount = data.dictionaryCount;
+        // Validate dictionaryCount against the declared payloadLength to prevent
+        // large array allocations or out-of-bounds reads on corrupted records.
+        int expectedPayloadLen = FIXED_PAYLOAD_SIZE + dictCount * DICT_ENTRY_SIZE;
+        if (dictCount < 0 || expectedPayloadLen > payloadLen) {
+            return null;
+        }
         data.dictRoots = new long[dictCount];
         data.dictNextCodes = new long[dictCount];
         data.dictSizes = new long[dictCount];

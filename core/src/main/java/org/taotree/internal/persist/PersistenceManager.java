@@ -80,6 +80,11 @@ public final class PersistenceManager {
      * {@code primarySize}, dictionary state). This method fills in the
      * persistence fields (generation, prevCommitPage, arena pages) and
      * writes the record.
+     *
+     * <p><b>Durability contract:</b> The caller MUST call
+     * {@code chunkStore.syncDirty()} before returning to the user to
+     * guarantee that the commit record and all modified data pages are
+     * flushed to stable storage.
      */
     public void writeCommitRecord(CommitRecord.CommitData commitData) {
         if (nextCommitPage < 0) return;

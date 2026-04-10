@@ -6,6 +6,9 @@ import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.lang.invoke.VarHandle;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 import org.taotree.internal.art.NodePtr;
 import org.taotree.internal.persist.Superblock;
 
@@ -22,9 +25,11 @@ import org.taotree.internal.persist.Superblock;
  * <p>Slabs and bitmasks are allocated as pages from a {@link ChunkStore}.
  * Writes are immediately visible in the mapped file.
  *
- * <p><b>Thread safety:</b> not thread-safe on its own. Must be accessed under the
- * owning tree's {@code ReentrantReadWriteLock}. All trees and dictionaries sharing
- * the same slab allocator share the same lock.
+ * <p><b>Thread safety:</b> {@link #allocate} and {@link #free} are lock-free,
+ * using {@link VarHandle#compareAndExchange} on off-heap bitmask words. Multiple
+ * threads can allocate and free segments from the same slab class concurrently
+ * without any lock acquisition. Only the rare slab-growth path serializes via a
+ * per-class {@link ReentrantLock}. {@link #resolve} methods are lock-free.
  */
 public final class SlabAllocator implements AutoCloseable {
 
@@ -34,6 +39,9 @@ public final class SlabAllocator implements AutoCloseable {
     private static final int MAX_SLAB_CLASSES = 256;  // 8-bit slabClassId
     private static final int MAX_SLABS_PER_CLASS = 65536;  // 16-bit slabId
     private static final int INITIAL_SLABS_CAPACITY = 4;
+
+    /** VarHandle for atomic CAS on bitmask longs in off-heap MemorySegment. */
+    private static final VarHandle VH_LONG = ValueLayout.JAVA_LONG.varHandle();
 
     private final ChunkStore chunkStore;
     private final int slabSize;
@@ -81,36 +89,36 @@ public final class SlabAllocator implements AutoCloseable {
     /**
      * Allocate a segment from the given slab class, stamping it as a {@link NodePtr#LEAF}.
      *
-     * <p>Thread-safe: synchronized to support concurrent COW writers.
+     * <p>Thread-safe: lock-free CAS on bitmask words.
      *
      * @param slabClassId the slab class ID (from {@link #registerClass})
      * @return a {@link NodePtr}-encoded pointer to the allocated segment
      */
-    public synchronized long allocate(int slabClassId) {
-        return allocate(slabClassId, NodePtr.LEAF);
+    public long allocate(int slabClassId) {
+        return classes[slabClassId].allocate(NodePtr.LEAF);
     }
 
     /**
      * Allocate a segment from the given slab class with a specific node type tag.
      *
-     * <p>Thread-safe: synchronized to support concurrent COW writers.
+     * <p>Thread-safe: lock-free CAS on bitmask words.
      *
      * @param slabClassId the slab class ID (from {@link #registerClass})
      * @param nodeType    the {@link NodePtr} node type tag to stamp in the pointer
      * @return a {@link NodePtr}-encoded pointer to the allocated segment
      */
-    public synchronized long allocate(int slabClassId, int nodeType) {
+    public long allocate(int slabClassId, int nodeType) {
         return classes[slabClassId].allocate(nodeType);
     }
 
     /**
      * Free a previously allocated segment.
      *
-     * <p>Thread-safe: synchronized to support concurrent epoch reclamation.
+     * <p>Thread-safe: lock-free CAS on bitmask words.
      *
      * @param ptr the {@link NodePtr}-encoded pointer returned by {@link #allocate}
      */
-    public synchronized void free(long ptr) {
+    public void free(long ptr) {
         int classId = NodePtr.slabClassId(ptr);
         classes[classId].free(ptr);
     }
@@ -168,7 +176,7 @@ public final class SlabAllocator implements AutoCloseable {
     public long totalSegmentsInUse() {
         long total = 0;
         for (int i = 0; i < classCount; i++) {
-            total += classes[i].segmentsInUse;
+            total += classes[i].segmentsInUse.get();
         }
         return total;
     }
@@ -191,7 +199,7 @@ public final class SlabAllocator implements AutoCloseable {
         var desc = new Superblock.SlabClassDescriptor();
         desc.segmentSize = cls.segmentSize;
         desc.slabCount = cls.slabCount;
-        desc.segmentsInUse = cls.segmentsInUse;
+        desc.segmentsInUse = cls.segmentsInUse.get();
         desc.dataStartPages = new int[cls.slabCount];
         desc.bitmaskStartPages = new int[cls.slabCount];
         desc.bitmaskPageCounts = new int[cls.slabCount];
@@ -233,12 +241,12 @@ public final class SlabAllocator implements AutoCloseable {
             cls.bitmaskSegs[s] = chunkStore.resolve(desc.bitmaskStartPages[s], desc.bitmaskPageCounts[s]);
         }
         cls.slabCount = desc.slabCount;
-        cls.segmentsInUse = desc.segmentsInUse;
+        cls.segmentsInUse.set(desc.segmentsInUse);
 
         return id;
     }
 
-    // ---- Inner: per-class state ----
+    // ---- Inner: per-class state (lock-free allocation via CAS on bitmask) ----
 
     private final class SlabClass {
         final int id;
@@ -246,17 +254,24 @@ public final class SlabAllocator implements AutoCloseable {
         final int segmentsPerSlab;   // how many segments fit in one slab
         final int bitmaskLongs;      // number of longs in the bitmask per slab
 
-        MemorySegment[] slabs;       // the slab data buffers
-        MemorySegment[] bitmaskSegs; // occupancy bitmask as MemorySegment (1=free, 0=in-use)
-        int slabCount;
-        int segmentsInUse;
+        // Volatile for visibility: scanners read slabCount first (acquire),
+        // which synchronizes with the growth path's volatile write (release),
+        // ensuring populated array entries are visible.
+        volatile MemorySegment[] slabs;
+        volatile MemorySegment[] bitmaskSegs;
+        volatile int slabCount;
+        final AtomicInteger segmentsInUse = new AtomicInteger();
 
-        // File-backed: page locations for each slab
+        // Slab growth serialization (only held during rare growth operations)
+        private final ReentrantLock growLock = new ReentrantLock();
+
+        // Persistence metadata (only accessed during sync/compact under write lock)
         int[] dataStartPages;
         int[] bitmaskStartPages;
         int[] bitmaskPageCounts;
 
-        // Allocation hint: (slabIndex, bitmask word index) to start scanning from
+        // Best-effort allocation hints (benign races — stale hint just means
+        // a few extra words scanned, no correctness impact)
         int hintSlab;
         int hintWord;
 
@@ -272,47 +287,63 @@ public final class SlabAllocator implements AutoCloseable {
             this.slabs = new MemorySegment[INITIAL_SLABS_CAPACITY];
             this.bitmaskSegs = new MemorySegment[INITIAL_SLABS_CAPACITY];
             this.slabCount = 0;
-            this.segmentsInUse = 0;
 
             this.dataStartPages = new int[INITIAL_SLABS_CAPACITY];
             this.bitmaskStartPages = new int[INITIAL_SLABS_CAPACITY];
             this.bitmaskPageCounts = new int[INITIAL_SLABS_CAPACITY];
         }
 
+        /**
+         * Lock-free allocation. Scans bitmask words from the hint position,
+         * atomically claiming a free bit via CAS. Falls back to growLock only
+         * when all existing slabs are full.
+         */
         long allocate(int nodeType) {
-            // Try to find a free segment starting from the hint
-            for (int s = hintSlab; s < slabCount; s++) {
-                int wordStart = (s == hintSlab) ? hintWord : 0;
-                int idx = findFreeInSlab(s, wordStart);
-                if (idx >= 0) {
-                    return markAllocated(s, idx, nodeType);
-                }
+            // Phase 1: CAS-based scan of existing slabs
+            long ptr = scanAndCas(nodeType);
+            if (ptr != 0) return ptr;
+
+            // Phase 2: grow under lock, then CAS from new slab
+            growLock.lock();
+            try {
+                // Re-scan: another grower may have added capacity
+                ptr = scanAndCas(nodeType);
+                if (ptr != 0) return ptr;
+
+                // Grow and allocate from the fresh slab
+                int newSlabId = growSlabImpl();
+                ptr = casInSlab(newSlabId, 0, nodeType);
+                if (ptr != 0) return ptr;
+
+                // Should not happen — fresh slab is completely free
+                throw new IllegalStateException(
+                    "Failed to allocate from fresh slab (class " + id + ")");
+            } finally {
+                growLock.unlock();
             }
-            // Wrap around: check slabs before the hint
-            for (int s = 0; s < hintSlab && s < slabCount; s++) {
-                int idx = findFreeInSlab(s, 0);
-                if (idx >= 0) {
-                    return markAllocated(s, idx, nodeType);
-                }
-            }
-            // No free segment found — grow
-            int newSlabId = growSlab();
-            int idx = findFreeInSlab(newSlabId, 0);
-            return markAllocated(newSlabId, idx, nodeType);
         }
 
+        /**
+         * Lock-free free. Atomically sets the free bit in the bitmask via CAS.
+         */
         void free(long ptr) {
             int slabId = NodePtr.slabId(ptr);
             int offset = NodePtr.offset(ptr);
             int segIdx = offset / segmentSize;
             int word = segIdx >>> 6;
             int bit = segIdx & 63;
-            // Mark free in bitmask
+
             MemorySegment bm = bitmaskSegs[slabId];
-            long val = bm.get(ValueLayout.JAVA_LONG, (long) word * 8);
-            bm.set(ValueLayout.JAVA_LONG, (long) word * 8, val | (1L << bit));
-            segmentsInUse--;
-            // Move hint back to this position for locality
+            long byteOff = (long) word * 8;
+            long mask = 1L << bit;
+
+            // Atomic set-bit via CAS loop
+            long prev;
+            do {
+                prev = (long) VH_LONG.getVolatile(bm, byteOff);
+            } while ((long) VH_LONG.compareAndExchange(bm, byteOff, prev, prev | mask) != prev);
+
+            segmentsInUse.decrementAndGet();
             hintSlab = slabId;
             hintWord = word;
         }
@@ -334,96 +365,147 @@ public final class SlabAllocator implements AutoCloseable {
         }
 
         /**
-         * Scan bitmask for a free bit in the given slab, starting from wordStart.
-         * Returns the segment index, or -1 if none found.
+         * CAS-based scan across all slabs starting from the hint.
+         * Returns 0 if no free segment found.
          */
-        private int findFreeInSlab(int slabId, int wordStart) {
-            MemorySegment bm = bitmaskSegs[slabId];
+        private long scanAndCas(int nodeType) {
+            int sc = slabCount; // volatile read — acquire fence
+            if (sc == 0) return 0;
+
+            int hs = hintSlab;
+            if (hs >= sc) hs = 0;
+            int hw = hintWord;
+
+            // Scan from hint forward
+            for (int s = hs; s < sc; s++) {
+                long ptr = casInSlab(s, (s == hs) ? hw : 0, nodeType);
+                if (ptr != 0) return ptr;
+            }
+            // Wrap around: check slabs before the hint
+            for (int s = 0; s < hs; s++) {
+                long ptr = casInSlab(s, 0, nodeType);
+                if (ptr != 0) return ptr;
+            }
+            return 0;
+        }
+
+        /**
+         * CAS-based allocation within a single slab. Scans bitmask words for a
+         * free bit (non-zero word) and atomically claims it via compareAndExchange.
+         *
+         * <p>On CAS failure (another thread claimed the same bit), retries with the
+         * witness value — no re-read needed, and the loop naturally finds the next
+         * free bit in the same word.
+         *
+         * @return a NodePtr-encoded pointer, or 0 if no free segment in this slab
+         */
+        private long casInSlab(int slabId, int wordStart, int nodeType) {
+            MemorySegment bm = bitmaskSegs[slabId]; // volatile read of reference
             for (int w = wordStart; w < bitmaskLongs; w++) {
-                long val = bm.get(ValueLayout.JAVA_LONG, (long) w * 8);
-                if (val != 0L) {
+                long byteOff = (long) w * 8;
+                long val = (long) VH_LONG.getVolatile(bm, byteOff);
+                while (val != 0L) {
                     int bit = Long.numberOfTrailingZeros(val);
                     int segIdx = (w << 6) | bit;
-                    if (segIdx < segmentsPerSlab) {
-                        return segIdx;
+                    if (segIdx >= segmentsPerSlab) break;
+
+                    long newVal = val & ~(1L << bit);
+                    long witness = (long) VH_LONG.compareAndExchange(bm, byteOff, val, newVal);
+                    if (witness == val) {
+                        // CAS succeeded — segment allocated
+                        segmentsInUse.incrementAndGet();
+                        hintSlab = slabId;
+                        hintWord = w;
+                        return NodePtr.pack(nodeType, id, slabId, segIdx * segmentSize);
                     }
+                    // CAS failed — retry with witness as the new current value
+                    val = witness;
                 }
             }
-            return -1;
+            return 0;
         }
 
-        private long markAllocated(int slabId, int segIdx, int nodeType) {
-            int word = segIdx >>> 6;
-            int bit = segIdx & 63;
-            // Clear bit in bitmask (in-use)
-            MemorySegment bm = bitmaskSegs[slabId];
-            long val = bm.get(ValueLayout.JAVA_LONG, (long) word * 8);
-            bm.set(ValueLayout.JAVA_LONG, (long) word * 8, val & ~(1L << bit));
-            segmentsInUse++;
-            // Advance hint
-            hintSlab = slabId;
-            hintWord = word;
-            int offset = segIdx * segmentSize;
-            return NodePtr.pack(nodeType, id, slabId, offset);
-        }
-
-        private int growSlab() {
-            if (slabCount >= MAX_SLABS_PER_CLASS) {
+        /**
+         * Grow this slab class by one slab. Called under {@link #growLock}.
+         * Publishes new arrays (volatile write) BEFORE incrementing slabCount
+         * (volatile write) to ensure scanners see populated entries.
+         */
+        private int growSlabImpl() {
+            int newId = slabCount; // volatile read (we're under growLock, but be explicit)
+            if (newId >= MAX_SLABS_PER_CLASS) {
                 throw new OutOfMemoryError(
                     "Slab class " + id + " exhausted (" + MAX_SLABS_PER_CLASS + " slabs)");
             }
-            // Grow arrays if needed
-            if (slabCount >= slabs.length) {
-                int newCap = Math.min(slabs.length * 2, MAX_SLABS_PER_CLASS);
-                MemorySegment[] newSlabs = new MemorySegment[newCap];
-                System.arraycopy(slabs, 0, newSlabs, 0, slabCount);
-                slabs = newSlabs;
-                MemorySegment[] newBm = new MemorySegment[newCap];
-                System.arraycopy(bitmaskSegs, 0, newBm, 0, slabCount);
-                bitmaskSegs = newBm;
-                int[] newDsp = new int[newCap];
-                System.arraycopy(dataStartPages, 0, newDsp, 0, slabCount);
-                dataStartPages = newDsp;
-                int[] newBsp = new int[newCap];
-                System.arraycopy(bitmaskStartPages, 0, newBsp, 0, slabCount);
-                bitmaskStartPages = newBsp;
-                int[] newBpc = new int[newCap];
-                System.arraycopy(bitmaskPageCounts, 0, newBpc, 0, slabCount);
-                bitmaskPageCounts = newBpc;
-            }
 
-            int newId = slabCount;
             int bitmaskBytes = bitmaskLongs * 8;
+            int slabPages = slabSize / ChunkStore.PAGE_SIZE;
+            int bmPages = (bitmaskBytes + ChunkStore.PAGE_SIZE - 1) / ChunkStore.PAGE_SIZE;
 
             // Allocate pages from ChunkStore
+            int dataPage, bmPage;
+            MemorySegment dataSeg, bmSeg;
             try {
-                int slabPages = slabSize / ChunkStore.PAGE_SIZE;
-                int bmPages = (bitmaskBytes + ChunkStore.PAGE_SIZE - 1) / ChunkStore.PAGE_SIZE;
-
-                int dataPage = chunkStore.allocPages(slabPages);
-                int bmPage = chunkStore.allocPages(bmPages);
-
-                slabs[newId] = chunkStore.resolve(dataPage, slabPages);
-                bitmaskSegs[newId] = chunkStore.resolve(bmPage, bmPages);
-                dataStartPages[newId] = dataPage;
-                bitmaskStartPages[newId] = bmPage;
-                bitmaskPageCounts[newId] = bmPages;
+                dataPage = chunkStore.allocPages(slabPages);
+                bmPage = chunkStore.allocPages(bmPages);
+                dataSeg = chunkStore.resolve(dataPage, slabPages);
+                bmSeg = chunkStore.resolve(bmPage, bmPages);
             } catch (IOException e) {
                 throw new UncheckedIOException("Failed to grow slab class " + id, e);
             }
 
             // Initialize bitmask: all bits set = all free
-            MemorySegment bm = bitmaskSegs[newId];
             for (int w = 0; w < bitmaskLongs; w++) {
-                bm.set(ValueLayout.JAVA_LONG, (long) w * 8, -1L);  // all bits set
+                bmSeg.set(ValueLayout.JAVA_LONG, (long) w * 8, -1L);
             }
             // Mask off bits beyond segmentsPerSlab in the last word
             int remainder = segmentsPerSlab & 63;
             if (remainder != 0) {
-                bm.set(ValueLayout.JAVA_LONG, (long) (bitmaskLongs - 1) * 8, (1L << remainder) - 1);
+                bmSeg.set(ValueLayout.JAVA_LONG, (long) (bitmaskLongs - 1) * 8, (1L << remainder) - 1);
             }
 
-            slabCount++;
+            // Grow arrays if needed, then populate and publish
+            if (newId >= slabs.length) {
+                int newCap = Math.min(slabs.length * 2, MAX_SLABS_PER_CLASS);
+
+                MemorySegment[] newSlabs = new MemorySegment[newCap];
+                System.arraycopy(slabs, 0, newSlabs, 0, newId);
+                newSlabs[newId] = dataSeg;
+
+                MemorySegment[] newBm = new MemorySegment[newCap];
+                System.arraycopy(bitmaskSegs, 0, newBm, 0, newId);
+                newBm[newId] = bmSeg;
+
+                int[] newDsp = new int[newCap];
+                System.arraycopy(dataStartPages, 0, newDsp, 0, newId);
+                newDsp[newId] = dataPage;
+                dataStartPages = newDsp;
+
+                int[] newBsp = new int[newCap];
+                System.arraycopy(bitmaskStartPages, 0, newBsp, 0, newId);
+                newBsp[newId] = bmPage;
+                bitmaskStartPages = newBsp;
+
+                int[] newBpc = new int[newCap];
+                System.arraycopy(bitmaskPageCounts, 0, newBpc, 0, newId);
+                newBpc[newId] = bmPages;
+                bitmaskPageCounts = newBpc;
+
+                // Volatile publish arrays BEFORE slabCount
+                slabs = newSlabs;
+                bitmaskSegs = newBm;
+            } else {
+                // Arrays large enough — populate directly
+                slabs[newId] = dataSeg;
+                bitmaskSegs[newId] = bmSeg;
+                dataStartPages[newId] = dataPage;
+                bitmaskStartPages[newId] = bmPage;
+                bitmaskPageCounts[newId] = bmPages;
+            }
+
+            // Volatile publish count LAST — scanners reading this see all prior stores
+            slabCount = newId + 1;
+            hintSlab = newId;
+            hintWord = 0;
             return newId;
         }
     }

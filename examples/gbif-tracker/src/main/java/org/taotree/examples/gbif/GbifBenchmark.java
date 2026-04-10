@@ -315,6 +315,7 @@ public class GbifBenchmark {
         }
 
         latch.await();
+        tree.sync();
         if (errors.sum() > 0) throw new RuntimeException(errors.sum() + " writer(s) failed");
     }
 

@@ -4,6 +4,7 @@ import org.jetbrains.lincheck.datastructures.IntGen;
 import org.jetbrains.lincheck.datastructures.Operation;
 import org.jetbrains.lincheck.datastructures.Param;
 import org.jetbrains.lincheck.datastructures.StressOptions;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
@@ -11,6 +12,8 @@ import java.io.UncheckedIOException;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import org.taotree.internal.alloc.BumpAllocator;
 import org.taotree.internal.alloc.ChunkStore;
 import org.taotree.internal.alloc.SlabAllocator;
@@ -35,6 +38,9 @@ public class LincheckMappedTreeTest {
     /** Chunk size must be ≥ slab size (1 MB default). No preallocation keeps disk usage low. */
     private static final long CHUNK_SIZE = 1024L * 1024;
 
+    /** All trees and paths created by Lincheck invocations — drained by @AfterEach. */
+    private static final List<Runnable> CLEANUPS = new CopyOnWriteArrayList<>();
+
     private final TaoTree tree;
 
     public LincheckMappedTreeTest() {
@@ -43,9 +49,20 @@ public class LincheckMappedTreeTest {
             tmp.toFile().deleteOnExit();
             Files.delete(tmp); // TaoTree.create requires non-existent path
             tree = TaoTree.create(tmp, KEY_LEN, VALUE_SIZE, CHUNK_SIZE, false);
+            CLEANUPS.add(() -> {
+                tree.close();
+                try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
+            });
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    @AfterEach
+    void cleanup() {
+        List<Runnable> toRun = List.copyOf(CLEANUPS);
+        CLEANUPS.clear();
+        toRun.forEach(Runnable::run);
     }
 
     private static byte[] encodeKey(int k) {

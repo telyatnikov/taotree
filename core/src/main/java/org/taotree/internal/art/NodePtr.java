@@ -41,6 +41,9 @@ public final class NodePtr {
      * Metadata flag marking arena-allocated nodes ({@link org.taotree.internal.alloc.WriterArena}).
      * When set, the slabId and offset fields encode a ChunkStore page number + byte offset
      * instead of a slab index + slab-relative offset.
+     *
+     * <p><b>Reserved bits contract:</b> Bits 4-6 of the metadata byte MUST always be zero.
+     * They are reserved for future use. Any pointer with non-zero reserved bits is malformed.
      */
     public static final int ARENA_FLAG = 0x80;
 

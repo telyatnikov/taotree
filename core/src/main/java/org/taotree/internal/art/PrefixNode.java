@@ -40,6 +40,7 @@ public final class PrefixNode {
      * @param child  the child pointer
      */
     public static void init(MemorySegment seg, byte[] key, int offset, int length, long child) {
+        if (length > NodeConstants.PREFIX_CAPACITY) throwPrefixTooLong(length);
         seg.set(ValueLayout.JAVA_BYTE, OFF_COUNT, (byte) length);
         for (int i = 0; i < length; i++) {
             seg.set(ValueLayout.JAVA_BYTE, OFF_KEYS + i, key[offset + i]);
@@ -51,11 +52,18 @@ public final class PrefixNode {
      * Initialize from a MemorySegment key source.
      */
     public static void init(MemorySegment seg, MemorySegment key, int offset, int length, long child) {
+        if (length > NodeConstants.PREFIX_CAPACITY) throwPrefixTooLong(length);
         seg.set(ValueLayout.JAVA_BYTE, OFF_COUNT, (byte) length);
         for (int i = 0; i < length; i++) {
             seg.set(ValueLayout.JAVA_BYTE, OFF_KEYS + i, key.get(ValueLayout.JAVA_BYTE, offset + i));
         }
         seg.set(ValueLayout.JAVA_LONG, OFF_CHILD, child);
+    }
+
+    /** Cold-path helper — extracted so both {@code init} overloads stay small for JIT inlining. */
+    private static void throwPrefixTooLong(int length) {
+        throw new IllegalArgumentException(
+            "Prefix length " + length + " > " + NodeConstants.PREFIX_CAPACITY);
     }
 
     /** Get the number of prefix bytes. */

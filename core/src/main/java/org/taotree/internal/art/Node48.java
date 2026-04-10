@@ -29,6 +29,8 @@ public final class Node48 {
 
     public static final int CAPACITY = NodeConstants.NODE48_CAPACITY; // 48
     public static final byte EMPTY_MARKER = 48; // impossible slot index (valid: 0-47)
+    /** Cached {@code Byte.toUnsignedInt(EMPTY_MARKER)} to avoid repeated boxing in comparisons. */
+    private static final int EMPTY_SLOT_IDX = Byte.toUnsignedInt(EMPTY_MARKER);
 
     public static void init(MemorySegment seg) {
         seg.set(ValueLayout.JAVA_BYTE, OFF_COUNT, (byte) 0);
@@ -57,7 +59,7 @@ public final class Node48 {
     public static long findChild(MemorySegment seg, long baseOffset, byte key) {
         int idx = Byte.toUnsignedInt(seg.get(ValueLayout.JAVA_BYTE,
                 baseOffset + OFF_CHILD_IDX + Byte.toUnsignedInt(key)));
-        if (idx == Byte.toUnsignedInt(EMPTY_MARKER)) {
+        if (idx == EMPTY_SLOT_IDX) {
             return NodePtr.EMPTY_PTR;
         }
         return seg.get(ValueLayout.JAVA_LONG, baseOffset + OFF_CHILDREN + (long) idx * 8);
@@ -101,7 +103,7 @@ public final class Node48 {
     public static boolean removeChild(MemorySegment seg, byte key) {
         int keyIdx = Byte.toUnsignedInt(key);
         int slot = Byte.toUnsignedInt(seg.get(ValueLayout.JAVA_BYTE, OFF_CHILD_IDX + keyIdx));
-        if (slot == Byte.toUnsignedInt(EMPTY_MARKER)) return false;
+        if (slot == EMPTY_SLOT_IDX) return false;
 
         seg.set(ValueLayout.JAVA_BYTE, OFF_CHILD_IDX + keyIdx, EMPTY_MARKER);
         setChildAtSlot(seg, slot, NodePtr.EMPTY_PTR);
@@ -152,7 +154,7 @@ public final class Node48 {
     public static void forEach(MemorySegment seg, KeyChildConsumer consumer) {
         for (int k = 0; k < 256; k++) {
             int slot = Byte.toUnsignedInt(seg.get(ValueLayout.JAVA_BYTE, OFF_CHILD_IDX + k));
-            if (slot != Byte.toUnsignedInt(EMPTY_MARKER)) {
+            if (slot != EMPTY_SLOT_IDX) {
                 long child = childAtSlot(seg, slot);
                 consumer.accept((byte) k, child);
             }

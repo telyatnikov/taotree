@@ -38,7 +38,7 @@ public final class LongOpenHashSet {
      * @return {@code true} if the value was newly added; {@code false} if already present
      */
     public boolean add(long value) {
-        assert value != EMPTY : "LongOpenHashSet does not support 0L as a value";
+        if (value == EMPTY) throwEmpty();
         int mask = table.length - 1;
         int idx = mix(value) & mask;
         while (true) {
@@ -51,6 +51,12 @@ public final class LongOpenHashSet {
             if (slot == value) return false;
             idx = (idx + 1) & mask;
         }
+    }
+
+    /** Cold-path helper — extracted so the hot {@link #add} stays small for JIT inlining. */
+    private static void throwEmpty() {
+        throw new IllegalArgumentException(
+            "LongOpenHashSet does not support 0L as a value (sentinel for empty slots)");
     }
 
     public boolean contains(long value) {

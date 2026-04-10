@@ -60,4 +60,4 @@
 - Store file: `<parquet-dir>/gbif-tracker.taotree` (created on first run, reopened on subsequent)
 - Verification tools: `GbifVerifier` (field coverage), `GbifCrossCheck` (aggregate), `GbifFieldCheck` (field-by-field)
 - All 13 leaf fields verified against Parquet source: 0 mismatches
-- **Known bug:** `Duplicate key in cowExpandLeaf` crash at ~1.4M rows (file 3). Pre-existing memory corruption: WriterArena NodePtr values overwrite a dict slab leaf's key bytes. Suspected cause: WriterArena 20-bit page encoding overflow after ~22M page allocations from per-scope arenas. See investigation prompt for details.
+- **Fixed:** `Duplicate key in cowExpandLeaf` crash was caused by a race condition in `ChunkStore.allocPagesSlow()` — `nextPage.set()` could overwrite a concurrent fast-path CAS, causing page double-allocation and memory corruption. Fix: replaced `set()` with a CAS loop.

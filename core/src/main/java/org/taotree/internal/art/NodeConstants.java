@@ -30,5 +30,5 @@ public final class NodeConstants {
 
     public static final int NODE256_SHRINK_THRESHOLD = 36;
     public static final int NODE48_SHRINK_THRESHOLD  = 12;
-    public static final int NODE16_SHRINK_THRESHOLD  = 4;
+    public static final int NODE16_SHRINK_THRESHOLD  = 3;
 }

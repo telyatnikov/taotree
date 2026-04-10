@@ -18,7 +18,7 @@ public final class KeyLayout {
         int off = 0;
         for (int i = 0; i < fields.length; i++) {
             offsets[i] = off;
-            off += fields[i].width();
+            off = Math.addExact(off, fields[i].width());
         }
         this.totalWidth = off;
     }

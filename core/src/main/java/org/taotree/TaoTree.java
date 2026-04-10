@@ -175,14 +175,20 @@ public final class TaoTree implements AutoCloseable {
     // Per-thread WriterArena reuse: each thread gets a dedicated arena that persists
     // across WriteScopes, avoiding wasteful batch re-reservation on every scope open.
     // Lazily initialized because chunkStore is not set until construction completes.
-    private ThreadLocal<WriterArena> threadArena;
+    // Volatile: prevents lost ThreadLocal on concurrent first-write() races (C2 fix).
+    private volatile ThreadLocal<WriterArena> threadArena;
 
     /** Get or create the per-thread WriterArena for this tree. */
     private WriterArena threadArena() {
         var tl = threadArena;
         if (tl == null) {
-            tl = ThreadLocal.withInitial(() -> new WriterArena(chunkStore));
-            threadArena = tl;
+            synchronized (this) {
+                tl = threadArena;
+                if (tl == null) {
+                    tl = ThreadLocal.withInitial(() -> new WriterArena(chunkStore));
+                    threadArena = tl;
+                }
+            }
         }
         return tl.get();
     }
@@ -1191,7 +1197,7 @@ public final class TaoTree implements AutoCloseable {
     }
 
     /** Lazy-init CowEngine + reclaimer for child trees on first write(). */
-    private void ensureCowEngine() {
+    private synchronized void ensureCowEngine() {
         if (cowEngine != null) return;
         if (reclaimer == null) {
             reclaimer = new EpochReclaimer(slab);
@@ -1826,6 +1832,46 @@ public final class TaoTree implements AutoCloseable {
             org.taotree.internal.cow.LongList retireAfterPublish = null;
             org.taotree.internal.cow.LongList retireStaleAfterPublish = null;
             boolean resetArenaAfterPublish = false;
+
+            // Optimistic rebase: if we detect a conflict before acquiring the lock,
+            // perform the expensive rebase computation outside the lock so concurrent
+            // writers are not serialized during the replay.
+            if (!commitLockHeld && mutationLog != null && mutationLog.size() > 0) {
+                var pre = publishedState();
+                if (pre != scopeSnapshot) {
+                    RebaseResult optimistic = rebaseCompute(pre);
+
+                    commitLock.lock();
+                    commitLockHeld = true;
+                    try {
+                        var current = publishedState();
+                        if (current == pre) {
+                            root = optimistic.root;
+                            size = optimistic.size;
+                            publishRoot();
+                            retireAfterPublish = optimistic.retirees;
+                        } else {
+                            // Another writer published during optimistic rebase — redo under lock
+                            var locked = rebaseCompute(current);
+                            root = locked.root;
+                            size = locked.size;
+                            publishRoot();
+                            retireAfterPublish = locked.retirees;
+                        }
+                        retireStaleAfterPublish = scopeRetirees;
+                    } finally {
+                        if (!keepLock) {
+                            commitLock.unlock();
+                            commitLockHeld = false;
+                        }
+                    }
+                    retireScope(retireAfterPublish);
+                    retireScope(retireStaleAfterPublish);
+                    return;
+                }
+            }
+
+            // Fast path: no conflict detected pre-lock, or commitLock already held
             if (!commitLockHeld) {
                 commitLock.lock();
                 commitLockHeld = true;
@@ -1856,7 +1902,12 @@ public final class TaoTree implements AutoCloseable {
                         retireAfterPublish = scopeRetirees;
                     }
                 } else {
-                    retireAfterPublish = rebaseLocked(current);
+                    // Conflict under lock (commitLock was already held, or TOCTOU race)
+                    var result = rebaseCompute(current);
+                    root = result.root;
+                    size = result.size;
+                    publishRoot();
+                    retireAfterPublish = result.retirees;
                     retireStaleAfterPublish = scopeRetirees;
                 }
             } finally {
@@ -1873,21 +1924,30 @@ public final class TaoTree implements AutoCloseable {
         }
 
         /**
-         * Replay the mutation log against a new root, copying leaf values
-         * from our private COW copies to the rebased copies.
+         * Result of a rebase computation: new root, size, and retirees.
+         * Separated from publishing so the computation can run without locks.
+         */
+        private record RebaseResult(long root, long size,
+                                    org.taotree.internal.cow.LongList retirees) {}
+
+        /**
+         * Replay the mutation log against the given published state, copying
+         * leaf values from our private COW copies to the rebased copies.
+         *
+         * <p>This method only <em>computes</em> the rebase result; it does not
+         * modify any TaoTree fields or publish. The caller publishes under the
+         * commit lock after verifying the target state is still current.
+         *
+         * <p>Thread-safe: uses only scope-private state (mutation log, arena)
+         * and thread-safe read paths (slab resolution, cow engine).
          *
          * <p>For keys that already existed in the published tree (sizeDelta == 0),
          * a {@link ConflictResolver} is consulted (if provided) to decide whether
          * the pending value should replace the published value.
          */
-        private org.taotree.internal.cow.LongList rebaseLocked(PublicationState current) {
-            // The stale COW copies from our original mutation phase are
-            // arena-allocated and will be reclaimed with the arena pages.
-            // We don't need to explicitly retire them — they're in our
-            // WriterArena which lives beyond the scope.
-
-            long rebaseRoot = current.root();
-            long rebaseSize = current.size();
+        private RebaseResult rebaseCompute(PublicationState against) {
+            long rebaseRoot = against.root();
+            long rebaseSize = against.size();
             var rebaseRetirees = new org.taotree.internal.cow.LongList();
 
             // Reusable LeafAccessors for the conflict resolver (avoids allocation per entry)
@@ -1941,10 +2001,7 @@ public final class TaoTree implements AutoCloseable {
                 }
             }
 
-            root = rebaseRoot;
-            size = rebaseSize;
-            publishRoot();
-            return rebaseRetirees;
+            return new RebaseResult(rebaseRoot, rebaseSize, rebaseRetirees);
         }
 
         private boolean shouldWriteBack() {

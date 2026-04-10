@@ -46,7 +46,7 @@ public final class TaoDictionary {
     private final TaoTree owner;
     private final TaoTree tree;
     private final int maxCode;
-    private int nextCode;
+    private volatile int nextCode;
 
     // Per-dictionary lock for COW mode: serializes dict writes without holding
     // the global tree lock. Multiple dicts can be interned concurrently.
@@ -135,6 +135,9 @@ public final class TaoDictionary {
         }
         dictLock.lock();
         try {
+            // Re-check: another writer may have interned while we waited for the lock
+            existing = resolveEncoded(padded);
+            if (existing != -1) return existing;
             return internEncoded(value, padded);
         } finally {
             dictLock.unlock();

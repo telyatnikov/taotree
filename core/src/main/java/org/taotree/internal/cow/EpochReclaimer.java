@@ -1,6 +1,8 @@
 package org.taotree.internal.cow;
 
 
+import java.lang.invoke.VarHandle;
+import java.lang.ref.Cleaner;
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -41,12 +43,33 @@ public final class EpochReclaimer implements AutoCloseable {
 
     private final AtomicLong[] readerSlots;
     private final AtomicInteger nextSlotIndex = new AtomicInteger(0);
-    private final ThreadLocal<Integer> threadSlotIndex;
+    /** Pool of recycled slot indices returned by terminated threads. */
+    private final ConcurrentLinkedQueue<Integer> slotPool = new ConcurrentLinkedQueue<>();
+    private final Cleaner slotCleaner = Cleaner.create();
+    private final ThreadLocal<SlotToken> threadSlot;
 
     private final ThreadLocal<RetireList> retireList;
     private final ConcurrentLinkedQueue<RetireList> allRetireLists = new ConcurrentLinkedQueue<>();
 
     private final SlabAllocator slab;
+
+    /**
+     * Opaque token held by a thread's ThreadLocal to anchor Cleaner slot-return.
+     * When a thread exits, the token becomes unreachable, and the Cleaner action
+     * returns the slot index to {@link #slotPool} for reuse.
+     *
+     * <p><b>Thread-pool limitation:</b> slot recycling fires only when a thread
+     * terminates and its {@code ThreadLocal} value is GC'd. For long-lived thread
+     * pools whose threads never terminate, slots are never recycled. If the total
+     * number of threads that ever enter a read epoch exceeds {@code maxReaderSlots},
+     * the {@link #enterEpoch()} call will throw {@link IllegalStateException}. Size
+     * the pool (default {@value #DEFAULT_MAX_READER_SLOTS}) to cover the maximum
+     * concurrent reader threads over the lifetime of the tree.
+     */
+    private static final class SlotToken {
+        final int slotIndex;
+        SlotToken(int slotIndex) { this.slotIndex = slotIndex; }
+    }
 
     // -----------------------------------------------------------------------
     // Construction
@@ -62,13 +85,23 @@ public final class EpochReclaimer implements AutoCloseable {
         for (int i = 0; i < maxReaderSlots; i++) {
             readerSlots[i] = new AtomicLong(INACTIVE);
         }
-        this.threadSlotIndex = ThreadLocal.withInitial(() -> {
-            int idx = nextSlotIndex.getAndIncrement();
-            if (idx >= readerSlots.length) {
-                throw new IllegalStateException(
-                    "Reader slots exhausted (" + readerSlots.length + ")");
+        this.threadSlot = ThreadLocal.withInitial(() -> {
+            // Prefer a recycled slot; fall back to sequential allocation.
+            Integer pooled = slotPool.poll();
+            int idx;
+            if (pooled != null) {
+                idx = pooled;
+            } else {
+                idx = nextSlotIndex.getAndIncrement();
+                if (idx >= readerSlots.length) {
+                    throw new IllegalStateException(
+                        "Reader slots exhausted (" + readerSlots.length + ")");
+                }
             }
-            return idx;
+            var token = new SlotToken(idx);
+            // Return the slot to the pool when the token (and thus the thread) is GC'd.
+            slotCleaner.register(token, () -> slotPool.offer(idx));
+            return token;
         });
         this.retireList = ThreadLocal.withInitial(() -> {
             var list = new RetireList();
@@ -88,15 +121,20 @@ public final class EpochReclaimer implements AutoCloseable {
      * @return the slot index (pass to {@link #exitEpoch(int)})
      */
     public int enterEpoch() {
-        int slot = threadSlotIndex.get();
+        int slot = threadSlot.get().slotIndex;
         readerSlots[slot].setRelease(globalGeneration.get());
         return slot;
     }
 
     /**
-     * Exit a read epoch. Sets the slot to {@code INACTIVE} with release semantics.
+     * Exit a read epoch. An acquire fence is issued first to prevent CPU
+     * reordering of reads inside the epoch to after the slot is cleared.
+     * On weakly-ordered architectures (ARM64, RISC-V) this ensures the
+     * reclaimer cannot free memory still referenced by epoch reads.
      */
     public void exitEpoch(int slotIndex) {
+        // Prevent reads inside the epoch from being reordered past the slot clear.
+        VarHandle.acquireFence();
         readerSlots[slotIndex].setRelease(INACTIVE);
     }
 
@@ -105,11 +143,37 @@ public final class EpochReclaimer implements AutoCloseable {
     // -----------------------------------------------------------------------
 
     /**
+     * Per-thread retire list drain threshold. When a thread's list reaches this
+     * size, we attempt a local drain — but only if {@link #safeReclaimGeneration()}
+     * has advanced since the last attempt. This avoids the O(n²) problem of
+     * repeatedly scanning a list that can't be drained (e.g., during pure
+     * ingestion where {@code durableGeneration = 0}).
+     */
+    private static final int LOCAL_DRAIN_THRESHOLD = 65_536;
+
+    /**
      * Retire an old node pointer. The node is added to this thread's retire list
      * tagged with the current global generation. No synchronization is required.
+     *
+     * <p>When the thread's list exceeds {@link #LOCAL_DRAIN_THRESHOLD}, a
+     * generation-gated local drain is attempted: if {@code safeReclaimGeneration}
+     * has advanced since the last drain, entries below the safe boundary are freed.
+     * If it hasn't advanced, the check short-circuits with a single volatile read.
      */
     public void retire(long nodePtr) {
-        retireList.get().add(nodePtr, globalGeneration.get());
+        RetireList list = retireList.get();
+        list.add(nodePtr, globalGeneration.get());
+        if (list.size() >= LOCAL_DRAIN_THRESHOLD) {
+            tryDrainLocal(list);
+        }
+    }
+
+    private void tryDrainLocal(RetireList list) {
+        long safeGen = safeReclaimGeneration();
+        if (safeGen > list.lastDrainSafeGen) {
+            list.lastDrainSafeGen = safeGen;
+            list.drain(safeGen, slab);
+        }
     }
 
     /**
@@ -162,6 +226,12 @@ public final class EpochReclaimer implements AutoCloseable {
     /**
      * Compute the current safe reclaim generation:
      * {@code min(durableGeneration, min(activeReaderGenerations))}.
+     *
+     * <p><b>Note on benign TOCTOU:</b> a new reader thread may allocate a slot
+     * after the snapshot of {@code nextSlotIndex} but before the loop reaches
+     * that slot. This causes at most one generation of delayed reclamation for
+     * the new reader's first epoch; it is harmless and self-correcting on the
+     * next call.
      */
     public long safeReclaimGeneration() {
         long min = durableGeneration.get();
@@ -212,6 +282,8 @@ public final class EpochReclaimer implements AutoCloseable {
         private long[] ptrs;
         private long[] gens;
         private int size;
+        /** Safe generation at the last local drain attempt (or 0 if never drained). */
+        long lastDrainSafeGen;
 
         RetireList() {
             ptrs = new long[INITIAL_CAPACITY];

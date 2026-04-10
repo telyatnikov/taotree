@@ -100,7 +100,10 @@ public final class ShadowPagingRecovery {
             state.dictNextCodes = commit.dictNextCodes != null ? commit.dictNextCodes.clone() : new long[0];
             state.dictSizes = commit.dictSizes != null ? commit.dictSizes.clone() : new long[0];
 
-            // Advance cursor past this commit's arena
+            // Advance cursor past this commit's arena — with bounds validation.
+            if (commit.arenaEndPage <= cursor || commit.arenaEndPage > totalPages) {
+                break;  // corrupt or zero arenaEndPage — stop recovery
+            }
             state.nextPage = commit.arenaEndPage;
             cursor = commit.arenaEndPage;
         }

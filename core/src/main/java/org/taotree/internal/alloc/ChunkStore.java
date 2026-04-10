@@ -183,13 +183,25 @@ public final class ChunkStore implements AutoCloseable {
                 "Cannot allocate " + pageCount + " pages; exceeds chunk capacity " + pagesPerChunk);
         }
         while (true) {
-            int startPage = nextPage.get();
-            int offsetInChunk = startPage % pagesPerChunk;
-            int endPage = startPage + pageCount;
-            if (offsetInChunk + pageCount > pagesPerChunk || endPage > totalPages) {
-                return allocPagesSlow(pageCount);
+            int cur = nextPage.get();
+            int offsetInChunk = cur % pagesPerChunk;
+
+            // Chunk boundary crossing: skip to next chunk start (lock-free)
+            int startPage;
+            if (offsetInChunk + pageCount > pagesPerChunk) {
+                startPage = (cur / pagesPerChunk + 1) * pagesPerChunk;
+            } else {
+                startPage = cur;
             }
-            if (nextPage.compareAndSet(startPage, endPage)) {
+
+            int endPage = startPage + pageCount;
+
+            if (endPage > totalPages) {
+                ensureCapacity(endPage);
+                continue; // retry with updated totalPages
+            }
+
+            if (nextPage.compareAndSet(cur, endPage)) {
                 dirtyChunks.add(startPage / pagesPerChunk);
                 return startPage;
             }
@@ -365,20 +377,17 @@ public final class ChunkStore implements AutoCloseable {
     // Internals
     // -----------------------------------------------------------------------
 
-    private synchronized int allocPagesSlow(int pageCount) throws IOException {
-        int startPage = nextPage.get();
-        int currentChunkIdx = startPage / pagesPerChunk;
-        int offsetInChunk = startPage % pagesPerChunk;
-        if (offsetInChunk + pageCount > pagesPerChunk) {
-            startPage = (currentChunkIdx + 1) * pagesPerChunk;
-        }
-        int endPage = startPage + pageCount;
-        if (endPage > totalPages) {
-            growFile(endPage);
-        }
-        nextPage.set(endPage);
-        dirtyChunks.add(startPage / pagesPerChunk);
-        return startPage;
+    /**
+     * Grow the file if it doesn't have enough pages.
+     *
+     * <p>Only the growth path (file I/O + mmap) is synchronized. The CAS-based
+     * allocation loop in {@link #allocPages} handles chunk boundary crossing
+     * lock-free. If another thread already grew the file, the guard
+     * {@code minPages <= totalPages} causes an immediate return.
+     */
+    private synchronized void ensureCapacity(int minPages) throws IOException {
+        if (minPages <= totalPages) return;
+        growFile(minPages);
     }
 
     /**
@@ -413,14 +422,24 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     private void mapChunk(int chunkIdx) throws IOException {
-        if (chunkIdx >= chunks.length) {
-            int newCap = Math.min(chunks.length * 2, MAX_CHUNKS);
-            var newChunks = new MemorySegment[newCap];
-            System.arraycopy(chunks, 0, newChunks, 0, chunkCount);
-            chunks = newChunks;
-        }
+        // Map the new segment first so the array is fully initialised before publication.
         long offset = (long) chunkIdx * chunkSize;
-        chunks[chunkIdx] = channel.map(FileChannel.MapMode.READ_WRITE, offset, chunkSize, arena);
+        MemorySegment mapped = channel.map(FileChannel.MapMode.READ_WRITE, offset, chunkSize, arena);
+
+        MemorySegment[] current = chunks;
+        if (chunkIdx >= current.length) {
+            int newCap = Math.min(current.length * 2, MAX_CHUNKS);
+            var newChunks = new MemorySegment[newCap];
+            System.arraycopy(current, 0, newChunks, 0, chunkCount);
+            // Populate the new slot before the volatile publish so readers never
+            // see a null entry at chunkIdx (H2 fix).
+            newChunks[chunkIdx] = mapped;
+            chunks = newChunks; // volatile write — publishes the fully-initialised array
+        } else {
+            current[chunkIdx] = mapped;
+        }
+        // Volatile write after all array stores; any reader that sees the new
+        // chunkCount is guaranteed to see the populated chunk entry (happens-before).
         chunkCount = Math.max(chunkCount, chunkIdx + 1);
     }
 

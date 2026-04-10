@@ -137,7 +137,11 @@ public final class Compactor {
             case NodePtr.NODE_16  -> compactNode16(seg, count);
             case NodePtr.NODE_48  -> compactNode48(seg, count);
             case NodePtr.NODE_256 -> compactNode256(seg, count);
-            default -> throw new IllegalStateException("Unknown node type: " + type);
+            default -> {
+                System.getLogger(Compactor.class.getName())
+                    .log(System.Logger.Level.ERROR, "Unknown node type during compaction: {0}", type);
+                throw new IllegalStateException("Unknown node type: " + type);
+            }
         };
     }
 

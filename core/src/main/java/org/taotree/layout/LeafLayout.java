@@ -43,7 +43,7 @@ public final class LeafLayout {
         int extrasCount = 0;
         for (int i = 0; i < fields.length; i++) {
             offsets[i] = off;
-            off += fields[i].width();
+            off = Math.addExact(off, fields[i].width());
             if (fields[i] instanceof LeafField.Nullable) {
                 nullBitIndices[i] = nullCount++;
             } else {
@@ -57,8 +57,8 @@ public final class LeafLayout {
             throw new IllegalArgumentException("At most one extras field per layout (found " + extrasCount + ")");
         }
         this.nullBitmapOffset = off;
-        this.nullBitmapSize = (nullCount + 7) / 8;
-        this.totalWidth = off + nullBitmapSize;
+        this.nullBitmapSize = Math.addExact(nullCount, 7) / 8;
+        this.totalWidth = Math.addExact(off, nullBitmapSize);
     }
 
     /**
