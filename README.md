@@ -93,8 +93,8 @@ try (var tree = TaoTree.open(Path.of("data.tao"), keyLayout, leafLayout)) {
 - **JSON catch-all** — `LeafField.json("extras")` stores arbitrary JSON as a TaoString
 - **Off-heap storage** — all data in `MemorySegment`, zero GC pressure
 - **File persistence** — `ChunkStore` with mmap'd chunks, optional OS-native preallocation; reopen with layout binding
-- **Concurrency** — fair `ReentrantReadWriteLock` with scoped access (`tree.read()` / `tree.write()`)
-- **Lincheck tests** — linearizability stress tests as a safety net for future lock-free refactoring
+- **Concurrency** — ROWEX model: lock-free readers (epoch-based snapshots), concurrent writers (optimistic COW + commit lock), and coordinated persistence (`sync`/`compact`/`close` acquire both write lock and commit lock)
+- **Concurrency testing** — Fray (controlled concurrency with schedule-point instrumentation) and Lincheck (linearizability stress tests) as safety nets for lock-free algorithms
 
 ## Build
 
@@ -103,6 +103,7 @@ Requires Java 25+.
 ```bash
 ./gradlew build                          # full build (core + jmh + examples)
 ./gradlew :core:test                     # run tests
+./gradlew :core:frayTest                 # Fray concurrency tests only (~1 min)
 ./gradlew :core:cleanTest :core:test     # force re-run tests
 ./gradlew :core:pitest                   # mutation testing (STRONGER mutators, ≥75% threshold)
 ./gradlew :core:jacocoTestReport         # line coverage report

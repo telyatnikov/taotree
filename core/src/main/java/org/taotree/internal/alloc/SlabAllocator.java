@@ -337,6 +337,9 @@ public final class SlabAllocator implements AutoCloseable {
             long byteOff = (long) word * 8;
             long mask = 1L << bit;
 
+            // Schedule point: Fray intercepts yield() to control interleaving of
+            // concurrent free vs. alloc CAS operations on off-heap bitmasks.
+            Thread.yield();
             // Atomic set-bit via CAS loop
             long prev;
             do {
@@ -401,6 +404,10 @@ public final class SlabAllocator implements AutoCloseable {
          */
         private long casInSlab(int slabId, int wordStart, int nodeType) {
             MemorySegment bm = bitmaskSegs[slabId]; // volatile read of reference
+            // Schedule point: Fray intercepts yield() to control interleaving of
+            // concurrent CAS operations on off-heap MemorySegment bitmasks, which
+            // Fray cannot auto-instrument. No-op hint under normal execution.
+            Thread.yield();
             for (int w = wordStart; w < bitmaskLongs; w++) {
                 long byteOff = (long) w * 8;
                 long val = (long) VH_LONG.getVolatile(bm, byteOff);

@@ -20,14 +20,16 @@ import java.util.concurrent.CopyOnWriteArrayList;
 /**
  * Lincheck linearizability test for core TaoTree operations with raw byte keys.
  *
- * <p>Uses a small key space (1..5) to force high contention on the same keys,
- * maximising the chance of catching non-linearizable outcomes.
+ * <p>Uses a small key space (1..5) and an independent value space (100..105)
+ * so that conflicting updates on the same key are observable (different values
+ * distinguish "which writer won").
  *
  * <p>These tests pass trivially with the current RWLock implementation
  * (every concurrent execution is serialised by the lock). They become the
  * safety net when the lock is replaced with a lock-free algorithm.
  */
 @Param(name = "key", gen = IntGen.class, conf = "1:5")
+@Param(name = "val", gen = IntGen.class, conf = "100:105")
 public class LincheckTaoTreeTest {
 
     private static final int KEY_LEN = 4;
@@ -71,12 +73,12 @@ public class LincheckTaoTreeTest {
     }
 
     @Operation
-    public int put(@Param(name = "key") int k) {
+    public int put(@Param(name = "key") int k, @Param(name = "val") int v) {
         byte[] key = encodeKey(k);
         try (var w = tree.write()) {
             long leaf = w.getOrCreate(key);
-            w.leafValue(leaf).set(ValueLayout.JAVA_INT, 0, k);
-            return k;
+            w.leafValue(leaf).set(ValueLayout.JAVA_INT, 0, v);
+            return v;
         }
     }
 
@@ -124,9 +126,9 @@ public class LincheckTaoTreeTest {
     public static class SequentialSpec {
         private final Map<Integer, Integer> map = new HashMap<>();
 
-        public int put(int k) {
-            map.put(k, k);
-            return k;
+        public int put(int k, int v) {
+            map.put(k, v);
+            return v;
         }
 
         public int get(int k) {

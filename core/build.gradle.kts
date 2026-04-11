@@ -2,6 +2,7 @@ plugins {
     `java-library`
     jacoco
     id("info.solidsoft.pitest") version "1.19.0"
+    id("org.pastalab.fray.gradle") version "0.8.3"
 }
 
 description = "TaoTree — Adaptive Radix Tree on Java FFM"
@@ -36,9 +37,9 @@ pitest {
         "org.taotree.internal.alloc.Preallocator"
     )
 
-    // Exclude Lincheck stress tests — they test concurrency, not code paths,
-    // and their Arena-leaking lifecycle crashes the PIT minion.
-    excludedTestClasses = setOf("org.taotree.Lincheck*")
+    // Exclude Lincheck and Fray stress tests — they test concurrency, not code paths,
+    // and their lifecycle crashes the PIT minion.
+    excludedTestClasses = setOf("org.taotree.Lincheck*", "org.taotree.fray.*")
 
     // Pass native access flag to forked test JVMs
     jvmArgs = listOf(

@@ -98,7 +98,11 @@ public final class TaoTree implements AutoCloseable {
     private final Arena arena;
     private final SlabAllocator slab;
     private final BumpAllocator bump;
+    // Structural lock: writeLock for compact/sync/close/copyFrom; readLock for stats.
+    // Lock ordering: writeLock → commitLock (never reversed).
     private final ReentrantReadWriteLock lock;
+    // Publication lock: serialises writer commits (deferredCommitImpl, commitWrite)
+    // and structural ops that read/write root/size (compact, sync, close).
     private final ReentrantLock commitLock = new ReentrantLock();
     private final boolean ownsArena;
     private final ChunkStore chunkStore; // null for child trees (dictionaries)
@@ -957,28 +961,37 @@ public final class TaoTree implements AutoCloseable {
     public void compact() throws IOException {
         lock.writeLock().lock();
         try {
-            long currentRoot = root;
-            if (NodePtr.isEmpty(currentRoot)) return;
+            // Acquire commitLock to prevent concurrent writer publications.
+            // Without this, a WriteScope.deferredCommitImpl() could publish a
+            // new root between our read of 'root' and our publishRoot(), causing
+            // the writer's insertion to be silently lost.
+            commitLock.lock();
+            try {
+                long currentRoot = root;
+                if (NodePtr.isEmpty(currentRoot)) return;
 
-            var compactor = new Compactor(slab, bump, reclaimer, chunkStore,
-                prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
-                keyLen, keySlotSize, leafClassIds, leafValueSizes);
+                var compactor = new Compactor(slab, bump, reclaimer, chunkStore,
+                    prefixClassId, node4ClassId, node16ClassId, node48ClassId, node256ClassId,
+                    keyLen, keySlotSize, leafClassIds, leafValueSizes);
 
-            var result = compactor.compact(currentRoot);
+                var result = compactor.compact(currentRoot);
 
-            // Publish the compacted root
-            root = result.newRoot();
-            publishRoot();
+                // Publish the compacted root
+                root = result.newRoot();
+                publishRoot();
 
-            // Write a full checkpoint with the compacted state
-            persistence.writeCheckpoint(gatherMetadata());
-            persistence.resetCommitCount();
-            chunkStore.sync();
+                // Write a full checkpoint with the compacted state
+                persistence.writeCheckpoint(gatherMetadata());
+                persistence.resetCommitCount();
+                chunkStore.sync();
 
-            // Advance durable generation — retired nodes older than this can now be freed
-            if (reclaimer != null) {
-                reclaimer.advanceDurableGeneration(persistence.generation());
-                reclaimer.reclaim();
+                // Advance durable generation — retired nodes older than this can now be freed
+                if (reclaimer != null) {
+                    reclaimer.advanceDurableGeneration(persistence.generation());
+                    reclaimer.reclaim();
+                }
+            } finally {
+                commitLock.unlock();
             }
         } finally {
             lock.writeLock().unlock();
@@ -1011,17 +1024,25 @@ public final class TaoTree implements AutoCloseable {
     public void sync() throws IOException {
         lock.writeLock().lock();
         try {
-            persistence.writeCommitRecord(buildCommitData());
-            if (persistence.shouldCheckpoint()) {
-                persistence.writeCheckpoint(gatherMetadata());
-                persistence.resetCommitCount();
-                chunkStore.syncDirty();
-                if (reclaimer != null) {
-                    reclaimer.advanceDurableGeneration(persistence.generation());
-                    reclaimer.reclaim();
+            // Acquire commitLock so buildCommitData() and gatherMetadata() read
+            // consistent root/size — a concurrent writer cannot publish between
+            // our reads and our persistence writes.
+            commitLock.lock();
+            try {
+                persistence.writeCommitRecord(buildCommitData());
+                if (persistence.shouldCheckpoint()) {
+                    persistence.writeCheckpoint(gatherMetadata());
+                    persistence.resetCommitCount();
+                    chunkStore.syncDirty();
+                    if (reclaimer != null) {
+                        reclaimer.advanceDurableGeneration(persistence.generation());
+                        reclaimer.reclaim();
+                    }
+                } else {
+                    chunkStore.syncDirty();
                 }
-            } else {
-                chunkStore.syncDirty();
+            } finally {
+                commitLock.unlock();
             }
         } finally {
             lock.writeLock().unlock();
@@ -1037,11 +1058,24 @@ public final class TaoTree implements AutoCloseable {
     public void close() {
         if (ownsArena) {
             try {
-                persistence.writeCheckpoint(gatherMetadata());
-                chunkStore.sync();
-                if (reclaimer != null) {
-                    reclaimer.advanceDurableGeneration(persistence.generation());
-                    reclaimer.reclaim();
+                // Acquire both locks so the final checkpoint captures a
+                // consistent snapshot of root/size, not torn by a concurrent
+                // writer publishing via commitLock.
+                lock.writeLock().lock();
+                try {
+                    commitLock.lock();
+                    try {
+                        persistence.writeCheckpoint(gatherMetadata());
+                        chunkStore.sync();
+                        if (reclaimer != null) {
+                            reclaimer.advanceDurableGeneration(persistence.generation());
+                            reclaimer.reclaim();
+                        }
+                    } finally {
+                        commitLock.unlock();
+                    }
+                } finally {
+                    lock.writeLock().unlock();
                 }
                 chunkStore.close();
             } catch (IOException e) {
