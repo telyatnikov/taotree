@@ -12,40 +12,54 @@
 
 | Component | Status | Notes |
 |---|---|---|
-| `SlabAllocator` | Done | Fixed-size slab allocator with bitmask occupancy, dual-mode (in-memory / file-backed) |
-| `BumpAllocator` | Done | Bump allocator for variable-length immutable payloads, dual-mode (in-memory / file-backed) |
+| `SlabAllocator` | Done | Fixed-size slab allocator with bitmask occupancy, file-backed via `ChunkStore` |
+| `BumpAllocator` | Done | Bump allocator for variable-length immutable payloads, file-backed via `ChunkStore` |
 | `NodePtr` / `OverflowPtr` | Done | 64-bit tagged swizzled pointer encoding |
 | Node types (4/16/48/256/PrefixNode) | Done | Static operations on off-heap `MemorySegment` slices |
 | `TaoTree` core (lookup/insert/delete) | Done | Fixed-width keys, pessimistic prefix compression, zero-initialized leaf values |
-| `TaoTree` owns infrastructure | Done | Owns Arena, allocator, overflow, node class IDs, fair `ReentrantReadWriteLock` |
-| `TaoTree.ReadScope` / `TaoTree.WriteScope` | Done | Scoped lock guards via `try-with-resources` |
+| `TaoTree` owns infrastructure | Done | Owns `ChunkStore`, allocators, node class IDs, `ReentrantReadWriteLock` + `commitLock` |
+| `TaoTree.ReadScope` / `TaoTree.WriteScope` | Done | Epoch-based lock-free reads; optimistic COW writes with deferred commit |
+| `LeafField` / `LeafLayout` / `LeafHandle` | Done | Typed leaf schema with pre-computed offsets and compile-time type safety |
+| `LeafAccessor` / `LeafVisitor` | Done | Typed read/write access to leaf values; boolean-returning visitor for scan |
+| `QueryBuilder` | Done | Resolve-only key builder (lock-free); unknown dict values → empty scan |
+| `ConflictResolver` | Done | Pluggable merge strategy for deferred-commit rebase conflicts |
 | `TaoDictionary` | Done | Self-locking string→int dictionary (fixed padded keys, 128B max) |
 | `TaoKey` | Done | Binary-comparable encoding for u8-u64, i8-i64, strings |
 | `TaoString` | Done | 16-byte inline/overflow string representation |
 | `KeyField` / `KeyLayout` / `KeyBuilder` | Done | Compound key definition and encoding |
+| Scan / prefix scan | Done | `forEach(visitor)`, `scan(qb, handle, visitor)` with ordered traversal and early termination |
+| COW + epoch reclamation | Done | `CowEngine`, `CowInsert`, `CowDelete`, `CowNodeOps`, `EpochReclaimer`, `Compactor` |
+| File-backed persistence | Done | `ChunkStore` + v2 checkpoint (mirrored A/B slots, CRC-32C, shadow paging) |
+| Compaction | Done | `tree.compact()` — post-order arena→slab migration, checkpoint, epoch reclamation |
 | JMH benchmarks | Done | ART lookup/insert, dictionary resolve throughput |
-| GBIF species tracker example | Done | Reads Parquet, 7 dict-encoded key fields |
-| File-backed persistence | Done | `ChunkStore` + `Superblock`, single file with 64 MB chunked mmap windows |
+| GBIF species tracker example | Done | Reads Parquet, 7 dict-encoded key fields, 13 verified leaf fields |
+| Fray concurrency testing | Done | Controlled schedule-point testing for race conditions (JDK 25, Fray 0.8.3) |
+| Lincheck linearizability tests | Done | Stress-based linearizability verification against sequential spec |
 
 ### Concurrency model
 
-One fair `ReentrantReadWriteLock` per `TaoTree`. All child trees and dictionaries sharing the same
-tree share the same lock. Scoped access via `tree.read()` / `tree.write()` returning
-`ReadScope` / `WriteScope` guards (`AutoCloseable`). `TaoDictionary` methods are self-locking
-and reentrant-safe. Read→write upgrade is detected and throws `IllegalStateException`.
+ROWEX (Read-Optimistic Write-EXclusive) model:
+
+- **Readers** are lock-free. `ReadScope` captures a `PublicationState` (root + size atomically)
+  via `VarHandle.getAcquire` and enters an epoch. Readers never block on writers.
+- **Writers** perform optimistic COW outside any lock on the first mutation, then acquire a
+  lightweight `commitLock` to publish the new root. On conflict (another writer published during
+  COW), one redo against the new root is attempted (bounded single retry).
+- **Persistence** operations (`sync()`/`compact()`/`close()`) acquire the global `writeLock`
+  then `commitLock` (lock ordering: writeLock → commitLock) for exclusive file I/O coordination.
+- **Dictionaries** (`TaoDictionary`) are self-locking (own lock for `intern`, lock-free for `resolve`).
+- **Epoch reclamation** (`EpochReclaimer`) defers freeing of COW-replaced nodes until all readers
+  that could see the old root have exited. Child trees share the parent's reclaimer.
 
 ### Future work (not yet implemented)
 
 | Feature | Notes |
 |---|---|
 | Builder API for ART | Currently uses constructor directly |
-| Scan / prefix scan | `art.scan(prefix, consumer)` — design is in the doc but not implemented |
 | `LEAF_INLINE` | Inline small leaf values in the `NodePtr` payload |
 | Variable-length ART keys | Current implementation uses fixed-width keys only; dictionary ARTs pad strings to 128B |
 | Configurable `prefixCapacity` | Hardcoded to 15 (fits in 24B prefix node) |
 | Reserved-range dictionary APIs | `TaoDictionary.u32WithReserved()` for pre-assigned codes |
-| Vacuum / compaction | Slab and bump allocator compaction |
-| Persistence: TaoDictionary | Child tree descriptors + nextCode persistence |
 | Persistence: WAL | Write-ahead log for crash recovery |
 
 ---
@@ -1225,9 +1239,11 @@ A single file with 4 KB pages, mapped via `FileChannel.map()` in 64 MB chunked w
 The file grows by appending 64 MB chunks (one `mmap()` per chunk, keeping VMA count low).
 On macOS/APFS, files are sparse — physical disk usage matches actual data written.
 
-### 14.2 Superblock (page 0)
+### 14.2 Checkpoint (v2 format)
 
-Contains all metadata needed to reconstruct allocator and tree state on reopen:
+Uses a v2 checkpoint format with mirrored A/B slots, CRC-32C integrity, and shadow paging
+for crash-safe updates. Contains all metadata needed to reconstruct allocator and tree state
+on reopen:
 
 - ChunkStore state: totalPages, nextPage, chunkSize
 - SlabAllocator class registry: per-class segmentSize, slabCount, page locations, segmentsInUse
@@ -1243,14 +1259,12 @@ Slabs and bump pages are `chunk.asSlice()` from the containing chunk.
 When a page allocation would straddle a chunk boundary, it skips to the next chunk.
 This ensures every slab is contiguous within a single mapping.
 
-### 14.4 Dual mode
+### 14.4 File-backed mode
 
-The same `SlabAllocator` and `BumpAllocator` support both modes:
+All trees are file-backed via `ChunkStore`. The `SlabAllocator` and `BumpAllocator`
+allocate pages from the chunk store, which maps them via `FileChannel.map()`.
 
-- **In-memory** (default): `Arena.allocate()` for anonymous off-heap memory.
-- **File-backed**: `ChunkStore.allocPages()` → mapped file pages.
-
-Bitmasks use `MemorySegment` in both modes. In file-backed mode, bitmask writes are
+Bitmasks use `MemorySegment` backed by the mapped file. Bitmask writes are
 immediately visible in the mapped file — no separate sync step for allocation tracking.
 
 ### 14.5 API
@@ -1271,18 +1285,18 @@ tree.close();
 
 ### 14.6 Durability model
 
-- `sync()` writes the superblock and calls `force()` on all mapped chunks.
+- `sync()` writes the checkpoint (v2: mirrored A/B with CRC-32C) and calls `force()` on dirty chunks.
+- `compact()` migrates arena nodes to slab, writes checkpoint, reclaims epochs.
 - `close()` calls `sync()` automatically.
-- Crash between writes and `sync()` may leave metadata stale (no WAL in v1).
+- All three acquire `writeLock` → `commitLock` to coordinate with concurrent writers.
+- Crash between writes and `sync()` recovers from the last valid checkpoint slot (shadow paging).
 - On macOS, `force()` uses `msync(MS_SYNC)`. For full durability, `F_FULLFSYNC` is needed
   (future enhancement).
 
 ### 14.7 Future work
 
-- TaoDictionary persistence (child tree descriptors + nextCode)
-- WAL or copy-on-write for crash recovery
-- `fallocate` / `F_PREALLOCATE` for physical block reservation
-- Vacuum / compaction for file-backed stores
+- WAL for fine-grained crash recovery (currently relies on checkpoint + shadow paging)
+- `F_FULLFSYNC` on macOS for guaranteed durability
 
 ---
 
@@ -1540,9 +1554,9 @@ With 2.8B occurrences mapped to ~2.5M species × ~50K locations, the ART's inner
 at the taxonomy levels are heavily shared, reducing memory consumption compared to a flat
 hash map.
 
-### 15b.9 Prefix scan queries (future work)
+### 15b.9 Prefix scan queries
 
-The hierarchical key enables natural prefix scans (not yet implemented):
+The hierarchical key enables natural prefix scans via `scan(queryBuilder, handle, visitor)`:
 
 ```
 // All observations in kingdom Animalia
@@ -1656,9 +1670,9 @@ aws s3 sync s3://gbif-open-data-us-east-1/occurrence/2026-04-01/occurrence.parqu
    16) given that our data ART keys are 16 bytes and dictionary ART keys can be longer?
 2. **LEAF_INLINE threshold.** Inline leaves in the NodePtr payload for leaves ≤ 7 bytes? This
    helps dictionary ARTs (4-byte codes) but adds a branch to every leaf access.
-3. **Concurrency model.** Resolved: coarse-grained fair `ReentrantReadWriteLock` per
-   `TaoTree`. Scoped `ReadScope`/`WriteScope` guards. Future: OLC or lock-free approaches
-   may be explored for higher-throughput read-heavy workloads.
+3. **Concurrency model.** Resolved: ROWEX model — lock-free readers (epoch-based snapshots),
+   concurrent writers (optimistic COW + `commitLock`), coordinated persistence
+   (`writeLock` → `commitLock`). Fray + Lincheck provide ongoing safety verification.
 4. **Slab sizing.** How large should each slab be? Larger slabs reduce allocation frequency
    but increase memory granularity. 1 MB or 4 MB per slab are reasonable starting points.
 5. **Vacuum frequency.** How often to compact slab occupancy, and whether to do it

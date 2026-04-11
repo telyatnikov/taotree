@@ -20,7 +20,7 @@ var leafLayout = LeafLayout.of(
 );
 
 // Create tree — dicts created automatically from the key layout
-try (var tree = TaoTree.open(keyLayout, leafLayout)) {
+try (var tree = TaoTree.create(Path.of("data.tao"), keyLayout, leafLayout)) {
 
     // Derive typed handles (pre-computed offsets, compile-time type safety)
     var KINGDOM  = tree.keyDict16("kingdom");
@@ -68,15 +68,10 @@ try (var tree = TaoTree.open(keyLayout, leafLayout)) {
 }
 ```
 
-### File-backed (persistent)
+### Reopen an existing tree
 
 ```java
-// Create
-try (var tree = TaoTree.create(Path.of("data.tao"), keyLayout, leafLayout)) {
-    // ... same handle-based API ...
-    tree.sync();
-}
-// Reopen with layout binding
+// Reopen with layout binding — dicts restored from checkpoint
 try (var tree = TaoTree.open(Path.of("data.tao"), keyLayout, leafLayout)) {
     var KINGDOM = tree.keyDict16("kingdom");  // re-bound to restored dicts
     // ...
@@ -146,11 +141,13 @@ taotree/
 - `LeafAccessor` — typed read/write access to leaf values
 - `QueryBuilder` — resolve-only key builder for scan operations
 - `LeafVisitor` — boolean-returning visitor for ordered scan with early termination
+- `ConflictResolver` — pluggable merge strategy for concurrent writer conflicts
 - `TaoDictionary` — string-to-int intern table backed by ART
 - `TaoString` — 16-byte inline/overflow string representation
-- `SlabAllocator` — fixed-size slab allocator (in-memory or file-backed)
+- `CowEngine` / `EpochReclaimer` — copy-on-write mutation with epoch-based reclamation
+- `SlabAllocator` — fixed-size slab allocator (file-backed via `ChunkStore`)
 - `BumpAllocator` — append-only allocator for variable-length overflow data
 - `ChunkStore` — single-file storage with chunked mmap windows
-- `Preallocator` — OS-native block reservation (macOS `F_PREALLOCATE`, Linux `fallocate`)
+- `CheckpointV2` — crash-safe persistence with mirrored A/B slots and CRC-32C
 
 See [docs/design.md](docs/design.md) for the full design document.
