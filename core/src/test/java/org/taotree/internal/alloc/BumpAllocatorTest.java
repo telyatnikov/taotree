@@ -27,7 +27,7 @@ class BumpAllocatorTest {
             Path tmp = Files.createTempFile("bump-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var bump = new BumpAllocator(arena, cs, 4096);
 
             byte[] data = "Hello, TaoTree!".getBytes(StandardCharsets.UTF_8);
@@ -50,7 +50,7 @@ class BumpAllocatorTest {
             Path tmp = Files.createTempFile("bump-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var bump = new BumpAllocator(arena, cs, 4096);
 
             long ptr1 = bump.allocate(10);
@@ -77,7 +77,7 @@ class BumpAllocatorTest {
             Path tmp = Files.createTempFile("bump-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var bump = new BumpAllocator(arena, cs, 4096);
 
             // 4096 byte pages. Allocate payloads that exceed one page.
@@ -98,7 +98,7 @@ class BumpAllocatorTest {
             Path tmp = Files.createTempFile("bump-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var bump = new BumpAllocator(arena, cs, 4096);
 
             // Payloads large enough to span multiple 4096-byte pages
@@ -137,7 +137,7 @@ class BumpAllocatorTest {
             Path tmp = Files.createTempFile("bump-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var bump = new BumpAllocator(arena, cs, 4096);
 
             // Payload larger than page size
@@ -161,7 +161,7 @@ class BumpAllocatorTest {
             Path tmp = Files.createTempFile("bump-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var bump = new BumpAllocator(arena, cs, 4096);
 
             // Normal allocation first
@@ -186,7 +186,7 @@ class BumpAllocatorTest {
             Path tmp = Files.createTempFile("bump-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var bump = new BumpAllocator(arena, cs, 4096);
 
             assertEquals(0, bump.bytesAllocated());
@@ -203,7 +203,7 @@ class BumpAllocatorTest {
             Path tmp = Files.createTempFile("bump-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var bump = new BumpAllocator(arena, cs, BumpAllocator.DEFAULT_PAGE_SIZE);
             assertThrows(IllegalArgumentException.class, () -> bump.allocate(0));
             assertThrows(IllegalArgumentException.class, () -> bump.allocate(-1));
@@ -218,7 +218,7 @@ class BumpAllocatorTest {
             Path tmp = Files.createTempFile("bump-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             assertThrows(IllegalArgumentException.class,
                 () -> new BumpAllocator(arena, cs, 0));
         }
@@ -230,7 +230,7 @@ class BumpAllocatorTest {
             Path tmp = Files.createTempFile("bump-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             assertThrows(IllegalArgumentException.class,
                 () -> new BumpAllocator(arena, cs, -1));
         }
@@ -242,7 +242,7 @@ class BumpAllocatorTest {
             Path tmp = Files.createTempFile("bump-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var bump = new BumpAllocator(arena, cs, 4096);
             assertThrows(IllegalArgumentException.class,
                 () -> bump.allocate(-1));
@@ -257,7 +257,7 @@ class BumpAllocatorTest {
             Path tmp = Files.createTempFile("bump-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var bump = new BumpAllocator(arena, cs, 4096);
 
             assertEquals(0, bump.totalCommittedBytes());
@@ -284,7 +284,7 @@ class BumpAllocatorTest {
             Path tmp = Files.createTempFile("bump-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var bump = new BumpAllocator(arena, cs, 4096);
 
             assertEquals(0, bump.pageCount());
@@ -400,7 +400,7 @@ class BumpAllocatorTest {
             Path tmp = Files.createTempFile("bump-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var bump = new BumpAllocator(arena, cs, 4096);
 
             // Allocate many payloads across multiple 4096-byte pages
@@ -426,7 +426,7 @@ class BumpAllocatorTest {
             Path tmp = Files.createTempFile("bump-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var bump = new BumpAllocator(arena, cs, 4096);
 
             int threads = 4;

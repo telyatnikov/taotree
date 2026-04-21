@@ -141,4 +141,34 @@ public final class TaoKey {
         dst[pos++] = 0x00;
         return pos;
     }
+
+    /**
+     * Decode a null-terminated, escaped byte key back to a String.
+     *
+     * <p>Exact inverse of {@link #encodeString(String)}: un-escapes {@code [0x01, b]}
+     * sequences back to {@code b}, and stops at the unescaped {@code 0x00} terminator.
+     * Empty strings (encoded as a single {@code 0x00} byte) decode to {@code ""}.
+     *
+     * @param encoded the encoded key bytes (may be padded with trailing zeros)
+     * @return the decoded string (never null)
+     */
+    public static String decodeString(byte[] encoded) {
+        byte[] raw = new byte[encoded.length]; // upper bound
+        int pos = 0;
+        for (int i = 0; i < encoded.length; i++) {
+            byte b = encoded[i];
+            if (b == 0x01) {
+                // Escape byte — next byte is the original byte (0x00 or 0x01)
+                if (i + 1 < encoded.length) {
+                    raw[pos++] = encoded[++i];
+                }
+            } else if (b == 0x00) {
+                // Unescaped null terminator
+                break;
+            } else {
+                raw[pos++] = b;
+            }
+        }
+        return new String(raw, 0, pos, StandardCharsets.UTF_8);
+    }
 }

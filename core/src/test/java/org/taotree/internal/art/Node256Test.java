@@ -24,7 +24,7 @@ class Node256Test {
             Path tmp = Files.createTempFile("slab-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
@@ -54,7 +54,7 @@ class Node256Test {
             Path tmp = Files.createTempFile("slab-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
@@ -83,7 +83,7 @@ class Node256Test {
             Path tmp = Files.createTempFile("slab-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
@@ -113,7 +113,7 @@ class Node256Test {
             Path tmp = Files.createTempFile("slab-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
@@ -147,7 +147,7 @@ class Node256Test {
             Path tmp = Files.createTempFile("slab-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
@@ -174,7 +174,7 @@ class Node256Test {
             Path tmp = Files.createTempFile("slab-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             int prefixClassId = alloc.registerClass(NodeConstants.PREFIX_SIZE);
             int node4ClassId = alloc.registerClass(NodeConstants.NODE4_SIZE);
@@ -203,7 +203,7 @@ class Node256Test {
             Path tmp = Files.createTempFile("slab-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             alloc.registerClass(NodeConstants.PREFIX_SIZE);
             alloc.registerClass(NodeConstants.NODE4_SIZE);
@@ -230,7 +230,7 @@ class Node256Test {
             Path tmp = Files.createTempFile("slab-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             alloc.registerClass(NodeConstants.PREFIX_SIZE);
             alloc.registerClass(NodeConstants.NODE4_SIZE);
@@ -264,7 +264,7 @@ class Node256Test {
             Path tmp = Files.createTempFile("slab-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             alloc.registerClass(NodeConstants.PREFIX_SIZE);
             alloc.registerClass(NodeConstants.NODE4_SIZE);
@@ -295,7 +295,7 @@ class Node256Test {
             Path tmp = Files.createTempFile("slab-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             alloc.registerClass(NodeConstants.PREFIX_SIZE);
             alloc.registerClass(NodeConstants.NODE4_SIZE);
@@ -329,7 +329,7 @@ class Node256Test {
             Path tmp = Files.createTempFile("slab-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var alloc = new SlabAllocator(arena, cs, 64 * 1024);
             alloc.registerClass(NodeConstants.PREFIX_SIZE);
             alloc.registerClass(NodeConstants.NODE4_SIZE);

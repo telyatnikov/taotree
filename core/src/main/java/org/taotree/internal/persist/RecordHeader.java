@@ -10,7 +10,7 @@ import java.util.zip.CRC32C;
  * <p>Layout (all little-endian via {@code JAVA_*_UNALIGNED}):
  * <pre>
  * Offset  Size  Field
- * 0       8     magic (MAGIC_V2)
+ * 0       8     magic (MAGIC)
  * 8       4     majorVersion (2)
  * 12      4     minorVersion (0)
  * 16      4     recordType (0=checkpoint, 1=metadata_section, 2=wal_block, 3=commit_record)
@@ -32,15 +32,13 @@ public final class RecordHeader {
     private RecordHeader() {}
 
     /** "TAOTREE2" in little-endian. */
-    public static final long MAGIC_V2 = 0x3245455254_4F4154L;
+    public static final long MAGIC = 0x3245455254_4F4154L;
 
     public static final int MAJOR_VERSION = 2;
     public static final int MINOR_VERSION = 0;
 
     // Record types
     public static final int TYPE_CHECKPOINT      = 0;
-    public static final int TYPE_METADATA_SECTION = 1;
-    public static final int TYPE_WAL_BLOCK        = 2;
     public static final int TYPE_COMMIT_RECORD    = 3;
 
     public static final int HEADER_SIZE = 64;
@@ -80,7 +78,7 @@ public final class RecordHeader {
                              int recordType, int flags,
                              int payloadLength, long generation,
                              long recordId, int payloadCrc32c) {
-        seg.set(ValueLayout.JAVA_LONG_UNALIGNED, offset + OFF_MAGIC, MAGIC_V2);
+        seg.set(ValueLayout.JAVA_LONG_UNALIGNED, offset + OFF_MAGIC, MAGIC);
         seg.set(ValueLayout.JAVA_INT_UNALIGNED, offset + OFF_MAJOR_VERSION, MAJOR_VERSION);
         seg.set(ValueLayout.JAVA_INT_UNALIGNED, offset + OFF_MINOR_VERSION, MINOR_VERSION);
         seg.set(ValueLayout.JAVA_INT_UNALIGNED, offset + OFF_RECORD_TYPE, recordType);
@@ -113,7 +111,7 @@ public final class RecordHeader {
      */
     public static boolean validate(MemorySegment seg, long offset) {
         long magic = seg.get(ValueLayout.JAVA_LONG_UNALIGNED, offset + OFF_MAGIC);
-        if (magic != MAGIC_V2) {
+        if (magic != MAGIC) {
             return false;
         }
         int storedCrc = seg.get(ValueLayout.JAVA_INT_UNALIGNED, offset + OFF_HEADER_CRC);

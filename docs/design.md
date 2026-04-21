@@ -2,7 +2,53 @@
 
 **Name:** TaoTree (`org.taotree`)  
 **Status:** Draft  
-**Date:** 2026-04-02
+**Date:** 2026-04-02 (last revised 2026-04-20)
+
+> **2026-04-20 notice — design vs code.** The public API and on-disk format
+> diverged from this document during the temporal-unification refactor
+> (Phases 1–7). The code is the source of truth; this document is being
+> updated incrementally. Known pivots:
+>
+> 1. **TaoTree is always temporal.** There is no more user-defined
+>    `LeafLayout` / `LeafField` / `LeafHandle` / `LeafAccessor` /
+>    `ConflictResolver`. Those types are deleted from the public API.
+>    Sections that still describe a generic "data ART with structured leaf
+>    values" describe an earlier state — read them as historical context.
+> 2. **24-byte inline `EntityNode`, not 8-byte `EntityNodeRef` or 40-byte.** Each
+>    leaf of the global ART holds the full `EntityNode` struct directly; there
+>    is no indirection. Layout: `{current_state_root_ref, attr_art_root_ref,
+>    versions_art_root_ref}` — three 8-byte fields. An earlier draft of this
+>    doc described a 40-byte layout with archive/metadata refs — those
+>    fields were dropped in Phase 4 (they would only be populated by
+>    not-yet-designed archive tiers). See §18.3.
+> 3. **`Value` tagged union, not raw `byte[]`.** Attribute values are
+>    instances of `org.taotree.Value` (int / long / float / double / bool /
+>    string / bytes / json / null) and serialize through `ValueCodec` into
+>    a 16-byte slot or a bump-allocated overflow payload.
+> 4. **Checkpoint v3 with `FEATURE_INCOMPAT_UNIFIED_TEMPORAL = 0x0004`.**
+>    v2 files are rejected.
+> 5. **§18.12.3 compactor is aspirational.** The shipped `Compactor` walks
+>    only the outer ART; per-entity nested CHAMP / AttributeRuns ART /
+>    EntityVersions ART are not repacked and old slab nodes are not
+>    retired. This is a space + locality gap, not data loss —
+>    `CompactorSpaceReclaimTest` in `core/src/test/java/org/taotree/`
+>    encodes the empirical bound. Tracked as `p8-compactor-temporal`.
+> 6. **Rebase on conflict uses `TemporalOpLog`, not `MutationLog` segment
+>    copy.** See §0 "Concurrency model" below.
+> 7. **Schema fingerprint on reopen is implemented** (`SchemaBinding`
+>    section + `open(Path, KeyLayout)` verification + `open(Path)`
+>    self-describing reconstruction). Closes former `p8-schema-binding`.
+> 8. **`delete(kb, attr)` removes from CHAMP + writes a tombstone run.**
+>    Reads past a tombstone return "not found" until a later observation
+>    overrides it. Closes former `p8-tombstone-semantics`.
+> 9. **Same-logical-value writes extend a run's `last_seen` instead of
+>    allocating a new AttributeRun / EntityVersion / CHAMP root.** The
+>    public `Value` write path allocates a fresh encoded slot per call, so
+>    the writer detects duplicates via `ValueCodec.slotEquals` (byte-level
+>    comparison of slot contents), not pointer equality. Raw-API callers
+>    of `putTemporal(byte[], int, long, long)` must pass refs produced by
+>    `ValueCodec.encodeStandalone` — opaque synthetic longs alias into
+>    bump-page bytes and are not supported.
 
 ---
 
@@ -16,70 +62,100 @@
 | `BumpAllocator` | Done | Bump allocator for variable-length immutable payloads, file-backed via `ChunkStore` |
 | `NodePtr` / `OverflowPtr` | Done | 64-bit tagged swizzled pointer encoding |
 | Node types (4/16/48/256/PrefixNode) | Done | Static operations on off-heap `MemorySegment` slices |
-| `TaoTree` core (lookup/insert/delete) | Done | Fixed-width keys, pessimistic prefix compression, zero-initialized leaf values |
-| `TaoTree` owns infrastructure | Done | Owns `ChunkStore`, allocators, node class IDs, `ReentrantReadWriteLock` + `commitLock` |
+| `TaoTree` core (lookup/insert/delete) | Done | Fixed-width keys, pessimistic prefix compression |
+| `TaoTree` owns infrastructure | Done | Owns `ChunkStore`, allocators, node class IDs, locks |
 | `TaoTree.ReadScope` / `TaoTree.WriteScope` | Done | Epoch-based lock-free reads; optimistic COW writes with deferred commit |
-| `LeafField` / `LeafLayout` / `LeafHandle` | Done | Typed leaf schema with pre-computed offsets and compile-time type safety |
-| `LeafAccessor` / `LeafVisitor` | Done | Typed read/write access to leaf values; boolean-returning visitor for scan |
+| `KeyField` / `KeyLayout` / `KeyHandle` / `KeyBuilder` | Done | Compound-key schema + typed accessors |
 | `QueryBuilder` | Done | Resolve-only key builder (lock-free); unknown dict values → empty scan |
-| `ConflictResolver` | Done | Pluggable merge strategy for deferred-commit rebase conflicts |
 | `TaoDictionary` | Done | Self-locking string→int dictionary (fixed padded keys, 128B max) |
 | `TaoKey` | Done | Binary-comparable encoding for u8-u64, i8-i64, strings |
-| `TaoString` | Done | 16-byte inline/overflow string representation |
-| `KeyField` / `KeyLayout` / `KeyBuilder` | Done | Compound key definition and encoding |
-| Scan / prefix scan | Done | `forEach(visitor)`, `scan(qb, handle, visitor)` with ordered traversal and early termination |
-| COW + epoch reclamation | Done | `CowEngine`, `CowInsert`, `CowDelete`, `CowNodeOps`, `EpochReclaimer`, `Compactor` |
-| File-backed persistence | Done | `ChunkStore` + v2 checkpoint (mirrored A/B slots, CRC-32C, shadow paging) |
-| Compaction | Done | `tree.compact()` — post-order arena→slab migration, checkpoint, epoch reclamation |
-| JMH benchmarks | Done | ART lookup/insert, dictionary resolve throughput |
-| GBIF species tracker example | Done | Reads Parquet, 7 dict-encoded key fields, 13 verified leaf fields |
-| Fray concurrency testing | Done | Controlled schedule-point testing for race conditions (JDK 25, Fray 0.8.3) |
-| Lincheck linearizability tests | Done | Stress-based linearizability verification against sequential spec |
+| `Value` / `ValueCodec` | Done | Tagged union (9 variants); 12 B inline, overflow to bump |
+| Temporal layer (§18) | Done | `EntityNode`, `AttributeRuns` ART, `EntityVersions` ART, `ChampMap`, `TemporalWriter`, `TemporalReader`; unified always-temporal public API (`put`/`getAt`/`history`/...) |
+| Scan / prefix scan | Done | `forEach(EntityVisitor)`, `scan(qb, handle, EntityVisitor)` over entity keys |
+| COW + epoch reclamation | Done | `CowEngine`, `CowInsert`, `CowDelete`, `CowNodeOps`, `EpochReclaimer` |
+| Rebase-on-conflict via `TemporalOpLog` | Done | Per-scope op log replayed against the new root on publish conflict |
+| File-backed persistence | Done | `ChunkStore` + checkpoint v3 (mirrored A/B slots, CRC-32C, shadow paging) |
+| Compaction (outer ART) | Partial | Post-order repack of outer ART; nested per-entity structures not yet recompacted (see pivot #5 above) |
+| JMH benchmarks | Partial | Present; not yet rewritten for unified `Value`/`put` API |
+| GBIF species tracker example | Partial | Present; not yet rewritten for unified API |
+| Fray concurrency testing | Done | Schedule-point testing (JDK 25, Fray 0.8.3) |
+| Lincheck linearizability tests | Done | Stress-based linearizability verification |
+
+### Removed in Phase 4 (temporal unification)
+
+| Type | Replacement |
+|---|---|
+| `LeafField` / `LeafLayout` / `LeafHandle` | — (leaves are now the internal 40-byte `EntityNode`) |
+| `LeafAccessor` / `LeafVisitor` | `EntityVisitor` + `r.get(...)` / `r.getAll(...)` |
+| `ExtrasReader` / `ExtrasWriter` | `Value.ofJson(...)` stored as any attribute |
+| `ConflictResolver` | Per-scope `TemporalOpLog` replay (not user-pluggable) |
+| `TaoTree.create(Path, KeyLayout, LeafLayout)` and raw `create(Path, int, int)` factories | `TaoTree.create(Path, KeyLayout)` |
+| `createTemporal` / `openTemporal` / `forDictionaries` | Folded into the primary `create` / `open` |
 
 ### Concurrency model
 
-ROWEX (Read-Optimistic Write-EXclusive) model:
+ROWEX (Read-Optimistic Write-EXclusive):
 
-- **Readers** are lock-free. `ReadScope` captures a `PublicationState` (root + size atomically)
-  via `VarHandle.getAcquire` and enters an epoch. Readers never block on writers.
-- **Writers** perform optimistic COW outside any lock on the first mutation, then acquire a
-  lightweight `commitLock` to publish the new root. On conflict (another writer published during
-  COW), one redo against the new root is attempted (bounded single retry).
-- **Persistence** operations (`sync()`/`compact()`/`close()`) acquire the global `writeLock`
-  then `commitLock` (lock ordering: writeLock → commitLock) for exclusive file I/O coordination.
+- **Readers** are lock-free. `ReadScope` captures a `PublicationState` (root + size atomically) via `VarHandle.getAcquire` and enters an epoch. Readers never block on writers.
+- **Writers** perform optimistic COW outside any lock on the first mutation, then acquire a lightweight `commitLock` to publish the new root. On conflict (another writer published during COW), one bounded redo against the new root is attempted.
+- **Rebase on conflict (temporal trees):** each logical write is recorded in a per-scope `TemporalOpLog` (kind ∈ {PUT, DELETE_ATTR}, entityKey, attrId, valueRef, ts). On rebase, the scope's ops are replayed against the newly-published root — each op force-copies the entity leaf under the new root (picking up any other writer's `EntityNode` merges) and re-applies the temporal write via `TemporalWriter.write` / `ChampMap.remove`. Non-temporal child trees (dictionaries) use the legacy `MutationLog` segment-copy path.
+- **Persistence** operations (`sync()`/`compact()`/`close()`) acquire the global `writeLock` then `commitLock` (ordering: `writeLock → commitLock`).
 - **Dictionaries** (`TaoDictionary`) are self-locking (own lock for `intern`, lock-free for `resolve`).
-- **Epoch reclamation** (`EpochReclaimer`) defers freeing of COW-replaced nodes until all readers
-  that could see the old root have exited. Child trees share the parent's reclaimer.
+- **Epoch reclamation** (`EpochReclaimer`) defers freeing of COW-replaced nodes until all readers that could see the old root have exited. Child trees share the parent's reclaimer.
 
 ### Future work (not yet implemented)
 
-| Feature | Notes |
+| Feature | Tracking |
 |---|---|
-| Builder API for ART | Currently uses constructor directly |
+| `p8-compactor-temporal` — recursive per-entity recompaction + retire of old slab nodes (P2) | plan.md Phase 8 |
 | `LEAF_INLINE` | Inline small leaf values in the `NodePtr` payload |
-| Variable-length ART keys | Current implementation uses fixed-width keys only; dictionary ARTs pad strings to 128B |
-| Configurable `prefixCapacity` | Hardcoded to 15 (fits in 24B prefix node) |
-| Reserved-range dictionary APIs | `TaoDictionary.u32WithReserved()` for pre-assigned codes |
+| Configurable `prefixCapacity` | Hardcoded to 15 (fits in 24B prefix node); variable-length prefix nodes planned |
+| Reserved-range dictionary APIs | `TaoDictionary.u32WithReserved()` |
 | Persistence: WAL | Write-ahead log for crash recovery |
+| `ImmutableTaoTree.freeze()` | Cold store; see §18.14 |
+| HINT index / `scanOverlap` | Hierarchical interval indexing; see §18.15 |
+| Archive manifests / cold stubs | See §18.13 |
+
+### Recently closed
+
+| Item | Landed in |
+|---|---|
+| `p8-schema-binding` — `KeyLayout` fingerprint in `SECTION_SCHEMA_BINDING`, fail-fast on reopen mismatch | `SchemaBinding` + `TaoTree.open` |
+| `p8-tombstone-semantics` — explicit tombstone `AttributeRun` for `delete(kb, attr)` | `AttributeRun.TOMBSTONE_VALUE_REF` + readers |
+| `p8-value-canonicalization` — byte-level `ValueCodec.slotEquals`, canonical `effectiveValueRef` in `AttrUpsertResult`, fail-fast validation on raw `putTemporal` | `ValueCanonicalizationTest` |
+| `p8-split-taotree` — extract `WriteScopeOps` + `ArtRead` from the 3k-line `TaoTree.java` | `WriteScopeOps` / `ArtRead` |
+| `p8-champ-iterate-perf` — `ChampMap.iterateRec` reads directly from `BumpAllocator.page()` | 6× iterate speedup |
+| `p8-examples` / `p8-perf` | GBIF rewrite + JMH baseline suite in `performance/` |
 
 ---
 
 ## 1. Abstract
 
-This document specifies the design of a general-purpose Adaptive Radix Tree (ART) library
-implemented entirely in Java using the Foreign Function & Memory (FFM) API. All data structures
-live off-heap in `MemorySegment`-backed slab allocators. There is no reliance on Java object
-headers, garbage collection, or heap allocation on the hot path.
+This document specifies the design of TaoTree: a file-backed, always-temporal
+entity store implemented entirely in Java using the Foreign Function & Memory
+(FFM) API. All data structures live off-heap in `MemorySegment`-backed slab
+and bump allocators. There is no reliance on Java object headers, garbage
+collection, or heap allocation on the hot path.
 
-The library is designed to serve two roles within a single codebase:
+> **Historical note.** Earlier revisions of this document described a
+> general-purpose ART library with user-defined `LeafLayout` leaves. That
+> surface was removed in the Phase 4 temporal-unification refactor. The ART
+> node types (`Node4/16/48/256`, `PrefixNode`) are still the internal index
+> structure, but they are not part of the public API — they now index entities
+> whose values are versioned attributes, addressed via the temporal API
+> described in §18.
 
-1. **Data ART** — high-cardinality index with fixed-width compound keys and structured leaf values
-   (e.g., per-record observation state in the GBIF species tracker).
-2. **TaoDictionary ART** — low-cardinality string-to-integer mapping with variable-length keys and
-   small fixed-width leaf values (e.g., taxonomy, geography, and field-name dictionaries).
+Internally, the same ART core serves two roles:
 
-Both roles use the same ART core, the same node types, and the same slab allocator. Only the
-key encoding and leaf size differ per instance.
+1. **Global entity ART** — high-cardinality index with fixed-width compound
+   keys (declared by `KeyLayout`) whose leaves are 40-byte `EntityNode`
+   structs.
+2. **TaoDictionary ART** — low-cardinality string-to-integer mapping with
+   variable-length keys, used for `KeyField.dict16`/`dict32` and attribute
+   names.
+
+Both roles use the same ART core, the same node types, and the same slab
+allocator. Only the key encoding and leaf size differ per instance.
 
 ---
 
@@ -119,7 +195,7 @@ key encoding and leaf size differ per instance.
 ┌───────────────────────▼──────────────────────────────────────┐
 │                    ART Core (byte-level)                     │
 │   Node4 / Node16 / Node48 / Node256 / PrefixNode    │
-│   Supports both fixed-width and variable-length keys         │
+│   Fixed-width keys (length known at construction time)       │
 │   Returns leaf references (swizzled tagged pointers)         │
 └───────────────────────┬──────────────────────────────────────┘
                         │ allocates / dereferences nodes and leaves
@@ -1723,3 +1799,1540 @@ Implementation should proceed in this order:
 9. GBIF species tracker (benchmark application)
    └─ depends on all of the above
 ```
+
+10. CHAMP persistent map (off-heap)
+    └─ depends on SlabAllocator, BumpAllocator, EpochReclaimer
+
+11. TaoTree v3 (temporal layer: EntityNode, AttributeRuns, EntityVersions)
+    └─ depends on CHAMP, ART core, TaoDictionary, CowEngine
+
+12. ImmutableTaoTree (cold store)
+    └─ depends on TaoTree v3
+
+
+---
+
+## 18. Temporal Store
+
+### 18.1 Design rationale
+
+TaoTree v3 is a **temporal entity store**. The public class `TaoTree` provides the
+temporal API (put, latest, at, history). Internally, it uses a **two-layer entity-local
+temporal architecture**: a global ART routes compound keys to per-entity aggregate roots,
+each of which owns independent temporal indexes and immutable state snapshots.
+
+**Two layers:**
+
+1. **Global ART** — routes `(tenant, type, object)` prefixes to `EntityNode` pointers
+2. **Entity-local structures** — per-entity ART indexes (AttributeRuns, EntityVersions) and
+   CHAMP persistent snapshot maps, all reachable from the `EntityNode`
+
+**Why two layers instead of flat ART keys?**
+
+Putting timestamps and attribute IDs in the global ART key (e.g.,
+`[prefix | attr | invertedFirstSeen]`) creates problems:
+
+1. **Changing `last_seen` requires delete + reinsert** — it's in the key, so any timestamp
+   update is a structural trie mutation (two full COW paths).
+2. **"All attributes at time T" requires a full scan** — timestamps are at the end of the key,
+   so there is no prefix that selects "all attributes for entity X at time T." The CHAMP
+   snapshot map solves this: one predecessor search → one CHAMP iteration.
+3. **Multiple access patterns need multiple key orders** — entity-first for history,
+   time-first for overlap queries. One trie can't serve both efficiently.
+
+The entity-local design solves all three: `last_seen` updates are leaf-value mutations
+(no key change), `allFieldsAt(T)` is one predecessor search in EntityVersions + one CHAMP
+iteration, and alternative access patterns (HINT) can be added as a separate index.
+
+**Why not a monolithic block per entity?**
+
+An earlier design stored all of an entity's temporal data in a single contiguous block
+(field directory + segment arrays). This is simple but scales poorly:
+
+1. **Full block copy on any mutation** — changing one attribute requires copying all attributes.
+   For entities with 13 attributes and 26 runs, that's ~1 KB per `put()`.
+2. **No independent attribute access** — reading one attribute requires resolving the entire block.
+3. **No structural sharing** — two adjacent EntityVersions that differ in a single attribute
+   must each store a complete copy of all attribute values.
+
+The CHAMP snapshot map provides O(1) structural sharing: updating one attribute creates a
+new root, sharing most nodes with the previous snapshot. Two adjacent EntityVersions that
+differ in one attribute share all CHAMP nodes except the path to the changed entry.
+
+**Why separate AttributeRuns and EntityVersions?**
+
+AttributeRuns are the **canonical source of truth** — they record exactly what each attribute
+reported and when. EntityVersions are a **materialized read index** — they cache the
+full entity state at each state-change boundary for efficient time-travel queries.
+
+This separation is critical because:
+
+1. **`last_seen` updates are common and cheap.** An attribute reporting the same value only
+   extends `last_seen` in its AttributeRun. This does NOT create a new EntityVersion,
+   avoiding version explosion.
+2. **Late inserts have bounded impact.** A late-arriving attribute reading affects only the
+   local window of that attribute's history. The affected-window algorithm (§18.10) rewrites
+   only the EntityVersions whose state actually changed.
+3. **EntityVersions are reconstructible.** If EntityVersions are lost (cold tier eviction,
+   corruption), they can be rebuilt from AttributeRuns by replaying attribute events in order.
+
+### 18.2 Architecture
+
+```
++----------------------------------------------------------------------+
+|                       TaoTree (public API)                            |
+|                                                                       |
+|  +----------------------------------------------------------------+  |
+|  |  Global ART (CowEngine #1)                                     |  |
+|  |  key: (tenant, type, object) via KeyLayout                     |  |
+|  |  leaf value: 8B EntityNodeRef (slab pointer)                   |  |
+|  +--------+-------------------------------------------------------+  |
+|           |                                                           |
+|           v                                                           |
+|  +----------------------------------------------------------------+  |
+|  |  EntityNode (40B, fixed-size slab allocation)                  |  |
+|  |                                                                 |  |
+|  |  current_state_root_ref ──> CHAMP (latest full snapshot)       |  |
+|  |  attr_art_root_ref ────> AttributeRuns ART (CowEngine #2)      |  |
+|  |  versions_art_root_ref ──> EntityVersions ART (CowEngine #3)  |  |
+|  |  archive_manifest_ref ──> cold storage manifest                |  |
+|  |  metadata_ref ───────────> policy / TTL metadata               |  |
+|  +--------+---+---+------------------------------------------+---+  |
+|           |   |   |                                           |      |
+|     +-----+   |   +-----+                              +-----+      |
+|     v         v         v                              v             |
+|  +-------+ +--------+ +--------+            +-----------------+      |
+|  | CHAMP | | Attr   | | Entity |            | Archive         |      |
+|  | Map   | | Runs   | |Versions|            | Manifest        |      |
+|  |       | | ART    | | ART    |            | (cold tier)     |      |
+|  +-------+ +--------+ +--------+            +-----------------+      |
+|  attr_id  key:12B    key:8B                                        |
+|  -> value   (sid+fs)   (first_seen)                                  |
+|     _ref    leaf:24B   leaf:16B                                      |
+|             (SRun)     (ObjVer)                                      |
+|                                                                       |
+|  +----------------------------------------------------------------+  |
+|  |  TaoDictionary: attribute names -> uint32 codes                   |  |
+|  +----------------------------------------------------------------+  |
+|  +----------------------------------------------------------------+  |
+|  |  Shared infrastructure:                                         |  |
+|  |    ChunkStore (mmap'd pages via FFM)                            |  |
+|  |    SlabAllocator (ART nodes, EntityNodes, CHAMP inner nodes)    |  |
+|  |    BumpAllocator (CHAMP entry arrays, value payloads)           |  |
+|  |    EpochReclaimer (unified across all CowEngines + CHAMP)       |  |
+|  +----------------------------------------------------------------+  |
++----------------------------------------------------------------------+
+```
+
+**Data flow summary:**
+
+- **Write** mutates AttributeRuns ART, conditionally updates EntityVersions ART and CHAMP
+  maps, writes new EntityNode, publishes via global ART COW.
+- **`latest()`** reads EntityNode → `current_state_root` → CHAMP `get(attr_id)`.
+  No ART traversal of EntityVersions needed.
+- **`at(T)`** reads EntityNode → predecessor in EntityVersions ART → CHAMP
+  `get(attr_id)` from the version's `state_root_ref`.
+- **`history(attribute)`** reads EntityNode → prefix scan in AttributeRuns ART for
+  `[attr_id | *]`.
+
+### 18.3 EntityNode layout
+
+The `EntityNode` is the **aggregate root** for each tracked entity. It is stored
+inline as the leaf value of the global ART (i.e., the `(KeyLen + 24)`-byte leaf
+slab slot holds the key bytes followed by the EntityNode struct). There is no
+indirection through an `EntityNodeRef`.
+
+**EntityNode (24 bytes, inline in global-ART leaf slot):**
+
+```
+Offset  Size  Field                    Description
+------  ----  -----------------------  -------------------------------------------
+0       8     current_state_root_ref   CHAMP root: latest full entity state
+8       8     attr_art_root_ref        Per-entity AttributeRuns ART root (NodePtr)
+16      8     versions_art_root_ref    Per-entity EntityVersions ART root (NodePtr)
+```
+
+**Total: 24 bytes.** An earlier draft reserved two additional 8-byte fields
+(`archive_manifest_ref`, `metadata_ref`) for cold-tier archiving and
+per-entity policy metadata — both tiers were deferred to a future phase
+and the fields were dropped in Phase 4. If/when those tiers are
+revived, adding fields extends the leaf slab class by 8 bytes each and
+requires a checkpoint format bump.
+
+**Semantics:**
+
+- `current_state_root_ref` is a CHAMP node pointer (§18.6). It represents the latest
+  complete state of the entity — a map from `attr_id` (uint32) to `value_ref` (8 bytes).
+  This is the fast path for `latest()` queries.
+- `attr_art_root_ref` is a `NodePtr` to the root of this entity's AttributeRuns ART.
+  `NodePtr.EMPTY_PTR` (0) means no attribute data has been recorded.
+- `versions_art_root_ref` is a `NodePtr` to the root of this entity's EntityVersions ART.
+  `NodePtr.EMPTY_PTR` means no materialized versions exist (newly created entity or
+  cold-evicted).
+- `archive_manifest_ref` points to a cold-tier manifest (§18.13). Zero when the entity
+  has no archived data.
+- `metadata_ref` is reserved for per-entity policy (TTL, correction horizon override).
+  Zero when default policy applies.
+
+**Global ART leaf value (8 bytes):**
+
+```
+Offset  Size  Field
+------  ----  ---------------
+0       8     EntityNodeRef (long, slab pointer to EntityNode)
+```
+
+When `EntityNodeRef == 0`, the entity has been tombstoned or not yet initialized.
+
+### 18.4 AttributeRuns layout and invariants
+
+AttributeRuns are the **canonical write layer** — the source of truth for all temporal
+data. Each AttributeRun records a contiguous time interval during which an attribute reported
+a specific value.
+
+**AttributeRuns ART key (12 bytes):**
+
+```
+Offset  Size  Field
+------  ----  ---------------
+0       4     attr_id (uint32, big-endian, from TaoDictionary)
+4       8     first_seen (int64, big-endian, epoch milliseconds)
+```
+
+The key is ordered `(attr_id, first_seen)`. This enables:
+- Prefix scan with `[attr_id | *]` for all runs of a given attribute
+- Predecessor search with `[attr_id | T]` for the run covering time T
+
+**AttributeRun leaf value (24 bytes):**
+
+```
+Offset  Size  Field
+------  ----  ---------------
+0       8     last_seen (int64, epoch milliseconds)
+8       8     valid_to (int64, epoch milliseconds; Long.MAX_VALUE = open-ended)
+16      8     value_ref (long, pointer to value payload in BumpAllocator)
+```
+
+**Total leaf per entry:** 12B key + 24B value = 36 bytes (slab-allocated, aligned to
+40 or 48 bytes depending on slab class granularity).
+
+**Field semantics:**
+
+- `first_seen` (in key): earliest timestamp at which this attribute reported this value.
+- `last_seen`: latest timestamp at which this attribute confirmed this value. Updated
+  in-place (on a COW'd copy) without creating a new EntityVersion.
+- `valid_to`: the timestamp at which this run's validity ends. For the latest run of a
+  attribute, `valid_to = Long.MAX_VALUE` (open-ended). For historical runs,
+  `valid_to = next_run.first_seen - 1`. This field enables efficient interval queries
+  and is maintained by the write path during insert/split/merge.
+- `value_ref`: pointer to the value payload. Values are stored in the `BumpAllocator`
+  as length-prefixed byte arrays. Two runs with equal values share the same `value_ref`
+  (pointer equality is sufficient for deduplication).
+
+**Invariants (enforced by the write path, verified by tests):**
+
+1. **Sorted by `first_seen`**: within each attribute, runs are ordered by ascending
+   `first_seen`. The ART key ordering guarantees this automatically.
+2. **Non-overlapping per attribute**: for any two runs R1, R2 of the same attribute where
+   `R1.first_seen < R2.first_seen`, it holds that `R1.valid_to < R2.first_seen`.
+3. **Adjacent equal values merged**: if an insert would create two adjacent runs with
+   the same `value_ref` for the same attribute, they are merged into a single run spanning
+   both intervals. This prevents unbounded run proliferation.
+4. **`valid_to` consistency**: for consecutive runs R1, R2 of the same attribute,
+   `R1.valid_to = R2.first_seen - 1`. The last run of an attribute has
+   `valid_to = Long.MAX_VALUE`.
+
+### 18.5 EntityVersions layout and invariants
+
+EntityVersions are a **materialized read index** derived from AttributeRuns. Each
+EntityVersion records a point in time at which the aggregate entity state changed,
+together with a CHAMP snapshot of the full state at that point.
+
+**EntityVersions ART key (8 bytes):**
+
+```
+Offset  Size  Field
+------  ----  ---------------
+0       8     first_seen (int64, big-endian, epoch milliseconds)
+```
+
+**EntityVersion leaf value (16 bytes):**
+
+```
+Offset  Size  Field
+------  ----  ---------------
+0       8     valid_to (int64, epoch milliseconds; Long.MAX_VALUE = open-ended)
+8       8     state_root_ref (long, CHAMP node pointer to full state snapshot)
+```
+
+**Total leaf per entry:** 8B key + 16B value = 24 bytes.
+
+**Semantics:**
+
+- An EntityVersion is created **only** when a attribute value change alters the aggregate
+  entity state. Specifically, when a `put()` for attribute S at time T introduces a new
+  value (not just a `last_seen` extension), and this changes what `allFieldsAt(T)` would
+  return, a new EntityVersion is created (or an existing one is updated).
+- `state_root_ref` points to a CHAMP persistent map (§18.6) containing the full
+  `attr_id → value_ref` mapping at this point in time. Thanks to structural sharing,
+  adjacent EntityVersions that differ in a single attribute share all CHAMP nodes except
+  the path to the changed entry.
+- `valid_to` follows the same convention as AttributeRuns: `Long.MAX_VALUE` for the latest
+  version, `next_version.first_seen - 1` for historical versions.
+
+**EntityVersions do NOT store:**
+
+- `last_seen` per attribute (stored in AttributeRuns only — prevents version explosion)
+- Attribute-level metadata (which attribute triggered the version change)
+- Undated/undetermined state (see §18.11 for handling)
+
+**Invariants:**
+
+1. **Sorted by `first_seen`**: the ART key ordering guarantees this.
+2. **Non-overlapping**: consecutive versions have non-overlapping validity intervals.
+3. **No duplicate state**: adjacent EntityVersions with identical `state_root_ref` are
+   merged. Since CHAMP maps are canonical (§18.6), pointer equality of roots implies
+   content equality.
+4. **Derivable from AttributeRuns**: EntityVersions can always be rebuilt by replaying all
+   AttributeRuns in `first_seen` order and materializing a new CHAMP snapshot at each
+   state-change boundary.
+
+### 18.6 CHAMP persistent snapshot map
+
+The CHAMP (Compressed Hash-Array Mapped Prefix-tree) provides immutable, structurally
+shared maps from `attr_id` (uint32) to `value_ref` (8 bytes). It is based on
+Steindorfer's thesis (*Efficient Immutable Collections*, 2017) adapted for off-heap
+storage via FFM.
+
+#### 18.6.1 Design overview
+
+CHAMP is a hash-trie where the hash of the key determines the path through the tree.
+For a 32-bit `attr_id`, the hash is the identity function (attribute IDs are already
+well-distributed dictionary codes). The 32-bit hash is consumed 5 bits at a time,
+giving a maximum depth of 7 levels (5 × 7 = 35 > 32).
+
+Each inner node contains two 32-bit bitmaps (`dataMap` and `nodeMap`) that indicate
+which of the 32 positions at this level contain inline data entries vs. child node
+pointers. Entries and child pointers are packed contiguously in a single array,
+eliminating null slots.
+
+**Key properties:**
+
+- **Canonical form**: for any given logical map content, there is exactly one CHAMP
+  tree structure. This enables pointer equality as a content equality test.
+- **Structural sharing**: `put()` creates a new root and copies only the nodes on the
+  path from root to the affected leaf. All other nodes are shared with the old tree.
+- **Compact**: no null slots in arrays. A node with 3 data entries and 2 child pointers
+  uses exactly `8B header + 3×12B data + 2×8B children = 60B`.
+
+#### 18.6.2 Node layout (off-heap)
+
+**CHAMP inner node (variable-size, BumpAllocator):**
+
+```
+Offset  Size           Field
+------  -------------  ------
+0       4              dataMap (uint32 bitmap: which positions have inline data)
+4       4              nodeMap (uint32 bitmap: which positions have child pointers)
+8       12 × D         data entries [D = popcount(dataMap)]
+                         each: [attr_id:4B | value_ref:8B]
+8+12D   8 × C          child node pointers [C = popcount(nodeMap)]
+                         each: 8B CHAMP node pointer (BumpAllocator OverflowPtr)
+```
+
+**Total node size:** `8 + 12×D + 8×C` bytes, where D = data entry count, C = child count.
+
+Maximum node size: `8 + 12×32 + 8×32 = 648B` (all 32 positions occupied — extremely
+rare in practice).
+
+Typical node size: `8 + 12×4 + 8×2 = 72B` (4 data entries, 2 children — common at
+interior levels).
+
+**CHAMP collision node (for hash collisions at max depth):**
+
+```
+Offset  Size           Field
+------  -------------  ------
+0       4              count (uint32, number of entries)
+4       4              reserved (0)
+8       12 × count     data entries [attr_id:4B | value_ref:8B]
+```
+
+At depth 7, if two attribute IDs have the same 32-bit hash (identity, so this means the
+same attr_id — which is impossible for distinct keys), a collision node is used. In
+practice, since `attr_id` IS the hash, collisions cannot occur and this node type
+exists only for correctness at the algorithmic level.
+
+#### 18.6.3 Hash function and trie path
+
+```
+hash(attr_id) = attr_id    // identity — dictionary codes are sequential uint32
+
+level 0: bits [0..4]   → index 0..31
+level 1: bits [5..9]   → index 0..31
+level 2: bits [10..14] → index 0..31
+level 3: bits [15..19] → index 0..31
+level 4: bits [20..24] → index 0..31
+level 5: bits [25..29] → index 0..31
+level 6: bits [30..31] → index 0..3 (2 bits remaining)
+```
+
+```
+indexAtLevel(hash, level):
+  shift = level * 5
+  return (hash >>> shift) & 0x1F    // 5-bit mask, except level 6 uses 0x03
+```
+
+For typical attribute counts (tens to low hundreds), most maps fit in 1–2 levels. A map
+with 32 attributes where all hash to different level-0 positions is a single root node
+with 32 inline entries (8 + 12×32 = 392 bytes).
+
+#### 18.6.4 Operations
+
+**`get(root, attr_id) → value_ref`:**
+
+```
+get(node, attr_id):
+  hash = attr_id
+  for level = 0 to 6:
+    idx = indexAtLevel(hash, level)
+    bit = 1 << idx
+
+    if (node.dataMap & bit) != 0:
+      // Inline data at this position
+      dataIndex = popcount(node.dataMap & (bit - 1))
+      entry = node.data[dataIndex]
+      if entry.attr_id == attr_id:
+        return entry.value_ref
+      else:
+        return NOT_FOUND    // hash prefix matches but key differs
+
+    if (node.nodeMap & bit) != 0:
+      // Child node at this position
+      childIndex = popcount(node.nodeMap & (bit - 1))
+      node = resolve(node.children[childIndex])
+      continue
+
+    return NOT_FOUND    // position empty
+
+  // Reached max depth — check collision node
+  return linearSearch(node, attr_id)
+```
+
+**`put(root, attr_id, value_ref) → new_root`:**
+
+```
+put(node, attr_id, value_ref, level):
+  idx = indexAtLevel(attr_id, level)
+  bit = 1 << idx
+
+  if (node.dataMap & bit) != 0:
+    dataIndex = popcount(node.dataMap & (bit - 1))
+    existing = node.data[dataIndex]
+    if existing.attr_id == attr_id:
+      if existing.value_ref == value_ref:
+        return node    // no change — preserve identity
+      // Replace value: copy node with updated entry
+      newNode = copyNode(node)
+      newNode.data[dataIndex].value_ref = value_ref
+      return allocate(newNode)
+
+    // Hash collision at this level — push both entries down one level
+    subNode = put(emptyNode(), existing.attr_id, existing.value_ref, level + 1)
+    subNode = put(subNode, attr_id, value_ref, level + 1)
+    // Replace inline data with child pointer
+    newNode = copyNodeWithDataRemovedAndChildAdded(node, dataIndex, bit, subNode)
+    return allocate(newNode)
+
+  if (node.nodeMap & bit) != 0:
+    childIndex = popcount(node.nodeMap & (bit - 1))
+    oldChild = resolve(node.children[childIndex])
+    newChild = put(oldChild, attr_id, value_ref, level + 1)
+    if newChild == oldChild:
+      return node    // no change in subtree
+    newNode = copyNode(node)
+    newNode.children[childIndex] = newChild
+    return allocate(newNode)
+
+  // Empty position — insert inline data
+  newNode = copyNodeWithDataAdded(node, bit, attr_id, value_ref)
+  return allocate(newNode)
+```
+
+**`remove(root, attr_id) → new_root`:**
+
+```
+remove(node, attr_id, level):
+  idx = indexAtLevel(attr_id, level)
+  bit = 1 << idx
+
+  if (node.dataMap & bit) != 0:
+    dataIndex = popcount(node.dataMap & (bit - 1))
+    if node.data[dataIndex].attr_id != attr_id:
+      return node    // key not present
+    // Remove inline data entry
+    newNode = copyNodeWithDataRemoved(node, dataIndex, bit)
+    return allocate(newNode)
+
+  if (node.nodeMap & bit) != 0:
+    childIndex = popcount(node.nodeMap & (bit - 1))
+    oldChild = resolve(node.children[childIndex])
+    newChild = remove(oldChild, attr_id, level + 1)
+    if newChild == oldChild:
+      return node    // key not found in subtree
+    if isEmpty(newChild):
+      newNode = copyNodeWithChildRemoved(node, childIndex, bit)
+      return allocate(newNode)
+    if isSingleton(newChild):
+      // Inline the single remaining entry (CHAMP compaction rule)
+      entry = singleEntry(newChild)
+      newNode = copyNodeWithChildReplacedByData(node, childIndex, bit, entry)
+      return allocate(newNode)
+    newNode = copyNode(node)
+    newNode.children[childIndex] = newChild
+    return allocate(newNode)
+
+  return node    // position empty, key not present
+```
+
+**`iterate(root, visitor)`:**
+
+```
+iterate(node, visitor):
+  // Visit inline data entries first (in bitmap order for determinism)
+  for i = 0 to popcount(node.dataMap) - 1:
+    if !visitor.visit(node.data[i].attr_id, node.data[i].value_ref):
+      return false    // early termination
+  // Recurse into child nodes
+  for i = 0 to popcount(node.nodeMap) - 1:
+    child = resolve(node.children[i])
+    if !iterate(child, visitor):
+      return false
+  return true
+```
+
+#### 18.6.5 Structural sharing mechanics
+
+When `put()` updates one attribute, only nodes on the root-to-entry path are copied:
+
+```
+Before put(attr_42, new_value):         After put:
+
+    root_A                                    root_B (new)
+   / | \                                    / | \
+  n1  n2  n3                              n1  n2' n3
+      |                                       |
+      n4                                      n4' (new)
+     / \                                     / \
+   e42  e99                               e42' e99
+                                          (new)
+
+Shared nodes: n1, n3, e99 (not copied)
+New nodes: root_B, n2', n4', e42' (4 allocations)
+```
+
+For a map with S attributes, the copy cost per `put()` is O(log₃₂ S) nodes — at most 7
+for any uint32 key space. In practice, with S < 100 attributes, most maps are 1–2 levels
+deep, so a `put()` copies 1–2 nodes.
+
+#### 18.6.6 Allocation and reclamation
+
+- **Inner nodes**: allocated in the `BumpAllocator` (variable-size, append-only).
+  Each `put()` or `remove()` allocates new nodes for the modified path.
+- **Reclamation**: CHAMP nodes are immutable once published. Old nodes (replaced by
+  `put()`/`remove()`) are retired via the shared `EpochReclaimer`. When all readers
+  that could see the old root have exited their epoch, the old nodes become reclaimable.
+- **No reference counting**: structural sharing means a single node may be reachable
+  from multiple CHAMP roots (multiple EntityVersions). Epoch-based reclamation handles
+  this correctly — a node is only reclaimed when no reader can reach ANY root that
+  references it. Since old roots are retired in order, and readers hold epoch pins,
+  this is guaranteed.
+
+### 18.7 CowEngine configuration
+
+Three `CowEngine` instances share the same `SlabAllocator`, `ChunkStore`,
+`BumpAllocator`, and `EpochReclaimer`. ART internal node classes (Node4, Node16, Node48,
+Node256, PrefixNode) are key-length independent, so they are shared. Only leaf classes
+differ:
+
+| CowEngine | keyLen | leafValueSize | Purpose |
+|---|---|---|---|
+| Main ART (global) | prefix bytes | 24B (inline `EntityNode`) | Global entity routing |
+| AttributeRuns ART | 12B | 24B (AttributeRun) | Per-entity attribute history |
+| EntityVersions ART | 8B | 16B (EntityVersion) | Per-entity state timeline |
+
+**CHAMP is NOT a CowEngine.** It is a separate persistent map implementation using
+the shared `BumpAllocator` for node allocation and the shared `EpochReclaimer` for
+lifetime management. CHAMP nodes are not ART nodes — they have their own layout (§18.6.2)
+and do not participate in ART COW paths.
+
+**Engine registration:**
+
+All three CowEngines and the CHAMP allocator are created at `TaoTree.create()` time.
+The AttributeRuns and EntityVersions CowEngines are each registered once with the shared
+`SlabAllocator` — all per-entity ARTs of the same type share leaf and node class IDs.
+This means:
+
+- All AttributeRuns ARTs across all entities use the same slab classes.
+- All EntityVersions ARTs across all entities use the same slab classes.
+- EntityNode structs have their own slab class (40 bytes).
+
+**Slab classes registered:**
+
+| Slab class | Size | Used by |
+|---|---|---|
+| EntityNode | 40B | EntityNode aggregate roots |
+| MainART leaf | keySlot + 8B | Global ART leaf slots |
+| AttributeRuns leaf | aligned(12) + 24B | AttributeRuns ART leaf slots |
+| EntityVersions leaf | aligned(8) + 16B | EntityVersions ART leaf slots |
+| Node4 | 160B | All three CowEngines (shared) |
+| Node16 | 528B | All three CowEngines (shared) |
+| Node48 | 656B | All three CowEngines (shared) |
+| Node256 | 2064B | All three CowEngines (shared) |
+| PrefixNode | 24B | All three CowEngines (shared) |
+
+### 18.8 Write path
+
+The write path performs optimistic COW through the global ART, mutates per-entity
+structures, and publishes atomically. The key invariant: all mutations within a single
+`WriteScope` are visible as a single atomic state transition.
+
+#### 18.8.1 Full write flow
+
+```
+put(prefix, attr_name, value, T):
+  // --- Phase 1: Resolve identifiers ---
+  attr_id = attrDict.intern(attr_name)    // TaoDictionary, self-locking
+  value_ref = internValue(value)                 // BumpAllocator, deduplicated
+
+  // --- Phase 2: Global ART COW to EntityNode ---
+  mainCow = mainCowEngine.beginCow(mainRoot, prefix)
+  objNodeRef = mainCow.getOrCreateLeaf(prefix) → read EntityNodeRef
+  objNode = resolveEntityNode(objNodeRef)        // slab resolve to 40B struct
+  // If new entity: objNode fields are all zero (fresh slab slot)
+
+  // --- Phase 3: AttributeRuns upsert ---
+  attrArtRoot = objNode.attr_art_root_ref
+  attrKey = encodeAttrKey(attr_id, T)      // [attr_id:4 | T:8]
+  {newAttrRoot, stateChanged, affectedWindow} =
+      upsertAttributeRun(attrArtRoot, attr_id, T, value_ref)
+
+  // --- Phase 4: Conditional EntityVersions update ---
+  versionsArtRoot = objNode.versions_art_root_ref
+  currentStateRoot = objNode.current_state_root_ref
+  if stateChanged:
+    {newVersionsRoot, newCurrentStateRoot} =
+        updateEntityVersions(versionsArtRoot, currentStateRoot,
+                             attr_id, value_ref, affectedWindow)
+  else:
+    newVersionsRoot = versionsArtRoot
+    newCurrentStateRoot = currentStateRoot
+
+  // --- Phase 5: Write new EntityNode ---
+  newObjNode = allocEntityNode()
+  newObjNode.current_state_root_ref = newCurrentStateRoot
+  newObjNode.attr_art_root_ref = newAttrRoot
+  newObjNode.versions_art_root_ref = newVersionsRoot
+  newObjNode.archive_manifest_ref = objNode.archive_manifest_ref
+  newObjNode.metadata_ref = objNode.metadata_ref
+  mainCow.writeLeafValue(newObjNodeRef)
+
+  // --- Phase 6: Publish ---
+  retireOldEntityNode(objNodeRef)
+  mainCow.publish()    // atomic root swap via CAS
+```
+
+#### 18.8.2 AttributeRuns upsert (detail)
+
+```
+upsertAttributeRun(attrArtRoot, attr_id, T, value_ref):
+  // Step 1: Find predecessor run for this attribute at time T
+  searchKey = encodeAttrKey(attr_id, T)
+  predRun = predecessor(attrArtRoot, searchKey, 12)
+
+  // Step 2: Check if T falls within an existing run of this attribute
+  if predRun != null && predRun.attr_id == attr_id:
+    if predRun.value_ref == value_ref:
+      // Same value — extend last_seen, no state change
+      newLastSeen = max(predRun.last_seen, T)
+      if newLastSeen == predRun.last_seen:
+        return {attrArtRoot, stateChanged=false, affectedWindow=null}
+      // COW-update the run's last_seen
+      newRoot = cowUpdateLeafValue(attrArtRoot, predRun.key,
+                                   predRun.withLastSeen(newLastSeen))
+      return {newRoot, stateChanged=false, affectedWindow=null}
+
+    if T >= predRun.first_seen && T <= predRun.valid_to:
+      // Different value, T inside existing run → split run
+      return splitAndInsert(attrArtRoot, predRun, attr_id, T, value_ref)
+
+  // Step 3: Find successor run of this attribute (for valid_to computation)
+  succRun = successor(attrArtRoot, searchKey, 12, attr_id)
+
+  // Step 4: Check if merge with successor is possible
+  if succRun != null && succRun.value_ref == value_ref:
+    // Same value as successor — extend successor backwards
+    newRoot = cowDeleteAndReinsert(attrArtRoot, succRun.key,
+                                   succRun.withFirstSeen(T))
+    affectedWindow = {from=T, to=succRun.first_seen - 1}
+    return {newRoot, stateChanged=true, affectedWindow}
+
+  // Step 5: Check if merge with predecessor is possible
+  if predRun != null && predRun.attr_id == attr_id
+     && predRun.value_ref == value_ref:
+    // predRun was checked for same value above and failed...
+    // (This case is handled by step 2, same-value branch)
+    // Not reachable here.
+
+  // Step 6: Insert new run
+  newValidTo = (succRun != null) ? succRun.first_seen - 1 : Long.MAX_VALUE
+  newRun = AttributeRun{first_seen=T, last_seen=T, valid_to=newValidTo, value_ref}
+
+  // Update predecessor's valid_to if it exists for this attribute
+  if predRun != null && predRun.attr_id == attr_id:
+    newRoot = cowUpdateLeafValue(attrArtRoot, predRun.key,
+                                 predRun.withValidTo(T - 1))
+    newRoot = cowInsert(newRoot, encodeAttrKey(attr_id, T), newRun)
+  else:
+    newRoot = cowInsert(attrArtRoot, encodeAttrKey(attr_id, T), newRun)
+
+  affectedWindow = {from=T, to=newValidTo}
+  return {newRoot, stateChanged=true, affectedWindow}
+```
+
+#### 18.8.3 Split-and-insert for out-of-order within a run
+
+```
+splitAndInsert(attrArtRoot, existingRun, attr_id, T, value_ref):
+  // existingRun covers [first_seen .. valid_to] with a different value
+  // T falls inside this range
+
+  // Up to three runs result, depending on whether there are
+  // observations of the old value strictly past T:
+  //   [existingRun.first_seen, T-1] → existingRun.value_ref  (prefix, if T > first_seen)
+  //   [T, insertValidTo]             → value_ref              (insert)
+  //   [T+1, existingRun.valid_to]    → existingRun.value_ref  (suffix, only if last_seen > T)
+
+  root = attrArtRoot
+
+  // Shrink existing run to prefix portion
+  if T > existingRun.first_seen:
+    prefixRun = AttributeRun{first_seen=existingRun.first_seen,
+                           last_seen=existingRun.last_seen,
+                           valid_to=T-1, value_ref=existingRun.value_ref}
+    root = cowUpdateLeafValue(root, existingRun.key, prefixRun)
+  else:
+    // T == existingRun.first_seen — no prefix portion, delete existing
+    root = cowDelete(root, existingRun.key)
+
+  // A suffix run exists only when the old value was observed strictly past T.
+  // Without that, the "assumed valid" tail of the existing run collapses into
+  // the new value — the new run inherits existingRun.valid_to. This avoids a
+  // phantom suffix in the notable case where existingRun.last_seen ≤ T (e.g.
+  // overwriting a TIMELESS value, where first_seen == last_seen == T == 0
+  // but valid_to == Long.MAX_VALUE).
+  hasSuffix = (T < existingRun.valid_to) and (existingRun.last_seen > T)
+  insertValidTo = hasSuffix ? T : existingRun.valid_to
+
+  // Insert new run at T
+  newRun = AttributeRun{first_seen=T, last_seen=T,
+                        valid_to=insertValidTo, value_ref}
+  root = cowInsert(root, encodeAttrKey(attr_id, T), newRun)
+
+  if hasSuffix:
+    suffixRun = AttributeRun{first_seen=T+1, last_seen=existingRun.last_seen,
+                           valid_to=existingRun.valid_to,
+                           value_ref=existingRun.value_ref}
+    root = cowInsert(root, encodeAttrKey(attr_id, T+1), suffixRun)
+    affectedWindow = {from=T, to=T}
+    revertWindow  = {from=T+1, to=existingRun.valid_to}
+  else:
+    affectedWindow = {from=T, to=insertValidTo}
+    revertWindow   = null
+
+  return {root, stateChanged=true, affectedWindow, revertWindow}
+```
+
+### 18.9 Read path
+
+All read operations begin with a `ReadScope` that atomically captures the global ART
+root via `VarHandle.getAcquire()` and enters an epoch. Since the EntityNode contains
+roots for all per-entity structures, and all nodes are immutable once published, the
+entire multi-level structure is consistent from this single root snapshot.
+
+#### 18.9.1 `latest(prefix, attribute)`
+
+Returns the current value of a specific attribute for an entity. This is the fastest
+read path — it uses `current_state_root` directly, bypassing both per-entity ARTs.
+
+```
+latest(prefix, attr_name):
+  // 1. Resolve attribute ID (lock-free via TaoDictionary.resolve)
+  attr_id = attrDict.resolve(attr_name)
+  if attr_id == UNKNOWN:
+    return NOT_FOUND
+
+  // 2. Global ART lookup
+  objNodeRef = mainArt.lookup(mainRoot, prefix)
+  if objNodeRef == 0:
+    return NOT_FOUND
+  objNode = resolveEntityNode(objNodeRef)
+
+  // 3. CHAMP lookup in current state
+  value_ref = champGet(objNode.current_state_root_ref, attr_id)
+  if value_ref == NOT_FOUND:
+    return NOT_FOUND
+
+  return resolveValue(value_ref)
+```
+
+**Complexity:** O(P + log₃₂ S) where P = prefix key length, S = attribute count.
+In practice, O(P + 1) for S < 32.
+
+#### 18.9.2 `at(prefix, attribute, T)`
+
+Returns the value of a specific attribute at a given point in time.
+
+```
+at(prefix, attr_name, T):
+  attr_id = attrDict.resolve(attr_name)
+  if attr_id == UNKNOWN:
+    return NOT_FOUND
+
+  objNodeRef = mainArt.lookup(mainRoot, prefix)
+  if objNodeRef == 0:
+    return NOT_FOUND
+  objNode = resolveEntityNode(objNodeRef)
+
+  // Predecessor search in EntityVersions ART: find version with first_seen ≤ T
+  versionKey = encodeVersionKey(T)    // [T:8B]
+  version = predecessor(objNode.versions_art_root_ref, versionKey, 8)
+  if version == null:
+    return NOT_FOUND    // no version exists at or before T
+
+  // Check validity: version.valid_to >= T
+  if version.valid_to < T:
+    return NOT_FOUND    // gap in version timeline (should not happen if invariants hold)
+
+  // CHAMP lookup in version's state snapshot
+  value_ref = champGet(version.state_root_ref, attr_id)
+  if value_ref == NOT_FOUND:
+    return NOT_FOUND    // attribute not present in entity state at time T
+
+  return resolveValue(value_ref)
+```
+
+**Complexity:** O(P + 8 + log₃₂ S) — prefix lookup + EntityVersions predecessor + CHAMP get.
+
+#### 18.9.3 `allFieldsAt(prefix, T)`
+
+Returns the complete entity state (all attribute values) at a given point in time.
+
+```
+allFieldsAt(prefix, T, visitor):
+  objNodeRef = mainArt.lookup(mainRoot, prefix)
+  if objNodeRef == 0:
+    return    // entity not found
+
+  objNode = resolveEntityNode(objNodeRef)
+
+  // Predecessor search in EntityVersions ART
+  version = predecessor(objNode.versions_art_root_ref, encodeVersionKey(T), 8)
+  if version == null:
+    return    // no version at or before T
+
+  if version.valid_to < T:
+    return    // gap in timeline
+
+  // Iterate entire CHAMP map at this version's state
+  champIterate(version.state_root_ref, (attr_id, value_ref) -> {
+    attr_name = attrDict.reverseLookup(attr_id)
+    value = resolveValue(value_ref)
+    return visitor.visit(attr_name, value)    // false = stop early
+  })
+```
+
+**Complexity:** O(P + 8 + S) — prefix lookup + predecessor + CHAMP full iteration.
+This is a major improvement over the per-field predecessor approach in the old design,
+which cost O(P + F × 12) for F fields.
+
+#### 18.9.4 `history(prefix, attribute)`
+
+Returns the full history of a specific attribute as a sequence of AttributeRuns.
+
+```
+history(prefix, attr_name, visitor):
+  attr_id = attrDict.resolve(attr_name)
+  if attr_id == UNKNOWN:
+    return
+
+  objNodeRef = mainArt.lookup(mainRoot, prefix)
+  if objNodeRef == 0:
+    return
+
+  objNode = resolveEntityNode(objNodeRef)
+
+  // Prefix scan in AttributeRuns ART: all runs with key prefix [attr_id:4B]
+  attrPrefix = encodeAttrPrefix(attr_id)    // 4 bytes
+  scan(objNode.attr_art_root_ref, attrPrefix, 4, (key, run) -> {
+    return visitor.visit(AttributeRun{
+      first_seen = extractFirstSeen(key),
+      last_seen = run.last_seen,
+      valid_to = run.valid_to,
+      value = resolveValue(run.value_ref)
+    })
+  })
+```
+
+**Complexity:** O(P + 12 × R) where R = number of runs for this attribute.
+
+#### 18.9.5 `history(prefix, attribute, fromMs, toMs)` — bounded range
+
+```
+history(prefix, attr_name, fromMs, toMs, visitor):
+  attr_id = attrDict.resolve(attr_name)
+  if attr_id == UNKNOWN:
+    return
+
+  objNode = resolveEntityNode(mainArt.lookup(mainRoot, prefix))
+  if objNode == null:
+    return
+
+  // Start from predecessor of fromMs to catch runs that span the boundary
+  startKey = encodeAttrKey(attr_id, fromMs)
+  predRun = predecessor(objNode.attr_art_root_ref, startKey, 12)
+
+  // If predecessor exists and overlaps [fromMs, toMs], include it
+  if predRun != null && predRun.attr_id == attr_id
+     && predRun.valid_to >= fromMs:
+    visitor.visit(predRun)
+
+  // Scan forward from fromMs through toMs
+  scan(objNode.attr_art_root_ref, startKey, 12, (key, run) -> {
+    first_seen = extractFirstSeen(key)
+    if first_seen > toMs:
+      return false    // past end of range
+    return visitor.visit(run)
+  })
+```
+
+### 18.10 Affected window algorithm
+
+When a late insert arrives at time T for attribute S with value V, the affected window
+determines which EntityVersions need rewriting. This is the core complexity-bounding
+mechanism that keeps late inserts efficient.
+
+#### 18.10.1 Window computation
+
+```
+computeAffectedWindow(attrArtRoot, attr_id, T, old_value_ref, new_value_ref):
+  // The affected window spans from T to the next state change of this attribute.
+  // "Next state change" = the first_seen of the next run of this attribute that
+  // has a DIFFERENT value_ref than new_value_ref.
+
+  if old_value_ref == new_value_ref:
+    return null    // no state change → no affected window
+
+  // Find the next run of this attribute after T
+  searchKey = encodeAttrKey(attr_id, T + 1)
+  nextRun = successor(attrArtRoot, searchKey, attr_id)
+
+  if nextRun == null:
+    // This is the last run of the attribute — window extends to end of time
+    return {from=T, to=Long.MAX_VALUE}
+
+  if nextRun.value_ref == new_value_ref:
+    // Next run has the same value as the insert — window ends before it
+    // (the merged run covers from T through nextRun.valid_to)
+    return {from=T, to=nextRun.first_seen - 1}
+
+  // Next run has a different value — window extends to its boundary
+  return {from=T, to=nextRun.first_seen - 1}
+```
+
+#### 18.10.2 EntityVersions rewrite within the window
+
+```
+updateEntityVersions(versionsArtRoot, currentStateRoot,
+                     attr_id, new_value_ref, affectedWindow):
+  root = versionsArtRoot
+
+  // Step 1: Find all EntityVersions with first_seen in [window.from, window.to]
+  //         These versions need their CHAMP state rewritten.
+  affectedVersions = []
+  scanRange(root, affectedWindow.from, affectedWindow.to, (versionKey, version) -> {
+    affectedVersions.add({key=versionKey, version=version})
+    return true
+  })
+
+  // Step 2: Find the predecessor version (the version active just before the window)
+  predVersion = predecessor(root, encodeVersionKey(affectedWindow.from), 8)
+
+  // Step 3: Determine the base state for the window start
+  if predVersion != null:
+    baseStateRoot = predVersion.state_root_ref
+  else:
+    baseStateRoot = CHAMP_EMPTY_ROOT    // no prior state
+
+  // Step 4: Compute new state at window.from
+  newStateRoot = champPut(baseStateRoot, attr_id, new_value_ref)
+
+  // Step 5: Check if we need a new EntityVersion at window.from
+  needNewVersion = true
+  if predVersion != null && predVersion.state_root_ref == newStateRoot:
+    needNewVersion = false    // state didn't actually change (CHAMP canonical form)
+  if affectedVersions is not empty && affectedVersions[0].key == affectedWindow.from:
+    needNewVersion = false    // there's already a version at this timestamp; update it
+
+  // Step 6: Insert or update the version at window.from
+  if needNewVersion:
+    validTo = affectedVersions.isEmpty()
+              ? affectedWindow.to
+              : affectedVersions[0].first_seen - 1
+    newVersion = EntityVersion{valid_to=validTo, state_root_ref=newStateRoot}
+    root = cowInsert(root, encodeVersionKey(affectedWindow.from), newVersion)
+    // Update predecessor's valid_to
+    if predVersion != null:
+      root = cowUpdateLeafValue(root, predVersion.key,
+                                 predVersion.withValidTo(affectedWindow.from - 1))
+
+  // Step 7: Rewrite each affected version's CHAMP root
+  for each {key, version} in affectedVersions:
+    updatedStateRoot = champPut(version.state_root_ref, attr_id, new_value_ref)
+    root = cowUpdateLeafValue(root, key,
+                               version.withStateRoot(updatedStateRoot))
+
+  // Step 8: Merge adjacent versions with equal state_root_ref
+  root = mergeAdjacentVersions(root, affectedWindow)
+
+  // Step 9: Update current state if the window touches the present
+  if affectedWindow.to == Long.MAX_VALUE:
+    newCurrentStateRoot = newStateRoot
+  else:
+    newCurrentStateRoot = currentStateRoot
+    // Current state may need updating if we changed the latest version
+    latestVersion = rightmostLeaf(root)
+    if latestVersion != null:
+      newCurrentStateRoot = latestVersion.state_root_ref
+
+  return {root, newCurrentStateRoot}
+```
+
+#### 18.10.3 Merge adjacent versions
+
+```
+mergeAdjacentVersions(root, window):
+  // Scan versions in the window and one beyond
+  prev = null
+  toDelete = []
+  scanRange(root, window.from, window.to + 1, (key, version) -> {
+    if prev != null && prev.state_root_ref == version.state_root_ref:
+      // Adjacent versions with identical state — merge
+      toDelete.add(key)
+      prev.valid_to = version.valid_to    // extend predecessor
+    else:
+      prev = {key, version}
+    return true
+  })
+
+  for each key in toDelete:
+    root = cowDelete(root, key)
+
+  // Update the surviving merged version's valid_to
+  if prev != null:
+    root = cowUpdateLeafValue(root, prev.key, prev.version)
+
+  return root
+```
+
+#### 18.10.4 Worked example
+
+```
+Entity: bird-42, Attributes: {species, location}
+
+Initial state (2 attribute runs, 1 entity version):
+  AttributeRuns:
+    [species, T=100] → {last_seen=200, valid_to=MAX, value="Eagle"}
+    [location, T=100] → {last_seen=200, valid_to=MAX, value="Wyoming"}
+
+  EntityVersions:
+    [T=100] → {valid_to=MAX, state={species→"Eagle", location→"Wyoming"}}
+
+Late insert: put(bird-42, species, "Hawk", T=150)
+
+Step 1: upsertAttributeRun
+  predecessor([species, 150]) → run [species, T=100, "Eagle"]
+  T=150 inside [100..MAX], value differs → splitAndInsert
+  Result:
+    [species, T=100] → {last_seen=200, valid_to=149, value="Eagle"}
+    [species, T=150] → {last_seen=150, valid_to=MAX, value="Hawk"}
+
+Step 2: computeAffectedWindow
+  Next run of species after T=150: none (Hawk is the last run)
+  affectedWindow = {from=150, to=MAX}
+
+Step 3: updateEntityVersions
+  Affected versions: [T=100] has first_seen=100, which is < 150 → NOT in window
+  (No existing versions in [150..MAX])
+
+  predVersion = [T=100] → state={species→"Eagle", location→"Wyoming"}
+  newStateRoot = champPut(predVersion.state, species, "Hawk")
+               = {species→"Hawk", location→"Wyoming"}  (new CHAMP root, shares location node)
+
+  needNewVersion = true (no version at T=150)
+  Insert: [T=150] → {valid_to=MAX, state={species→"Hawk", location→"Wyoming"}}
+  Update: [T=100] → {valid_to=149, state={species→"Eagle", location→"Wyoming"}}
+
+  currentStateRoot = newStateRoot (window.to == MAX)
+
+Final state:
+  AttributeRuns:
+    [species, T=100] → {last_seen=200, valid_to=149, value="Eagle"}
+    [species, T=150] → {last_seen=150, valid_to=MAX, value="Hawk"}
+    [location, T=100] → {last_seen=200, valid_to=MAX, value="Wyoming"}
+
+  EntityVersions:
+    [T=100] → {valid_to=149, state={species→"Eagle", location→"Wyoming"}}
+    [T=150] → {valid_to=MAX, state={species→"Hawk", location→"Wyoming"}}
+
+  CHAMP sharing: both versions share the location→"Wyoming" CHAMP node.
+  Only the species entry differs.
+```
+
+### 18.11 Temporal edge-case rules
+
+These rules resolve ambiguous cases in the temporal store. They must be enforced by
+the implementation and verified by tests.
+
+1. **Same-timestamp, different-value tie-break:** Last-write-wins. If two `put()` calls
+   for the same entity, attribute, and timestamp arrive with different values, the second
+   write overwrites the first. Within a single `WriteScope`, mutations are ordered.
+   Across concurrent `WriteScope`s, the COW commit order determines the winner.
+
+2. **Adjacent equal-value AttributeRuns are merged eagerly.** Unlike the old bucket design,
+   AttributeRun merge is performed on the write path (invariant 3 in §18.4). After a
+   split creates `[100,149,"Eagle"]` and `[151,200,"Eagle"]` around `[150,150,"Hawk"]`,
+   if a subsequent write overwrites T=150 back to "Eagle", the three runs are merged
+   into a single `[100,200,"Eagle"]`.
+
+3. **Adjacent equal-state EntityVersions are merged eagerly.** After an affected-window
+   rewrite (§18.10), the merge step checks adjacent versions. If two versions have the
+   same `state_root_ref` (CHAMP canonical form guarantees pointer equality = content
+   equality), they are merged into one version spanning both intervals.
+
+4. **`last_seen` update does not create EntityVersions.** An attribute reporting the same
+   value it already reports only updates `AttributeRun.last_seen`. No EntityVersion is
+   created or modified. This prevents version explosion from high-frequency
+   attribute-confirm patterns.
+
+5. **First insert for a new attribute.** When an attribute reports a value for the first time
+   for a given entity, a new AttributeRun is created AND a new EntityVersion is created
+   (or the existing latest EntityVersion is extended if the state change was a no-op,
+   which cannot happen for a new attribute). The CHAMP map grows by one entry.
+
+6. **Attribute removal.** Removing an attribute (setting its value to a tombstone sentinel)
+   creates a new AttributeRun with `value_ref = TOMBSTONE_REF` and a new EntityVersion
+   whose CHAMP map has the attribute entry removed via `champRemove()`. The AttributeRun
+   remains in the history for auditability.
+
+7. **Empty entity cleanup.** If all attributes of an entity are tombstoned and all
+   EntityVersions have empty CHAMP maps, the EntityNode can be replaced with a
+   tombstone EntityNodeRef in the global ART. Full removal is deferred to compaction.
+
+8. **Undated observations removed.** The two-layer architecture does not support undated
+   observations. All `put()` calls require an explicit timestamp. The rationale:
+   AttributeRuns and EntityVersions are keyed by time, and "timeless" data cannot
+   participate in the temporal ordering, state materialization, or affected-window
+   algorithms. Applications that need to store non-temporal attributes should use a
+   separate non-temporal TaoTree instance (the existing v2 key-value API).
+
+### 18.12 Persistence
+
+All structures — EntityNodes, AttributeRuns ART nodes, EntityVersions ART nodes, CHAMP
+nodes, and value payloads — are stored in the shared `SlabAllocator` and
+`BumpAllocator`, both backed by the same `ChunkStore`.
+
+#### 18.12.1 Predecessor search and rightmost-leaf (ART operations)
+
+The per-entity ARTs require **predecessor search**: given key K, find the leaf with
+the largest key ≤ K. The existing ART has lookup (exact match) and prefix scan, but
+NOT predecessor search.
+
+Implementation: descend the ART as for exact lookup. When a child for the next byte
+is missing, backtrack to the nearest node with a smaller child, then descend to its
+rightmost leaf. This is O(key length) — same as lookup.
+
+```
+predecessor(root, key, keyLen):
+  Descend from root matching key bytes.
+  At each inner node, if the exact child byte is missing:
+    Find the largest child byte < target byte in this node.
+    If found: descend to that child, then follow rightmost path to leaf.
+    If not found: backtrack up the path to find the previous subtree.
+  At a leaf: if leaf key <= search key, return it. Else backtrack.
+```
+
+This operation is critical for:
+- `at(prefix, attribute, T)`: predecessor in EntityVersions ART finds the version
+  with `first_seen ≤ T`
+- AttributeRuns upsert: predecessor in AttributeRuns ART finds the run covering time T
+
+The `latest()` path does NOT need predecessor search — it uses `current_state_root`
+directly for O(1) CHAMP access.
+
+**Rightmost-leaf under a prefix** is used by the affected-window algorithm to find
+the latest EntityVersion:
+
+```
+rightmostLeaf(root, prefix, prefixLen):
+  Descend from root matching prefix bytes.
+  After prefix is fully matched, descend the subtree always choosing
+  the largest child byte at each inner node.
+  Return the leaf reached (the rightmost leaf under this prefix).
+```
+
+This is O(prefix length + remaining key depth) = O(key length).
+
+#### 18.12.2 Sync and recovery
+
+On `sync()`:
+
+1. `ChunkStore.syncDirty()` forces modified pages to disk (including all ART nodes,
+   EntityNodes, CHAMP nodes, and value payloads).
+2. Checkpoint writes the global ART state (root, size, slab class tables) using the
+   existing v2 format (mirrored A/B slots, CRC-32C, shadow paging).
+3. Recovery: open global ART → leaf slots contain `EntityNodeRef` → each EntityNode
+   contains `attr_art_root_ref`, `versions_art_root_ref`, `current_state_root_ref`
+   → the entire multi-level structure is reachable from the single global root.
+
+No separate checkpointing is needed for per-entity ARTs or CHAMP maps — they are
+all stored in the same `SlabAllocator`/`BumpAllocator` pages that the `ChunkStore`
+manages.
+
+**Temporal descriptor (persisted in checkpoint, for reopen safety):**
+
+```
+Offset  Size  Field
+------  ----  -----
+0       var   KeyLayout field definitions (prefix layout: count, types, names)
+var     4     attribute dictionary index (which dict entry is the attribute-name dict)
+var     4     AttributeRuns keyLen (12)
+var     4     AttributeRuns leafValueSize (24)
+var     4     EntityVersions keyLen (8)
+var     4     EntityVersions leafValueSize (16)
+var     4     EntityNode slab class ID
+var     4     CHAMP format version
+var     4     format version
+```
+
+This lets `TaoTree.open(Path)` reconstruct the `KeyLayout`, rebind the attribute
+dictionary, and re-create the AttributeRuns and EntityVersions `CowEngine` instances
+with correct parameters.
+
+#### 18.12.3 Compaction
+
+> **Implementation status (2026-04-20):** the pseudocode below is the
+> *intended* design. The shipped `Compactor` walks only the outer ART
+> (step 3 and a verbatim `MemorySegment.copy` of each `EntityNode` leaf);
+> steps 2a–2d and CHAMP deduplication are **not** implemented, and the
+> compactor does not call `EpochReclaimer.retire()` on old nodes. Net
+> effect: `compact()` does not shrink the file or repack per-entity
+> structures. Correctness is unaffected because pointers into the
+> nested structures remain valid (no page is physically reclaimed). See
+> `CompactorSpaceReclaimTest` for the empirical guardrails. Tracked as
+> `p8-compactor-temporal`.
+
+`TaoTree.compact()` provides temporal-aware vacuum logic:
+
+1. Walk the global ART.
+2. For each EntityNode:
+   a. Walk its AttributeRuns ART — migrate all leaf slots and ART nodes to target slabs.
+   b. Walk its EntityVersions ART — migrate all leaf slots and ART nodes.
+   c. Walk all reachable CHAMP nodes (from all `state_root_ref` pointers in
+      EntityVersions + `current_state_root`). Deduplicate shared CHAMP nodes
+      (track visited set by pointer to avoid double-copying).
+   d. Migrate the EntityNode itself.
+3. Migrate the global ART nodes and leaf slots.
+4. Write checkpoint.
+5. Epoch reclamation for old allocator state.
+
+CHAMP structural sharing requires care during compaction: a single CHAMP inner node
+may be referenced by multiple EntityVersion `state_root_ref` pointers. The compaction
+must track which CHAMP nodes have already been migrated (pointer → new-pointer map)
+to preserve sharing in the target.
+
+### 18.13 Hot/cold tiering and archival
+
+The temporal store supports a **correction horizon** (watermark): a configurable
+timestamp boundary. Data older than this is considered immutable and eligible for
+archival.
+
+#### 18.13.1 Correction horizon
+
+```
+correction_horizon = configurable timestamp (e.g., now() - 30 days)
+```
+
+- Data with `valid_to < correction_horizon` is immutable — no late inserts can affect it.
+- The write path checks: if a `put()` arrives with `T < correction_horizon`, it is
+  rejected (or routed to a correction log for manual review).
+- This bounds the affected-window algorithm: late inserts can only affect EntityVersions
+  within the mutable window (after the correction horizon).
+
+#### 18.13.2 Archive manifests
+
+Each entity may have an `archive_manifest_ref` in its EntityNode, pointing to a list
+of cold segments:
+
+```
+ArchiveManifest {
+  segment_count: uint32
+  segments: ArchivedSegment[]
+}
+
+ArchivedSegment {
+  from_timestamp: int64       // start of archived range
+  to_timestamp: int64         // end of archived range
+  attr_runs_ref: long       // pointer to cold-stored AttributeRuns
+  versions_ref: long          // pointer to cold-stored EntityVersions (may be 0)
+  checksum: int32             // CRC-32C of the cold segment
+}
+```
+
+**AttributeRuns** are the canonical archive layer — they are always fully preserved in
+cold storage. **EntityVersions** in cold storage may be sparse or absent — they are
+reconstructible from AttributeRuns when needed.
+
+#### 18.13.3 TypeArchiveIndex
+
+For browsing cold entities by type, a `TypeArchiveIndex` maps
+`(tenant, object_type)` to a list of archived entity segments:
+
+```
+ArchivedObjectSegment {
+  entity_id_min: bytes        // first entity ID in this segment
+  entity_id_max: bytes        // last entity ID in this segment
+  entity_count: uint32        // number of entities
+  archived_until: int64       // latest timestamp in this segment
+  archive_ref: long           // pointer to cold storage block
+}
+```
+
+This enables efficient cold-entity enumeration without scanning the global ART.
+
+#### 18.13.4 Cold stubs
+
+When an entity is fully archived (all data older than the correction horizon), its
+global ART entry is replaced with a **cold stub**: a minimal EntityNode with only
+`archive_manifest_ref` set, and all ART roots set to `EMPTY_PTR`. CHAMP
+`current_state_root_ref` points to the latest archived state snapshot.
+
+Reading a cold-stubbed entity triggers archive retrieval (transparent to the caller
+or explicit via an async API — deferred to implementation).
+
+### 18.14 Cold store: ImmutableTaoTree (deferred)
+
+`TaoTree.freeze(Path)` will produce an `ImmutableTaoTree` — a read-only,
+size-optimized snapshot. Deferred to phase 2.
+
+The cold store will use per-attribute `AttributeValueStats` to select optimal value encodings:
+
+| Stats condition | Encoding | Size per value |
+|---|---|---|
+| `allNumeric` + max fits int32 | `int32` | 4B |
+| `allNumeric` + max fits int64 | `int64` | 8B |
+| `distinctCount ≤ 256` | `dict8` | 1B |
+| `distinctCount ≤ 65536` | `dict16` | 2B |
+| `distinctCount ≤ 2^32` + short values | `dict32` | 4B |
+| otherwise | raw bytes | variable |
+
+AttributeRuns in the cold store are run-length encoded (each run is a contiguous value
+interval), which is already the natural format. EntityVersions may use delta-encoded
+CHAMP diffs instead of full snapshots for further compression.
+
+### 18.15 HINT index (deferred)
+
+Hierarchical Interval Indexing for `scanOverlap(fromMs, toMs)` queries — finding all
+entities with data overlapping a time range. Deferred to a future phase.
+
+When implemented, HINT will be a **separate ART** within `TaoTree` (not a child tree
+of the per-entity ART). The key insight: AttributeRuns' `[first_seen, valid_to]` intervals
+are the input to the HINT decomposition. The existing `HintPartitioner` class provides
+the interval decomposition algorithm.
+
+### 18.16 Operational notes
+
+**Epoch slot sizing:** The `EpochReclaimer` allocates reader slots via thread-local
+tokens. Slots are recycled only when threads terminate and their `ThreadLocal` is
+reclaimed. For long-lived thread pools (the common case in server applications), the
+maximum reader slot count is an operational setting that must be sized to the expected
+thread pool width. Exhausting reader slots will cause `ReadScope` creation to fail.
+This is not a design flaw but an operational constraint that should be configured at
+`TaoTree.create()` time.
+
+**Durability caveats:** The persistence model (mmap + `ChunkStore.syncDirty()` + A/B
+checkpoint with CRC-32C) provides crash-safe metadata recovery. However, power-loss
+durability for data pages depends on OS-level `msync` / `fsync` behavior, which varies
+by platform. The design does not claim stronger guarantees than the underlying OS provides.
+
+**CHAMP memory overhead:** Each EntityVersion holds a `state_root_ref` to a CHAMP map.
+For an entity with S attributes and V versions, worst-case CHAMP memory is
+`V × O(S)` — but structural sharing means the actual memory is typically
+`O(S + V × log₃₂ S)` because adjacent versions share most nodes. For S=20 attributes
+and V=100 versions, this is approximately `100 × (8 + 12×20) = 24.8 KB` worst case
+vs. `~20 × 248 + 100 × 3 × 60 = 22.9 KB` with sharing (one shared root + 3 path
+nodes per version change).
+
+**EntityNode slab fragmentation:** EntityNodes are fixed-size (40 bytes) and
+slab-allocated, so there is no fragmentation. Tombstoned entities leave holes in the
+slab that are reused by new entities via the slab free list.
+
+**Per-entity ART sizing:** Most entities have tens of attributes and hundreds of runs.
+A AttributeRuns ART with 100 entries (12-byte keys) typically fits in 3–4 inner nodes.
+An EntityVersions ART with 50 entries (8-byte keys) fits in 2–3 inner nodes. The
+per-entity ART overhead is modest: ~500 bytes per entity for typical attribute counts.
+
+**Writer contention per entity:** Two concurrent writers modifying different attributes
+of the same entity still conflict on the EntityNode (serialization point per entity).
+The single-retry optimistic COW handles this correctly — the second writer redoes its
+COW against the new root. This is acceptable for the dominant pattern of sequential
+per-entity ingestion. If truly independent concurrent attribute streams are needed, a
+future enhancement could use per-attribute sub-locking within the EntityNode.
+
+### 18.17 Complexity analysis
+
+| Operation | Algorithm | Complexity |
+|---|---|---|
+| `latest(prefix, attribute)` | Global ART lookup + CHAMP `get(attr_id)` | O(P + log₃₂ S) |
+| `at(prefix, attribute, T)` | Global ART lookup + EntityVersions predecessor + CHAMP get | O(P + 8 + log₃₂ S) |
+| `allFieldsAt(prefix, T)` | Global ART lookup + EntityVersions predecessor + CHAMP iterate | O(P + 8 + S) |
+| `history(prefix, attribute)` | Global ART lookup + AttributeRuns prefix scan | O(P + 12 × R) |
+| `history(prefix, attribute, from, to)` | Global ART lookup + predecessor + bounded scan | O(P + 12 + 12 × R') |
+| `put()` — last_seen only | Global ART COW + AttributeRuns COW (leaf update) | O(P + 12) |
+| `put()` — new value | Global ART COW + AttributeRuns COW + EntityVersions COW + CHAMP put | O(P + 12 + 8 + log₃₂ S) |
+| `put()` — late insert | Global ART COW + AttributeRuns split + affected window rewrite | O(P + 12 + W × log₃₂ S) |
+| `put()` — new attribute | Global ART COW + AttributeRuns insert + EntityVersions insert + CHAMP put | O(P + 12 + 8 + log₃₂ S) |
+
+Where:
+- P = prefix key length (bytes)
+- S = number of attributes per entity
+- R = number of AttributeRuns for the queried attribute
+- R' = runs in the queried time range
+- W = number of EntityVersions in the affected window
+- log₃₂ S = CHAMP depth (1 for S < 32, 2 for S < 1024)
+
+**Key improvements over the Y-fast trie design:**
+
+| Query | Old (Y-fast) | New (entity-local) | Improvement |
+|---|---|---|---|
+| `latest(prefix, attribute)` | O(P + 12) | O(P + 1) | No ART traversal — direct CHAMP |
+| `allFieldsAt(prefix, T)` | O(P + F × 12) | O(P + 8 + S) | One predecessor + one CHAMP walk |
+| `put()` — coalesce | O(P + 12 + B) | O(P + 12) | No bucket copy — leaf-value update |
+
+### 18.18 API reference
+
+Phase 1 (hot store) API. Cold store (freeze), HINT (scanOverlap), and archive
+operations are deferred to phase 2+.
+
+```java
+public class TaoTree implements AutoCloseable {
+
+    // --- Factory ---
+    static TaoTree create(Path path, KeyLayout prefixLayout);
+    static TaoTree open(Path path);
+
+    // --- Write ---
+    WriteScope write();
+
+    class WriteScope implements AutoCloseable {
+        /** Insert or update a attribute value at a specific timestamp. */
+        void put(KeyHandle prefix, String attribute, byte[] value, long timestampMs);
+
+        /** Remove an attribute (tombstone) at a specific timestamp. */
+        void remove(KeyHandle prefix, String attribute, long timestampMs);
+    }
+
+    // --- Read ---
+    ReadScope read();
+
+    class ReadScope implements AutoCloseable {
+        /** Latest value of an attribute (uses current_state_root — fastest path). */
+        AttributeValue latest(QueryHandle prefix, String attribute);
+
+        /** Value of an attribute at a specific point in time. */
+        AttributeValue at(QueryHandle prefix, String attribute, long timestampMs);
+
+        /** All attribute values at a specific point in time. */
+        void allFieldsAt(QueryHandle prefix, long timestampMs,
+                         AttributeVisitor visitor);
+
+        /** Full history of an attribute (all runs, ordered by first_seen). */
+        void history(QueryHandle prefix, String attribute,
+                     AttributeRunVisitor visitor);
+
+        /** Bounded history of an attribute within a time range. */
+        void history(QueryHandle prefix, String attribute,
+                     long fromMs, long toMs, AttributeRunVisitor visitor);
+
+        /** Number of tracked entitys in the global ART. */
+        long size();
+    }
+
+    // --- Key builders ---
+    KeyBuilder newKeyBuilder(WriterArena arena);
+    QueryBuilder newQueryBuilder(WriterArena arena);
+
+    // --- Lifecycle ---
+    void sync();
+    void compact();
+    void close();
+}
+
+/** Immutable value returned by latest() and at(). */
+public record AttributeValue(byte[] value) {
+    static final AttributeValue NOT_FOUND = null;
+}
+
+/** A single attribute run (contiguous time interval with one value). */
+public record AttributeRun(long firstSeenMs, long lastSeenMs, long validToMs,
+                        byte[] value) {
+    /** True if this run is active at the given timestamp. */
+    boolean activeAt(long timestampMs) {
+        return firstSeenMs <= timestampMs && validToMs >= timestampMs;
+    }
+
+    /** True if this run overlaps the given time range. */
+    boolean overlaps(long fromMs, long toMs) {
+        return firstSeenMs <= toMs && validToMs >= fromMs;
+    }
+}
+
+@FunctionalInterface
+public interface AttributeRunVisitor {
+    /** Return true to continue, false to stop early. */
+    boolean visit(AttributeRun run);
+}
+
+@FunctionalInterface
+public interface AttributeVisitor {
+    /** Return true to continue, false to stop early. */
+    boolean visit(String attribute, byte[] value);
+}
+```
+
+**API notes:**
+
+- `open(Path)` takes no layout parameter — the persisted temporal descriptor carries
+  the `KeyLayout` definition and attribute dictionary binding, ensuring safe reopen
+  without risk of layout mismatch.
+- Values are `byte[]` rather than `String` — the temporal store is value-type agnostic.
+  String encoding is the caller's responsibility. This allows numeric, binary, and
+  structured values without conversion overhead.
+- `KeyBuilder` requires a `WriterArena` (for dictionary `intern()` calls).
+  `QueryBuilder` also requires a `WriterArena` for arena-scoped key allocation, but
+  uses lock-free `resolve()` for dictionary lookups.
+- The `AttributeRun.validToMs` field is exposed for advanced callers that need interval
+  semantics. For simple queries, `activeAt()` and `overlaps()` are sufficient.
+- `remove()` creates a tombstone AttributeRun. The attribute disappears from
+  `allFieldsAt()` results for timestamps after the removal. History still shows the
+  full lifecycle including the tombstone event.

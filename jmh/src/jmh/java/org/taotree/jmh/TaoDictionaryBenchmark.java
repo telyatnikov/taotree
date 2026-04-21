@@ -33,7 +33,7 @@ public class TaoDictionaryBenchmark {
         Path tmp = Files.createTempFile("jmh-dict-", ".dat");
         tmp.toFile().deleteOnExit();
         Files.delete(tmp);
-        tree = TaoTree.forDictionaries(tmp, 4 * 1024 * 1024);
+        tree = TaoTree.create(tmp, org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")));
         dict = TaoDictionary.u32(tree);
 
         var rng = new Random(42);

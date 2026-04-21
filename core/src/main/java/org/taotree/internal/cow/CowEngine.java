@@ -121,6 +121,15 @@ public final class CowEngine {
     }
 
     /**
+     * Insert a key using COW path-copy with leaf-copy semantics.
+     * Uses the engine's default context (child tree / single-writer mode).
+     */
+    public DeferredResult deferredGetOrCreateCopy(long currentRoot,
+                                                   MemorySegment key, int keyLen, int leafClass) {
+        return CowInsert.deferredGetOrCreateCopy(defaultCtx, currentRoot, key, keyLen, leafClass);
+    }
+
+    /**
      * Like {@link #deferredGetOrCreateCopy}, but forces a COW-copy even for
      * arena-allocated leaves. Used during rebase where the published tree may
      * contain arena-allocated leaves from another writer's arena.

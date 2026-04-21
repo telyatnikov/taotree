@@ -1,486 +1,301 @@
 package org.taotree;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.taotree.layout.KeyField;
+import org.taotree.layout.KeyLayout;
 
 import java.io.IOException;
-import java.nio.file.Path;
-import org.junit.jupiter.api.io.TempDir;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+/**
+ * Direct tests for the package-private {@link TaoString} 16-byte German-string
+ * codec. Placed in {@code org.taotree} so we can reach both the codec and the
+ * package-private {@link TaoTree#bump()} accessor.
+ */
 class TaoStringTest {
 
     @TempDir Path tmp;
     private int fc;
+    private Path path() { return tmp.resolve(fc++ + ".taotree"); }
+
+    private TaoTree tree() throws IOException {
+        return TaoTree.create(path(), KeyLayout.of(KeyField.uint32("id")));
+    }
+
+    private static MemorySegment slot(Arena arena) {
+        return arena.allocate(TaoString.SIZE, 1);
+    }
+
+    // -----------------------------------------------------------------
+    // Short string round-trip (≤ 12 bytes → fully inline)
+    // -----------------------------------------------------------------
 
     @Test
-    void shortStringInline() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
+    void shortStringRoundTripsInline() throws IOException {
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var s = slot(arena);
+            TaoString.write(s, "hello", tree);
 
-                byte[] data = "hello".getBytes(StandardCharsets.UTF_8);
-                TaoString.write(slot, data, tree);
-
-                assertTrue(TaoString.isShort(slot));
-                assertEquals(5, TaoString.length(slot));
-                assertArrayEquals(data, TaoString.readBytes(slot, tree));
-                assertEquals("hello", TaoString.read(slot, tree));
-            }
+            assertTrue(TaoString.isShort(s));
+            assertEquals(5, TaoString.length(s));
+            assertEquals("hello", TaoString.read(s, tree));
+            assertArrayEquals("hello".getBytes(StandardCharsets.UTF_8),
+                    TaoString.readBytes(s, tree));
         }
     }
 
     @Test
-    void shortStringExactly12Bytes() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
+    void shortStringAtBoundaryIsStillInline() throws IOException {
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var s = slot(arena);
+            String twelve = "abcdefghijkl"; // exactly 12 bytes
+            TaoString.write(s, twelve, tree);
 
-                byte[] data = "Elops smithi".getBytes(StandardCharsets.UTF_8);
-                assertEquals(12, data.length);
-                TaoString.write(slot, data, tree);
+            assertTrue(TaoString.isShort(s));
+            assertEquals(12, TaoString.length(s));
+            assertEquals(twelve, TaoString.read(s, tree));
+        }
+    }
 
-                assertTrue(TaoString.isShort(slot));
-                assertArrayEquals(data, TaoString.readBytes(slot, tree));
-            }
+    // -----------------------------------------------------------------
+    // Long string round-trip (> 12 bytes → overflow)
+    // -----------------------------------------------------------------
+
+    @Test
+    void longStringRoundTripsViaOverflow() throws IOException {
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var s = slot(arena);
+            String big = "abcdefghijklm"; // 13 bytes → long
+            TaoString.write(s, big, tree);
+
+            assertFalse(TaoString.isShort(s));
+            assertEquals(13, TaoString.length(s));
+            assertEquals(big, TaoString.read(s, tree));
+            assertArrayEquals(big.getBytes(StandardCharsets.UTF_8),
+                    TaoString.readBytes(s, tree));
         }
     }
 
     @Test
-    void longStringOverflow() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
+    void veryLongStringRoundTrips() throws IOException {
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var s = slot(arena);
+            String big = "x".repeat(8192);
+            TaoString.write(s, big, tree);
 
-                String species = "Haliaeetus leucocephalus";
-                byte[] data = species.getBytes(StandardCharsets.UTF_8);
-                assertTrue(data.length > 12);
-                TaoString.write(slot, species, tree);
+            assertFalse(TaoString.isShort(s));
+            assertEquals(8192, TaoString.length(s));
+            assertEquals(big, TaoString.read(s, tree));
+        }
+    }
 
-                assertFalse(TaoString.isShort(slot));
-                assertEquals(data.length, TaoString.length(slot));
-                assertArrayEquals(data, TaoString.readBytes(slot, tree));
-                assertEquals(species, TaoString.read(slot, tree));
-            }
+    // -----------------------------------------------------------------
+    // Empty string
+    // -----------------------------------------------------------------
+
+    @Test
+    void emptyStringIsShort() throws IOException {
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var s = slot(arena);
+            TaoString.write(s, "", tree);
+
+            assertTrue(TaoString.isShort(s));
+            assertEquals(0, TaoString.length(s));
+            assertEquals("", TaoString.read(s, tree));
+            assertArrayEquals(new byte[0], TaoString.readBytes(s, tree));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // UTF-8 multibyte
+    // -----------------------------------------------------------------
+
+    @Test
+    void utf8MultibyteShortRoundTrip() throws IOException {
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var s = slot(arena);
+            String emoji = "🦅"; // 4-byte UTF-8
+            TaoString.write(s, emoji, tree);
+            assertTrue(TaoString.isShort(s));
+            assertEquals(4, TaoString.length(s));
+            assertEquals(emoji, TaoString.read(s, tree));
         }
     }
 
     @Test
-    void longStringLocality() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
+    void utf8MultibyteLongRoundTrip() throws IOException {
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var s = slot(arena);
+            String big = "éèàü".repeat(20); // many 2-byte code points
+            TaoString.write(s, big, tree);
+            assertFalse(TaoString.isShort(s));
+            assertEquals(big, TaoString.read(s, tree));
+        }
+    }
 
-                String s = "Yellowstone Lake, near fishing bridge";
-                TaoString.write(slot, s, tree);
+    // -----------------------------------------------------------------
+    // equals() — short/short
+    // -----------------------------------------------------------------
 
-                assertEquals(s, TaoString.read(slot, tree));
-            }
+    @Test
+    void equalsShortShort() throws IOException {
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var a = slot(arena);
+            var b = slot(arena);
+            var c = slot(arena);
+            TaoString.write(a, "hello", tree);
+            TaoString.write(b, "hello", tree);
+            TaoString.write(c, "world", tree);
+
+            assertTrue(TaoString.equals(a, b, tree));
+            assertTrue(TaoString.equals(b, a, tree));
+            assertFalse(TaoString.equals(a, c, tree));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // equals() — different length buckets never equal
+    // -----------------------------------------------------------------
+
+    @Test
+    void equalsShortLongNotEqual() throws IOException {
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var shrt = slot(arena);
+            var lng = slot(arena);
+            TaoString.write(shrt, "short", tree);
+            TaoString.write(lng, "this-is-a-longer-string", tree);
+            assertFalse(TaoString.equals(shrt, lng, tree));
+            assertFalse(TaoString.equals(lng, shrt, tree));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // equals() — long/long same + different
+    // -----------------------------------------------------------------
+
+    @Test
+    void equalsLongLong() throws IOException {
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var a = slot(arena);
+            var b = slot(arena);
+            String s = "Haliaeetus leucocephalus";
+            TaoString.write(a, s, tree);
+            TaoString.write(b, s, tree);
+            assertTrue(TaoString.equals(a, b, tree));
         }
     }
 
     @Test
-    void emptyString() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
+    void equalsLongLongSamePrefixDifferentTails() throws IOException {
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var a = slot(arena);
+            var b = slot(arena);
+            // Same 4-byte prefix "Halt" but differ after; same length so the
+            // header word collides and the code must compare the overflow.
+            TaoString.write(a, "Halteridium trailing1xx", tree);
+            TaoString.write(b, "Halteridium trailing2xx", tree);
+            assertFalse(TaoString.equals(a, b, tree));
+        }
+    }
 
-                TaoString.write(slot, new byte[0], tree);
-                assertTrue(TaoString.isShort(slot));
-                assertEquals(0, TaoString.length(slot));
-                assertArrayEquals(new byte[0], TaoString.readBytes(slot, tree));
-            }
+    // -----------------------------------------------------------------
+    // equalsBytes()
+    // -----------------------------------------------------------------
+
+    @Test
+    void equalsBytesShortMatch() throws IOException {
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var s = slot(arena);
+            TaoString.write(s, "abc", tree);
+            assertTrue(TaoString.equalsBytes(s, "abc".getBytes(StandardCharsets.UTF_8), tree));
+            assertFalse(TaoString.equalsBytes(s, "abd".getBytes(StandardCharsets.UTF_8), tree));
+            // Different length → fast-reject
+            assertFalse(TaoString.equalsBytes(s, "abcd".getBytes(StandardCharsets.UTF_8), tree));
         }
     }
 
     @Test
-    void equalsShortStrings() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            byte[] keyA = new byte[TaoString.SIZE];
-            byte[] keyB = new byte[TaoString.SIZE];
-            keyA[0] = 1;
-            keyB[0] = 2;
+    void equalsBytesLongMatch() throws IOException {
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var s = slot(arena);
+            String big = "this-is-a-longer-string";
+            TaoString.write(s, big, tree);
+            assertTrue(TaoString.equalsBytes(s, big.getBytes(StandardCharsets.UTF_8), tree));
 
-            try (var w = tree.write()) {
-                long leafA = w.getOrCreate(keyA, 0);
-                long leafB = w.getOrCreate(keyB, 0);
-                var a = w.leafValue(leafA);
-                var b = w.leafValue(leafB);
+            byte[] diffPrefix = big.getBytes(StandardCharsets.UTF_8).clone();
+            diffPrefix[0] = 'T';
+            assertFalse(TaoString.equalsBytes(s, diffPrefix, tree));
 
-                byte[] data = "hello".getBytes(StandardCharsets.UTF_8);
-                TaoString.write(a, data, tree);
-                TaoString.write(b, data, tree);
-
-                assertTrue(TaoString.equals(a, b, tree));
-            }
+            byte[] diffTail = big.getBytes(StandardCharsets.UTF_8).clone();
+            diffTail[diffTail.length - 1] = '!';
+            assertFalse(TaoString.equalsBytes(s, diffTail, tree));
         }
     }
 
     @Test
-    void equalsLongStrings() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            byte[] keyA = new byte[TaoString.SIZE];
-            byte[] keyB = new byte[TaoString.SIZE];
-            keyA[0] = 1;
-            keyB[0] = 2;
-
-            try (var w = tree.write()) {
-                long leafA = w.getOrCreate(keyA, 0);
-                long leafB = w.getOrCreate(keyB, 0);
-                var a = w.leafValue(leafA);
-                var b = w.leafValue(leafB);
-
-                byte[] data = "Centropomus undecimalis".getBytes(StandardCharsets.UTF_8);
-                TaoString.write(a, data, tree);
-                TaoString.write(b, data, tree);
-
-                assertTrue(TaoString.equals(a, b, tree));
-            }
+    void equalsShortShortSameHeaderDifferentInlineInt() throws IOException {
+        // Same length (6) with identical first 4 data bytes ("abcd") ⇒ header
+        // longs at offset 0 are equal. The codec must compare the second inline
+        // int (offset 8) to detect the mismatch in the remaining payload.
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var a = slot(arena);
+            var b = slot(arena);
+            TaoString.write(a, "abcdXY", tree);
+            TaoString.write(b, "abcdZW", tree);
+            assertFalse(TaoString.equals(a, b, tree),
+                    "short strings differing only in payload bytes 8..11 must compare unequal");
         }
     }
 
     @Test
-    void notEqualsDifferentLength() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            byte[] keyA = new byte[TaoString.SIZE];
-            byte[] keyB = new byte[TaoString.SIZE];
-            keyA[0] = 1;
-            keyB[0] = 2;
-
-            try (var w = tree.write()) {
-                long leafA = w.getOrCreate(keyA, 0);
-                long leafB = w.getOrCreate(keyB, 0);
-                var a = w.leafValue(leafA);
-                var b = w.leafValue(leafB);
-
-                TaoString.write(a, "abc".getBytes(StandardCharsets.UTF_8), tree);
-                TaoString.write(b, "abcd".getBytes(StandardCharsets.UTF_8), tree);
-
-                assertFalse(TaoString.equals(a, b, tree));
-            }
+    void equalsBytesAtShortThresholdBoundary() throws IOException {
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var s = slot(arena);
+            String twelve = "abcdefghijkl"; // exactly 12 bytes → short path
+            TaoString.write(s, twelve, tree);
+            assertTrue(TaoString.equalsBytes(s,
+                    twelve.getBytes(StandardCharsets.UTF_8), tree));
+            // Differ in the last byte — boundary mutator would miss this
+            // if the `<=` were flipped to `<`.
+            byte[] diffLast = twelve.getBytes(StandardCharsets.UTF_8).clone();
+            diffLast[11] = 'Z';
+            assertFalse(TaoString.equalsBytes(s, diffLast, tree));
         }
     }
 
     @Test
-    void notEqualsDifferentContent() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            byte[] keyA = new byte[TaoString.SIZE];
-            byte[] keyB = new byte[TaoString.SIZE];
-            keyA[0] = 1;
-            keyB[0] = 2;
-
-            try (var w = tree.write()) {
-                long leafA = w.getOrCreate(keyA, 0);
-                long leafB = w.getOrCreate(keyB, 0);
-                var a = w.leafValue(leafA);
-                var b = w.leafValue(leafB);
-
-                TaoString.write(a, "Haliaeetus leucocephalus".getBytes(StandardCharsets.UTF_8), tree);
-                TaoString.write(b, "Haliaeetus pelagicus".getBytes(StandardCharsets.UTF_8), tree);
-
-                assertFalse(TaoString.equals(a, b, tree));
+    void equalsBytesLongPrefixDifferAtEveryIndex() throws IOException {
+        // Covers each of the 4 prefix-byte comparisons by writing a long
+        // string and then testing a differing byte at each prefix index.
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var s = slot(arena);
+            byte[] raw = "abcd-long-string-longer-than-12b".getBytes(StandardCharsets.UTF_8);
+            TaoString.write(s, raw, tree);
+            for (int i = 0; i < 4; i++) {
+                byte[] mod = raw.clone();
+                mod[i] = (byte) (mod[i] ^ 0x40);
+                assertFalse(TaoString.equalsBytes(s, mod, tree),
+                        "prefix-byte diff at index " + i + " must reject");
             }
+            // And a matching byte array must still match.
+            assertTrue(TaoString.equalsBytes(s, raw, tree));
         }
     }
 
     @Test
-    void equalsBytesShort() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
-
-                byte[] data = "US".getBytes(StandardCharsets.UTF_8);
-                TaoString.write(slot, data, tree);
-
-                assertTrue(TaoString.equalsBytes(slot, data, tree));
-                assertFalse(TaoString.equalsBytes(slot, "DE".getBytes(StandardCharsets.UTF_8), tree));
-            }
-        }
-    }
-
-    @Test
-    void equalsBytesLong() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
-
-                byte[] data = "HUMAN_OBSERVATION".getBytes(StandardCharsets.UTF_8);
-                TaoString.write(slot, data, tree);
-
-                assertTrue(TaoString.equalsBytes(slot, data, tree));
-                assertFalse(TaoString.equalsBytes(slot, "MACHINE_OBSERVATION".getBytes(StandardCharsets.UTF_8), tree));
-            }
-        }
-    }
-
-    @Test
-    void writeStringOverload() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
-
-                TaoString.write(slot, "Panthera tigris", tree);
-                assertEquals("Panthera tigris", TaoString.read(slot, tree));
-            }
-        }
-    }
-
-    // ---- Mutation-killing: write length field ----
-
-    @Test
-    void writeLengthFieldIsSet() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
-
-                // Write then verify length can be read back correctly
-                byte[] data = "test".getBytes(StandardCharsets.UTF_8);
-                TaoString.write(slot, data, tree);
-
-                // Overwrite with a different-length string
-                byte[] data2 = "longer data!".getBytes(StandardCharsets.UTF_8);
-                TaoString.write(slot, data2, tree);
-                assertEquals(data2.length, TaoString.length(slot));
-                assertArrayEquals(data2, TaoString.readBytes(slot, tree));
-            }
-        }
-    }
-
-    @Test
-    void writeLongStringLengthFieldIsSet() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
-
-                String s = "Haliaeetus leucocephalus";
-                TaoString.write(slot, s, tree);
-                assertEquals(s.length(), TaoString.length(slot));
-                assertEquals(s, TaoString.read(slot, tree));
-            }
-        }
-    }
-
-    // ---- Mutation-killing: equals fast path ----
-
-    @Test
-    void equalsReturnsFalseForDifferentShortInlineData() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            byte[] keyA = new byte[TaoString.SIZE];
-            byte[] keyB = new byte[TaoString.SIZE];
-            keyA[0] = 1; keyB[0] = 2;
-
-            try (var w = tree.write()) {
-                long leafA = w.getOrCreate(keyA, 0);
-                long leafB = w.getOrCreate(keyB, 0);
-                var a = w.leafValue(leafA);
-                var b = w.leafValue(leafB);
-
-                // Same length, different content in data bytes 4-7 (slot offset 8-11)
-                TaoString.write(a, "AAAA1111".getBytes(StandardCharsets.UTF_8), tree); // 8 bytes
-                TaoString.write(b, "AAAA2222".getBytes(StandardCharsets.UTF_8), tree); // 8 bytes
-
-                assertFalse(TaoString.equals(a, b, tree));
-            }
-        }
-    }
-
-    @Test
-    void equalsLongStringSamePrefix() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            byte[] keyA = new byte[TaoString.SIZE];
-            byte[] keyB = new byte[TaoString.SIZE];
-            keyA[0] = 1; keyB[0] = 2;
-
-            try (var w = tree.write()) {
-                long leafA = w.getOrCreate(keyA, 0);
-                long leafB = w.getOrCreate(keyB, 0);
-                var a = w.leafValue(leafA);
-                var b = w.leafValue(leafB);
-
-                // Same 4-byte prefix, same length, different suffix → tests overflow comparison
-                TaoString.write(a, "ABCD_different_tail_1".getBytes(StandardCharsets.UTF_8), tree);
-                TaoString.write(b, "ABCD_different_tail_2".getBytes(StandardCharsets.UTF_8), tree);
-
-                assertFalse(TaoString.equals(a, b, tree));
-            }
-        }
-    }
-
-    // ---- Mutation-killing: equalsBytes boundary conditions ----
-
-    @Test
-    void equalsBytesBoundaryAt13Bytes() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
-
-                byte[] data = "1234567890123".getBytes(StandardCharsets.UTF_8);  // 13 bytes = overflow
-                TaoString.write(slot, data, tree);
-
-                assertTrue(TaoString.equalsBytes(slot, data, tree));
-                // Same length, different content
-                assertFalse(TaoString.equalsBytes(slot, "1234567890124".getBytes(StandardCharsets.UTF_8), tree));
-                // Same prefix, different length
-                assertFalse(TaoString.equalsBytes(slot, "123456789012".getBytes(StandardCharsets.UTF_8), tree));
-            }
-        }
-    }
-
-    @Test
-    void equalsBytesShortLastByteDiffers() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
-
-                byte[] data = "abcdefghijkl".getBytes(StandardCharsets.UTF_8);  // 12 bytes inline
-                TaoString.write(slot, data, tree);
-
-                assertTrue(TaoString.equalsBytes(slot, data, tree));
-                // Differ only in last byte
-                byte[] diff = "abcdefghijkm".getBytes(StandardCharsets.UTF_8);
-                assertFalse(TaoString.equalsBytes(slot, diff, tree));
-            }
-        }
-    }
-
-    @Test
-    void equalsBytesLongPrefixDiffers() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
-
-                byte[] data = "ABCDEFGHIJKLMNOP".getBytes(StandardCharsets.UTF_8);  // 16 bytes overflow
-                TaoString.write(slot, data, tree);
-
-                assertTrue(TaoString.equalsBytes(slot, data, tree));
-                // Differ in prefix (byte 2)
-                byte[] diffPrefix = "ABxDEFGHIJKLMNOP".getBytes(StandardCharsets.UTF_8);
-                assertFalse(TaoString.equalsBytes(slot, diffPrefix, tree));
-            }
-        }
-    }
-
-    // ---- Round 2: zero-padding mutation ----
-
-    @Test
-    void shortStringZeroPadded() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                // Write a long string first to fill the slot with non-zero data
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
-                TaoString.write(slot, "AAAAAAAAAAAA".getBytes(StandardCharsets.UTF_8), tree); // 12 bytes, fills payload
-                // Now overwrite with a shorter string
-                TaoString.write(slot, "BB".getBytes(StandardCharsets.UTF_8), tree); // 2 bytes
-                // Read back and verify exact content (no leftover from previous write)
-                assertArrayEquals("BB".getBytes(StandardCharsets.UTF_8), TaoString.readBytes(slot, tree));
-                // Verify by checking equality with a fresh write of "BB"
-                byte[] key2 = new byte[TaoString.SIZE];
-                key2[0] = 2;
-                long leaf2 = w.getOrCreate(key2, 0);
-                var slot2 = w.leafValue(leaf2);
-                TaoString.write(slot2, "BB".getBytes(StandardCharsets.UTF_8), tree);
-                assertTrue(TaoString.equals(slot, slot2, tree), "Zero-padding mismatch after overwrite");
-            }
-        }
-    }
-
-    // ---- Round 2: equals boundary at exactly 12 bytes ----
-
-    @Test
-    void equalsExactly12ByteStrings() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            byte[] keyA = new byte[TaoString.SIZE];
-            byte[] keyB = new byte[TaoString.SIZE];
-            keyA[0] = 1; keyB[0] = 2;
-
-            try (var w = tree.write()) {
-                long leafA = w.getOrCreate(keyA, 0);
-                long leafB = w.getOrCreate(keyB, 0);
-                var a = w.leafValue(leafA);
-                var b = w.leafValue(leafB);
-
-                // Exactly 12 bytes — boundary case for SHORT_THRESHOLD
-                byte[] data = "AbcDef012345".getBytes(StandardCharsets.UTF_8);
-                assertEquals(12, data.length);
-                TaoString.write(a, data, tree);
-                TaoString.write(b, data, tree);
-
-                assertTrue(TaoString.equals(a, b, tree));
-                assertTrue(TaoString.isShort(a));
-            }
-        }
-    }
-
-    // ---- Round 2: equalsBytes long string with matching prefix ----
-
-    @Test
-    void equalsBytesLongStringMatchingPrefixDifferentTail() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
-
-                // 20-byte string: same 4-byte prefix, different after that
-                byte[] data = "ABCDxxxxxxxxxxxx1234".getBytes(StandardCharsets.UTF_8);
-                TaoString.write(slot, data, tree);
-
-                assertTrue(TaoString.equalsBytes(slot, data, tree));
-                // Same prefix "ABCD" but different tail
-                byte[] diff = "ABCDxxxxxxxxxxxx5678".getBytes(StandardCharsets.UTF_8);
-                assertFalse(TaoString.equalsBytes(slot, diff, tree));
-            }
-        }
-    }
-
-    // ---- STRONGER: equalsBytes length mismatch kills ----
-
-    @Test
-    void equalsBytesRejectsDifferentLengths() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
-
-                TaoString.write(slot, "abc".getBytes(StandardCharsets.UTF_8), tree);
-
-                // Different lengths must return false
-                assertFalse(TaoString.equalsBytes(slot, "ab".getBytes(StandardCharsets.UTF_8), tree));
-                assertFalse(TaoString.equalsBytes(slot, "abcd".getBytes(StandardCharsets.UTF_8), tree));
-                assertFalse(TaoString.equalsBytes(slot, "".getBytes(StandardCharsets.UTF_8), tree));
-            }
-        }
-    }
-
-    @Test
-    void equalsBytesLongDifferentInFirstPrefixByte() throws IOException {
-        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), TaoString.SIZE, TaoString.SIZE)) {
-            try (var w = tree.write()) {
-                long leaf = w.getOrCreate(new byte[TaoString.SIZE], 0);
-                var slot = w.leafValue(leaf);
-
-                // 16 bytes → long string
-                byte[] data = "0123456789abcdef".getBytes(StandardCharsets.UTF_8);
-                TaoString.write(slot, data, tree);
-
-                // Differ in first byte of prefix (byte 0)
-                byte[] diff = "X123456789abcdef".getBytes(StandardCharsets.UTF_8);
-                assertFalse(TaoString.equalsBytes(slot, diff, tree));
-            }
+    void equalsBytesViaByteArrayOverload() throws IOException {
+        try (var tree = tree(); var arena = Arena.ofConfined()) {
+            var s = slot(arena);
+            byte[] raw = "bytes-ok".getBytes(StandardCharsets.UTF_8);
+            TaoString.write(s, raw, tree);
+            assertEquals("bytes-ok", TaoString.read(s, tree));
+            assertTrue(TaoString.equalsBytes(s, raw, tree));
         }
     }
 }

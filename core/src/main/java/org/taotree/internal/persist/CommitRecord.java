@@ -28,7 +28,7 @@ import org.taotree.internal.art.NodePtr;
  * 24      4     dictionaryCount (u32)
  * 28      4     arenaStartPage (u32)
  * 32      4     arenaEndPage (u32, exclusive)
- * 36      4     reserved (0)
+ * 36      4     childTreeCount (u32, 0 for non-temporal trees)
  * </pre>
  *
  * <p>Followed by {@code dictionaryCount} entries of:
@@ -36,6 +36,12 @@ import org.taotree.internal.art.NodePtr;
  * 8B  dictRoot (NodePtr)
  * 8B  dictNextCode
  * 8B  dictSize
+ * </pre>
+ *
+ * <p>Followed by {@code childTreeCount} entries of:
+ * <pre>
+ * 8B  childRoot (NodePtr)
+ * 8B  childSize
  * </pre>
  */
 public final class CommitRecord {
@@ -46,17 +52,20 @@ public final class CommitRecord {
     public static final int MAX_PAYLOAD_SIZE = ChunkStore.PAGE_SIZE - RecordHeader.HEADER_SIZE;
 
     // Fixed payload field offsets (relative to payload start)
-    private static final int OFF_PREV_COMMIT_PAGE = 0;
-    private static final int OFF_PRIMARY_ROOT     = 8;
-    private static final int OFF_PRIMARY_SIZE     = 16;
-    private static final int OFF_DICT_COUNT       = 24;
-    private static final int OFF_ARENA_START_PAGE = 28;
-    private static final int OFF_ARENA_END_PAGE   = 32;
-    private static final int OFF_RESERVED         = 36;
-    private static final int FIXED_PAYLOAD_SIZE   = 40;
+    private static final int OFF_PREV_COMMIT_PAGE   = 0;
+    private static final int OFF_PRIMARY_ROOT       = 8;
+    private static final int OFF_PRIMARY_SIZE       = 16;
+    private static final int OFF_DICT_COUNT         = 24;
+    private static final int OFF_ARENA_START_PAGE   = 28;
+    private static final int OFF_ARENA_END_PAGE     = 32;
+    private static final int OFF_CHILD_TREE_COUNT   = 36;
+    private static final int FIXED_PAYLOAD_SIZE     = 40;
 
     /** Size of each dictionary entry in bytes (dictRoot + dictNextCode + dictSize). */
     private static final int DICT_ENTRY_SIZE = 24;
+
+    /** Size of each child tree entry in bytes (childRoot + childSize). */
+    private static final int CHILD_TREE_ENTRY_SIZE = 16;
 
     // -----------------------------------------------------------------------
     // Data class
@@ -76,6 +85,10 @@ public final class CommitRecord {
         public long[] dictSizes;
         public int arenaStartPage;
         public int arenaEndPage;
+        // Child trees (e.g. HINT, time index for temporal trees)
+        public int childTreeCount;
+        public long[] childTreeRoots = new long[0];
+        public long[] childTreeSizes = new long[0];
     }
 
     // -----------------------------------------------------------------------
@@ -94,7 +107,8 @@ public final class CommitRecord {
      */
     public static void write(MemorySegment page, CommitData data) {
         int dictCount = data.dictionaryCount;
-        int payloadLen = payloadSize(dictCount);
+        int childCount = data.childTreeCount;
+        int payloadLen = payloadSize(dictCount, childCount);
 
         long pOff = RecordHeader.HEADER_SIZE; // payload start offset within the page
 
@@ -106,7 +120,7 @@ public final class CommitRecord {
         page.set(ValueLayout.JAVA_INT_UNALIGNED,  pOff + OFF_DICT_COUNT, dictCount);
         page.set(ValueLayout.JAVA_INT_UNALIGNED,  pOff + OFF_ARENA_START_PAGE, data.arenaStartPage);
         page.set(ValueLayout.JAVA_INT_UNALIGNED,  pOff + OFF_ARENA_END_PAGE, data.arenaEndPage);
-        page.set(ValueLayout.JAVA_INT_UNALIGNED,  pOff + OFF_RESERVED, 0);
+        page.set(ValueLayout.JAVA_INT_UNALIGNED,  pOff + OFF_CHILD_TREE_COUNT, childCount);
 
         // Write dictionary entries
         long dictOff = pOff + FIXED_PAYLOAD_SIZE;
@@ -115,6 +129,14 @@ public final class CommitRecord {
             page.set(ValueLayout.JAVA_LONG_UNALIGNED, dictOff + 8,  data.dictNextCodes[i]);
             page.set(ValueLayout.JAVA_LONG_UNALIGNED, dictOff + 16, data.dictSizes[i]);
             dictOff += DICT_ENTRY_SIZE;
+        }
+
+        // Write child tree entries
+        long childOff = dictOff;
+        for (int i = 0; i < childCount; i++) {
+            page.set(ValueLayout.JAVA_LONG_UNALIGNED, childOff,     data.childTreeRoots[i]);
+            page.set(ValueLayout.JAVA_LONG_UNALIGNED, childOff + 8, data.childTreeSizes[i]);
+            childOff += CHILD_TREE_ENTRY_SIZE;
         }
 
         // Compute payload CRC-32C
@@ -180,12 +202,16 @@ public final class CommitRecord {
         data.dictionaryCount = page.get(ValueLayout.JAVA_INT_UNALIGNED, pOff + OFF_DICT_COUNT);
         data.arenaStartPage = page.get(ValueLayout.JAVA_INT_UNALIGNED, pOff + OFF_ARENA_START_PAGE);
         data.arenaEndPage = page.get(ValueLayout.JAVA_INT_UNALIGNED, pOff + OFF_ARENA_END_PAGE);
+        data.childTreeCount = page.get(ValueLayout.JAVA_INT_UNALIGNED, pOff + OFF_CHILD_TREE_COUNT);
 
         int dictCount = data.dictionaryCount;
-        // Validate dictionaryCount against the declared payloadLength to prevent
+        int childCount = data.childTreeCount;
+        // Validate counts against the declared payloadLength to prevent
         // large array allocations or out-of-bounds reads on corrupted records.
-        int expectedPayloadLen = FIXED_PAYLOAD_SIZE + dictCount * DICT_ENTRY_SIZE;
-        if (dictCount < 0 || expectedPayloadLen > payloadLen) {
+        int expectedPayloadLen = FIXED_PAYLOAD_SIZE
+            + dictCount * DICT_ENTRY_SIZE
+            + childCount * CHILD_TREE_ENTRY_SIZE;
+        if (dictCount < 0 || childCount < 0 || expectedPayloadLen > payloadLen) {
             return null;
         }
         data.dictRoots = new long[dictCount];
@@ -198,6 +224,16 @@ public final class CommitRecord {
             data.dictNextCodes[i] = page.get(ValueLayout.JAVA_LONG_UNALIGNED, dictOff + 8);
             data.dictSizes[i] = page.get(ValueLayout.JAVA_LONG_UNALIGNED, dictOff + 16);
             dictOff += DICT_ENTRY_SIZE;
+        }
+
+        // Child tree entries (HINT, time index)
+        data.childTreeRoots = new long[childCount];
+        data.childTreeSizes = new long[childCount];
+        long childOff = dictOff;
+        for (int i = 0; i < childCount; i++) {
+            data.childTreeRoots[i] = page.get(ValueLayout.JAVA_LONG_UNALIGNED, childOff);
+            data.childTreeSizes[i] = page.get(ValueLayout.JAVA_LONG_UNALIGNED, childOff + 8);
+            childOff += CHILD_TREE_ENTRY_SIZE;
         }
 
         return data;
@@ -218,12 +254,25 @@ public final class CommitRecord {
     // -----------------------------------------------------------------------
 
     /**
-     * Compute the required payload size for the given dictionary count.
+     * Compute the required payload size for the given dictionary and child tree counts.
+     *
+     * @param dictCount number of dictionary entries
+     * @param childTreeCount number of child tree entries (HINT, time index)
+     * @return payload size in bytes
+     */
+    public static int payloadSize(int dictCount, int childTreeCount) {
+        return FIXED_PAYLOAD_SIZE
+            + dictCount * DICT_ENTRY_SIZE
+            + childTreeCount * CHILD_TREE_ENTRY_SIZE;
+    }
+
+    /**
+     * Compute the required payload size for the given dictionary count (no child trees).
      *
      * @param dictCount number of dictionary entries
      * @return payload size in bytes
      */
     public static int payloadSize(int dictCount) {
-        return FIXED_PAYLOAD_SIZE + dictCount * DICT_ENTRY_SIZE;
+        return payloadSize(dictCount, 0);
     }
 }

@@ -2,7 +2,6 @@ package org.taotree.internal.cow;
 
 
 import java.lang.foreign.MemorySegment;
-import org.taotree.TaoString;
 import org.taotree.TaoTree;
 import org.taotree.internal.alloc.BumpAllocator;
 import org.taotree.internal.alloc.ChunkStore;
@@ -153,7 +152,7 @@ public final class Compactor {
      * Copy a leaf node. Allocates a new segment of the same slab class,
      * copies the entire segment (key + value) verbatim.
      *
-     * <p>Overflow data in the {@link BumpAllocator} (e.g. TaoString overflow)
+     * <p>Overflow data in the {@link BumpAllocator} (e.g. string overflow)
      * is immutable and shared — overflow pointers remain valid without copying.
      */
     private long copyLeaf(long oldPtr) {

@@ -29,7 +29,7 @@ class EpochReclaimerTest {
             Path tmp = Files.createTempFile("slab-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var slab = new SlabAllocator(arena, cs, 1 << 20);
             int classId = slab.registerClass(SEGMENT_SIZE);
 
@@ -64,7 +64,7 @@ class EpochReclaimerTest {
             Path tmp = Files.createTempFile("slab-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var slab = new SlabAllocator(arena, cs, 1 << 20);
             int classId = slab.registerClass(SEGMENT_SIZE);
 
@@ -103,7 +103,7 @@ class EpochReclaimerTest {
             Path tmp = Files.createTempFile("slab-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var slab = new SlabAllocator(arena, cs, 1 << 20);
             int classId = slab.registerClass(SEGMENT_SIZE);
 
@@ -147,7 +147,7 @@ class EpochReclaimerTest {
             Path tmp = Files.createTempFile("slab-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var slab = new SlabAllocator(arena, cs, 1 << 20);
             int classId = slab.registerClass(SEGMENT_SIZE);
 

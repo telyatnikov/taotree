@@ -3,496 +3,479 @@ package org.taotree.examples.gbif;
 import dev.hardwood.InputFile;
 import dev.hardwood.reader.ParquetFileReader;
 import dev.hardwood.reader.RowReader;
-import org.taotree.*;
-
-import java.io.File;
-import java.lang.foreign.Arena;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.Arrays;
 import org.taotree.TaoTree;
+import org.taotree.Value;
 import org.taotree.layout.KeyBuilder;
 import org.taotree.layout.KeyField;
 import org.taotree.layout.KeyHandle;
 import org.taotree.layout.KeyLayout;
-import org.taotree.layout.LeafField;
-import org.taotree.layout.LeafHandle;
-import org.taotree.layout.LeafLayout;
+
+import java.io.File;
+import java.io.IOException;
+import java.lang.foreign.Arena;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.*;
 
 /**
- * GBIF Species Observation Tracker — demonstrates TaoTree with real biodiversity data.
+ * GBIF Species Observation Tracker — Approach B (taxonomy-prefix + temporal).
  *
- * <p>Reads GBIF Simple Parquet occurrence files using <a href="https://hardwood.dev">Hardwood</a>
- * and indexes species observations into a persistent, file-backed {@link TaoTree}.
+ * <p>This example demonstrates the non-trivial capabilities of a unified
+ * temporal TaoTree on a real-world dataset:
+ * <ul>
+ *   <li>7-field taxonomic prefix key → ordered range scans across taxonomy
+ *       (e.g. all Mammalia within a country);</li>
+ *   <li>per-entity CHAMP maps → non-taxonomic cells attached to each
+ *       occurrence as attributes;</li>
+ *   <li>observation timestamp ({@code eventdate}) → temporal history, lets
+ *       queries travel back in time for the same entity;</li>
+ *   <li>{@link dev.hardwood} Parquet reader → real ingestion from the GBIF
+ *       Simple download format.</li>
+ * </ul>
  *
- * <p>The store file ({@code gbif-tracker.taotree}) is created next to the source Parquet
- * files. Each run rebuilds the store from the input Parquet data.
+ * <p>The example is <em>fully reversible</em>: every cell of every input
+ * Parquet row is restorable from the TaoTree store plus a small
+ * {@code schema.json} sidecar.
  *
- * <p>Usage: {@code java -cp ... org.taotree.examples.gbif.GbifTracker <parquet-dir-or-file>}
+ * <h3>Subcommands</h3>
+ * <ul>
+ *   <li>{@code ingest &lt;parquet-dir&gt; &lt;store.taotree&gt;} — read Parquet files
+ *       and populate a new store.</li>
+ *   <li>{@code verify &lt;parquet-dir&gt; &lt;store.taotree&gt;} — re-read the
+ *       Parquet files, reconstruct every row from the store, and assert
+ *       every cell round-trips exactly.</li>
+ *   <li>{@code query &lt;store.taotree&gt; &lt;kingdom&gt; [phylum] [class] …}
+ *       — range-scan the store by a taxonomic prefix and print matches.</li>
+ *   <li>{@code stats &lt;store.taotree&gt;} — print tree size, dictionary
+ *       sizes, a few sample entities.</li>
+ * </ul>
  */
-public class GbifTracker {
+public final class GbifTracker {
 
-    static final String STORE_NAME = "gbif-tracker.taotree";
+    private GbifTracker() {}
 
-    // -----------------------------------------------------------------------
-    // Schema: declared once, used everywhere via handles
-    // -----------------------------------------------------------------------
-
-    static final KeyLayout KEY_LAYOUT = KeyLayout.of(
-        KeyField.dict16("kingdom"),
-        KeyField.dict16("phylum"),
-        KeyField.dict16("family"),
-        KeyField.dict32("species"),
-        KeyField.dict16("countryCode"),
-        KeyField.dict16("stateProvince")
-    );
-
-    static final LeafLayout LEAF_LAYOUT = LeafLayout.of(
-        LeafField.int32("count"),
-        LeafField.int32("year").nullable(),
-        LeafField.int32("month").nullable(),
-        LeafField.int32("day").nullable(),
-        LeafField.float64("decimalLatitude").nullable(),
-        LeafField.float64("decimalLongitude").nullable(),
-        LeafField.float64("elevation").nullable(),
-        LeafField.int32("individualCount").nullable(),
-        LeafField.int32("taxonKey").nullable(),
-        LeafField.int32("speciesKey").nullable(),
-        LeafField.string("locality").nullable(),
-        LeafField.string("recordedBy").nullable(),
-        LeafField.extras("extras")
-    );
-
-    static final LeafHandle.Int32   COUNT     = LEAF_LAYOUT.int32("count");
-    static final LeafHandle.Int32   YEAR      = LEAF_LAYOUT.int32("year");
-    static final LeafHandle.Int32   MONTH     = LEAF_LAYOUT.int32("month");
-    static final LeafHandle.Int32   DAY       = LEAF_LAYOUT.int32("day");
-    static final LeafHandle.Float64 LAT       = LEAF_LAYOUT.float64("decimalLatitude");
-    static final LeafHandle.Float64 LON       = LEAF_LAYOUT.float64("decimalLongitude");
-    static final LeafHandle.Float64 ELEV      = LEAF_LAYOUT.float64("elevation");
-    static final LeafHandle.Int32   IND_CNT   = LEAF_LAYOUT.int32("individualCount");
-    static final LeafHandle.Int32   TAXON_K   = LEAF_LAYOUT.int32("taxonKey");
-    static final LeafHandle.Int32   SPECIES_K = LEAF_LAYOUT.int32("speciesKey");
-    static final LeafHandle.Str     LOCALITY  = LEAF_LAYOUT.string("locality");
-    static final LeafHandle.Str     RECORDED  = LEAF_LAYOUT.string("recordedBy");
-    static final LeafHandle.Extras  EXTRAS    = LEAF_LAYOUT.extras("extras");
-
-    // -----------------------------------------------------------------------
-    // Reusable key-handle bundle (bound to a specific tree)
-    // -----------------------------------------------------------------------
-
-    /** Key handles bound to a tree instance. Thread-safe (immutable after construction). */
-    record KeyHandles(
-        KeyHandle.Dict16 kingdom, KeyHandle.Dict16 phylum, KeyHandle.Dict16 family,
-        KeyHandle.Dict32 species, KeyHandle.Dict16 country, KeyHandle.Dict16 state
-    ) {
-        static KeyHandles bind(TaoTree tree) {
-            return new KeyHandles(
-                tree.keyDict16("kingdom"), tree.keyDict16("phylum"),
-                tree.keyDict16("family"),  tree.keyDict32("species"),
-                tree.keyDict16("countryCode"), tree.keyDict16("stateProvince"));
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Shared ingestion: encode key + write leaf from a Parquet row
-    // -----------------------------------------------------------------------
-
-    /**
-     * Encode the key from the current Parquet row. Returns the species string,
-     * or {@code null} if the row should be skipped (no species field).
-     */
-    static String encodeKey(KeyBuilder kb, KeyHandles kh, RowReader rows) {
-        String species = nullSafe(rows, "species");
-        if (species == null) return null;
-        kb.set(kh.kingdom, nullSafe(rows, "kingdom"))
-          .set(kh.phylum,  nullSafe(rows, "phylum"))
-          .set(kh.family,  nullSafe(rows, "family"))
-          .set(kh.species, species)
-          .set(kh.country, nullSafe(rows, "countrycode"))
-          .set(kh.state,   nullSafe(rows, "stateprovince"));
-        return species;
-    }
-
-    /**
-     * Write (or update) the leaf for the current Parquet row.
-     * The key must already be encoded in the KeyBuilder.
-     *
-     * @return 1 if the row was forwarded (new or updated), 0 if suppressed (older dup)
-     */
-    static int writeLeaf(TaoTree.WriteScope w, KeyBuilder kb, RowReader rows) {
-        var leaf = w.getOrCreate(kb);
-
-        int year  = safeInt(rows, "year");
-        int month = safeInt(rows, "month");
-        int day   = safeInt(rows, "day");
-        double lat  = safeDouble(rows, "decimallatitude");
-        double lon  = safeDouble(rows, "decimallongitude");
-        double elev = safeDouble(rows, "elevation");
-
-        int existingCount = leaf.get(COUNT);
-        if (existingCount == 0) {
-            leaf.set(COUNT, 1);
-            setOrNull(leaf, YEAR, year, rows, "year");
-            setOrNull(leaf, MONTH, month, rows, "month");
-            setOrNull(leaf, DAY, day, rows, "day");
-            setOrNullDouble(leaf, LAT, lat, rows, "decimallatitude");
-            setOrNullDouble(leaf, LON, lon, rows, "decimallongitude");
-            setOrNullDouble(leaf, ELEV, elev, rows, "elevation");
-            setOrNull(leaf, IND_CNT, safeInt(rows, "individualcount"), rows, "individualcount");
-            setOrNull(leaf, TAXON_K, safeInt(rows, "taxonkey"), rows, "taxonkey");
-            setOrNull(leaf, SPECIES_K, safeInt(rows, "specieskey"), rows, "specieskey");
-            String locality = nullSafe(rows, "locality");
-            if (locality != null) leaf.set(LOCALITY, locality); else leaf.setNull(LOCALITY);
-            String recordedBy = nullSafe(rows, "recordedby");
-            if (recordedBy != null) leaf.set(RECORDED, recordedBy); else leaf.setNull(RECORDED);
-            writeExtras(leaf, rows);
-            return 1;
-        } else {
-            int taxon     = safeInt(rows, "taxonkey");
-            int species   = safeInt(rows, "specieskey");
-            int ind       = safeInt(rows, "individualcount");
-            String locality   = nullSafe(rows, "locality");
-            String recordedBy = nullSafe(rows, "recordedby");
-            leaf.set(COUNT, existingCount + 1);
-            int cmp = compareExceptExtras(year, month, day, lat, lon, taxon, species, ind, locality, recordedBy,
-                        leaf.get(YEAR), leaf.get(MONTH), leaf.get(DAY),
-                        getD(leaf, LAT), getD(leaf, LON),
-                        leaf.get(TAXON_K), leaf.get(SPECIES_K), leaf.get(IND_CNT),
-                        leaf.get(LOCALITY), leaf.get(RECORDED));
-            if (cmp < 0) return 0;
-            String extras = buildExtrasJson(rows);
-            if (cmp > 0 || compareNullable(extras, leaf.get(EXTRAS)) > 0) {
-                setOrNull(leaf, YEAR, year, rows, "year");
-                setOrNull(leaf, MONTH, month, rows, "month");
-                setOrNull(leaf, DAY, day, rows, "day");
-                setOrNullDouble(leaf, LAT, lat, rows, "decimallatitude");
-                setOrNullDouble(leaf, LON, lon, rows, "decimallongitude");
-                setOrNullDouble(leaf, ELEV, elev, rows, "elevation");
-                setOrNull(leaf, IND_CNT, ind, rows, "individualcount");
-                setOrNull(leaf, TAXON_K, taxon, rows, "taxonkey");
-                setOrNull(leaf, SPECIES_K, species, rows, "specieskey");
-                if (locality != null) leaf.set(LOCALITY, locality); else leaf.setNull(LOCALITY);
-                if (recordedBy != null) leaf.set(RECORDED, recordedBy); else leaf.setNull(RECORDED);
-                if (extras != null) leaf.set(EXTRAS, extras); else leaf.set(EXTRAS, "");
-                return 1;
-            }
-            return 0;
-        }
-    }
-
-    private static void setOrNull(LeafAccessor leaf, LeafHandle.Int32 h, int value,
-                                  RowReader rows, String parquetField) {
-        if (rows.isNull(parquetField)) leaf.setNull(h);
-        else leaf.set(h, value);
-    }
-
-    private static void setOrNullDouble(LeafAccessor leaf, LeafHandle.Float64 h, double value,
-                                        RowReader rows, String parquetField) {
-        if (rows.isNull(parquetField)) leaf.setNull(h);
-        else leaf.set(h, value);
-    }
-
-    /** Read a nullable double from the tree, mapping null → NaN (matching safeDouble's sentinel). */
-    static double getD(LeafAccessor leaf, LeafHandle.Float64 h) {
-        return leaf.isNull(h) ? Double.NaN : leaf.get(h);
-    }
-
-    private static void writeExtras(LeafAccessor leaf, RowReader rows) {
-        var eb = leaf.extrasWriter(EXTRAS);
-        eb.put("class", nullSafe(rows, "class"));
-        eb.put("order", nullSafe(rows, "order"));
-        eb.put("basisOfRecord", nullSafe(rows, "basisofrecord"));
-        eb.put("license", nullSafe(rows, "license"));
-        eb.put("occurrenceStatus", nullSafe(rows, "occurrencestatus"));
-        eb.put("scientificName", nullSafe(rows, "scientificname"));
-        eb.put("institutionCode", nullSafe(rows, "institutioncode"));
-        eb.put("catalogNumber", nullSafe(rows, "catalognumber"));
-        eb.put("eventDate", nullSafe(rows, "eventdate"));
-        if (!rows.isNull("coordinateuncertaintyinmeters")) {
-            eb.put("coordinateUncertainty", rows.getDouble("coordinateuncertaintyinmeters"));
-        }
-        eb.write();
-    }
-
-    /**
-     * Total-order comparison for duplicate-key merge.
-     *
-     * <p>Compares year → month → day → lat → lon → taxonKey → speciesKey →
-     * individualCount → locality → recordedBy lexicographically so that exactly
-     * one observation wins regardless of thread interleaving. This makes the merge
-     * commutative: merge(A,B) == merge(B,A).
-     *
-     * <p>NaN coordinates sort below any real value (via {@link Double#compare}).
-     * Null strings sort below any non-null string. The string tiebreakers handle
-     * the rare case where two observations share the same date, coordinates, and
-     * taxon identifiers; without them the winner would depend on processing order,
-     * breaking multi-threaded reproducibility.
-     */
-    static boolean isNewer(int y, int m, int d, double lat, double lon,
-                           int taxon, int species, int ind,
-                           String loc, String rec, String ext,
-                           int ey, int em, int ed, double elat, double elon,
-                           int etaxon, int especies, int eind,
-                           String eloc, String erec, String eext) {
-        if (y != ey) return y > ey;
-        if (m != em) return m > em;
-        if (d != ed) return d > ed;
-        int c = Double.compare(lat, elat);
-        if (c != 0) return c > 0;
-        c = Double.compare(lon, elon);
-        if (c != 0) return c > 0;
-        if (taxon != etaxon) return taxon > etaxon;
-        if (species != especies) return species > especies;
-        if (ind != eind) return ind > eind;
-        c = compareNullable(loc, eloc);
-        if (c != 0) return c > 0;
-        c = compareNullable(rec, erec);
-        if (c != 0) return c > 0;
-        return compareNullable(ext, eext) > 0;
-    }
-
-    /** Returns negative/zero/positive like compareTo, but excludes the extras field. */
-    private static int compareExceptExtras(int y, int m, int d, double lat, double lon,
-                                           int taxon, int species, int ind,
-                                           String loc, String rec,
-                                           int ey, int em, int ed, double elat, double elon,
-                                           int etaxon, int especies, int eind,
-                                           String eloc, String erec) {
-        if (y != ey) return y > ey ? 1 : -1;
-        if (m != em) return m > em ? 1 : -1;
-        if (d != ed) return d > ed ? 1 : -1;
-        int c = Double.compare(lat, elat);
-        if (c != 0) return c;
-        c = Double.compare(lon, elon);
-        if (c != 0) return c;
-        if (taxon != etaxon) return taxon > etaxon ? 1 : -1;
-        if (species != especies) return species > especies ? 1 : -1;
-        if (ind != eind) return ind > eind ? 1 : -1;
-        c = compareNullable(loc, eloc);
-        if (c != 0) return c;
-        return compareNullable(rec, erec);
-    }
-
-    private static int compareNullable(String a, String b) {
-        // Treat empty strings the same as null: a zero-initialized TaoString leaf
-        // returns "" rather than null, so we normalize to avoid false asymmetries.
-        String na = (a == null || a.isEmpty()) ? null : a;
-        String nb = (b == null || b.isEmpty()) ? null : b;
-        if (na == null && nb == null) return 0;
-        if (na == null) return -1;
-        if (nb == null) return 1;
-        return na.compareTo(nb);
-    }
-
-    // -----------------------------------------------------------------------
-    // Create a fresh store
-    // -----------------------------------------------------------------------
-
-    static TaoTree createFresh(Path storePath) throws java.io.IOException {
-        if (Files.exists(storePath)) {
-            Files.delete(storePath);
-        }
-        return TaoTree.create(storePath, KEY_LAYOUT, LEAF_LAYOUT);
-    }
+    // ── Entry point ──────────────────────────────────────────────────────
 
     public static void main(String[] args) throws Exception {
-        if (args.length == 0) {
-            System.out.println("Usage: GbifTracker <parquet-dir-or-file>");
-            System.out.println("  e.g.: GbifTracker data/gbif/");
-            System.out.println("  e.g.: GbifTracker data/gbif/000001.parquet");
-            return;
-        }
-
-        File input = new File(args[0]);
-        File[] files;
-        File storeDir;
-        if (input.isDirectory()) {
-            files = input.listFiles((dir, name) -> name.endsWith(".parquet"));
-            if (files == null || files.length == 0) {
-                System.err.println("No .parquet files in " + input);
-                return;
+        if (args.length == 0) { usage(); return; }
+        String cmd = args[0];
+        switch (cmd) {
+            case "ingest" -> {
+                requireArgs(args, 3, "ingest <parquet-dir> <store.taotree>");
+                ingest(new File(args[1]), Path.of(args[2]));
             }
-            Arrays.sort(files);
-            storeDir = input;
-        } else {
-            files = new File[]{input};
-            storeDir = input.getParentFile() != null ? input.getParentFile() : new File(".");
+            case "verify" -> {
+                requireArgs(args, 3, "verify <parquet-dir> <store.taotree>");
+                verify(new File(args[1]), Path.of(args[2]));
+            }
+            case "query" -> {
+                if (args.length < 3) {
+                    System.err.println("query <store.taotree> <kingdom> [phylum] [class] [order] [family] [genus] [species]");
+                    return;
+                }
+                Path store = Path.of(args[1]);
+                String[] levels = Arrays.copyOfRange(args, 2, args.length);
+                query(store, levels);
+            }
+            case "stats" -> {
+                requireArgs(args, 2, "stats <store.taotree>");
+                stats(Path.of(args[1]));
+            }
+            default -> { usage(); }
+        }
+    }
+
+    private static void usage() {
+        System.out.println("""
+            TaoTree GBIF Tracker (Approach B: taxonomy-prefix + temporal)
+            Usage:
+              ingest <parquet-dir>   <store.taotree>
+              verify <parquet-dir>   <store.taotree>
+              query  <store.taotree> <kingdom> [phylum] ... [species]
+              stats  <store.taotree>
+            """);
+    }
+
+    private static void requireArgs(String[] args, int n, String help) {
+        if (args.length < n) { System.err.println(help); System.exit(2); }
+    }
+
+    // ── Key layout ───────────────────────────────────────────────────────
+
+    /**
+     * Build the 7-taxonomy + gbifid key layout.
+     *
+     * Widths:
+     * <ul>
+     *   <li>kingdom, phylum, class, order, family — dict16 (2 B each) →
+     *       supports up to 65 534 distinct values each (GBIF has ~7 kingdoms,
+     *       ~80 phyla, ~300 classes, ~1 200 orders, ~6 000 families).</li>
+     *   <li>genus, species — dict32 (4 B each) → covers GBIF's ~60 000 genera
+     *       and ~2 000 000 species.</li>
+     *   <li>gbifid — uint64 (8 B).</li>
+     * </ul>
+     * Total key width: 5×2 + 2×4 + 8 = 26 bytes.
+     */
+    static KeyLayout buildLayout() {
+        return KeyLayout.of(
+            KeyField.dict16("kingdom"),
+            KeyField.dict16("phylum"),
+            KeyField.dict16("clazz"),     // "class" is a Java keyword; dictionary stores real column name
+            KeyField.dict16("ordr"),      // "order" can collide semantically; keep distinct
+            KeyField.dict16("family"),
+            KeyField.dict32("genus"),
+            KeyField.dict32("species"),
+            KeyField.uint64("gbifid")
+        );
+    }
+
+    /** Handles to the 8 key fields, cached once per open-tree lifetime. */
+    static final class Handles {
+        final KeyHandle.Dict16 kingdom, phylum, clazz, ordr, family;
+        final KeyHandle.Dict32 genus, species;
+        final KeyHandle.UInt64 gbifid;
+        final KeyHandle[] taxonomy; // in Parquet column order (length 7)
+
+        Handles(TaoTree t) {
+            this.kingdom = t.keyDict16("kingdom");
+            this.phylum  = t.keyDict16("phylum");
+            this.clazz   = t.keyDict16("clazz");
+            this.ordr    = t.keyDict16("ordr");
+            this.family  = t.keyDict16("family");
+            this.genus   = t.keyDict32("genus");
+            this.species = t.keyDict32("species");
+            this.gbifid  = t.keyUint64("gbifid");
+            this.taxonomy = new KeyHandle[] { kingdom, phylum, clazz, ordr, family, genus, species };
+        }
+    }
+
+    // ── Ingest ───────────────────────────────────────────────────────────
+
+    static void ingest(File parquetInput, Path storePath) throws Exception {
+        File[] files = resolveFiles(parquetInput);
+        if (files == null || files.length == 0) return;
+
+        // Snapshot the schema (column order) from the first file — GBIF Simple
+        // files share a schema so this is safe.
+        List<GbifSchema.Column> columns;
+        try (var fr = ParquetFileReader.open(InputFile.of(files[0].toPath()))) {
+            columns = GbifSchema.topLevelColumns(fr.getFileSchema());
         }
 
-        Path storePath = storeDir.toPath().resolve(STORE_NAME);
+        System.out.println("TaoTree GBIF Tracker — ingest");
+        System.out.printf("Files:     %d%n", files.length);
+        System.out.printf("Store:     %s%n", storePath);
+        System.out.printf("Columns:   %d (%d repeated)%n",
+            columns.size(),
+            (int) columns.stream().filter(GbifSchema.Column::isRepeated).count());
 
-        System.out.println("TaoTree GBIF Species Tracker");
-        System.out.println("Files:  " + files.length);
-        System.out.println("Store:  " + storePath);
-        System.out.println();
+        Files.deleteIfExists(storePath);
+        try (TaoTree tree = TaoTree.create(storePath, buildLayout())) {
+            var h = new Handles(tree);
 
-        // Create a fresh persistent store
-        try (var tree = createFresh(storePath)) {
+            // Which columns go into attributes (everything that is not part of
+            // the taxonomic prefix, not the gbifid key suffix, and — optionally
+            // — not the eventdate that we store as the timestamp axis). We
+            // still keep eventdate as an attribute so Parquet null ≠ TIMELESS
+            // is preserved (TIMELESS on the history axis does not tell us
+            // whether the Parquet cell was null or missing).
+            List<GbifSchema.Column> attrCols = columns.stream()
+                .filter(c -> !GbifSchema.TAXONOMY_FIELDS.contains(c.name()))
+                .filter(c -> !c.name().equals(GbifSchema.GBIFID_FIELD))
+                .toList();
 
-            var kh = KeyHandles.bind(tree);
+            long totalRows = 0, ingested = 0, skippedNoId = 0;
+            long t0 = System.nanoTime();
 
-            try (var arena = Arena.ofConfined()) {
-                var kb = tree.newKeyBuilder(arena);
+            for (File file : files) {
+                try (var fr = ParquetFileReader.open(InputFile.of(file.toPath()));
+                     RowReader rows = fr.createRowReader();
+                     Arena arena = Arena.ofConfined()) {
+                    KeyBuilder kb = tree.newKeyBuilder(arena);
+                    Map<String, Value> attrs = new LinkedHashMap<>(attrCols.size());
 
-                long totalRows = 0;
-                long forwarded = 0;
-                long suppressed = 0;
-                long skipped = 0;
-                long startNs = System.nanoTime();
+                    while (rows.hasNext()) {
+                        rows.next();
+                        totalRows++;
 
-                for (File file : files) {
-                    System.out.printf("Reading %s ...%n", file.getName());
+                        long gbifId = parseGbifId(rows);
+                        if (gbifId == 0) { skippedNoId++; continue; }
 
-                    try (ParquetFileReader fileReader = ParquetFileReader.open(InputFile.of(file.toPath()));
-                         RowReader rows = fileReader.createRowReader()) {
+                        // Build the key from the 7 taxonomy fields + gbifid.
+                        setDict(kb, h.kingdom, readTaxon(rows, "kingdom"));
+                        setDict(kb, h.phylum,  readTaxon(rows, "phylum"));
+                        setDict(kb, h.clazz,   readTaxon(rows, "class"));
+                        setDict(kb, h.ordr,    readTaxon(rows, "order"));
+                        setDict(kb, h.family,  readTaxon(rows, "family"));
+                        setDictU32(kb, h.genus,   readTaxon(rows, "genus"));
+                        setDictU32(kb, h.species, readTaxon(rows, "species"));
+                        kb.set(h.gbifid, gbifId);
 
-                        var w = tree.write();
-                        try {
-                        while (rows.hasNext()) {
-                            rows.next();
-                            totalRows++;
+                        // Gather attributes.
+                        attrs.clear();
+                        for (GbifSchema.Column col : attrCols) {
+                            Value v = ParquetCells.read(rows, col);
+                            if (v != null) attrs.put(col.name(), v);
+                        }
 
-                            if (encodeKey(kb, kh, rows) == null) { skipped++; continue; }
-                            int result = writeLeaf(w, kb, rows);
-                            if (result == 1) forwarded++; else suppressed++;
+                        // Timestamp axis: eventdate, or TIMELESS when NULL.
+                        long ts = rows.isNull(GbifSchema.EVENTDATE_FIELD)
+                            ? TaoTree.TIMELESS
+                            : rows.getLong(GbifSchema.EVENTDATE_FIELD);
 
-                            if (totalRows % 100_000 == 0) {
-                                // Close scope, sync, reopen for progress reporting
-                                w.close();
-                                tree.sync();
-                                double elapsedSec = (System.nanoTime() - startNs) / 1e9;
-                                try (var r = tree.read()) {
-                                    System.out.printf("  %,d rows | %,d entries | %.1f rows/sec%n",
-                                        totalRows, r.size(), totalRows / elapsedSec);
+                        try (var w = tree.write()) {
+                            w.putAll(kb, attrs, ts);
+                        }
+                        ingested++;
+
+                        if (ingested % 50_000 == 0) {
+                            System.out.printf("  %,d rows ingested (%.1fs)%n",
+                                ingested, (System.nanoTime() - t0) / 1e9);
+                        }
+                    }
+                }
+            }
+
+            tree.sync();
+            double secs = (System.nanoTime() - t0) / 1e9;
+            System.out.printf("%nDone. %,d ingested, %,d skipped (no gbifid) of %,d rows in %.1fs (%,.0f rows/s)%n",
+                ingested, skippedNoId, totalRows, secs, ingested / secs);
+
+            // Write the schema sidecar next to the store for standalone reverse-reads.
+            Path sidecar = sidecarPath(storePath);
+            GbifSchema.writeSidecar(sidecar, columns);
+            System.out.printf("Schema sidecar: %s%n", sidecar);
+        }
+    }
+
+    // ── Verify (reversibility check) ─────────────────────────────────────
+
+    static void verify(File parquetInput, Path storePath) throws Exception {
+        File[] files = resolveFiles(parquetInput);
+        if (files == null || files.length == 0) return;
+
+        List<GbifSchema.Column> columns = GbifSchema.readSidecar(sidecarPath(storePath));
+        List<GbifSchema.Column> attrCols = columns.stream()
+            .filter(c -> !GbifSchema.TAXONOMY_FIELDS.contains(c.name()))
+            .filter(c -> !c.name().equals(GbifSchema.GBIFID_FIELD))
+            .toList();
+
+        System.out.println("TaoTree GBIF Tracker — verify");
+        System.out.printf("Files:     %d%n", files.length);
+        System.out.printf("Store:     %s%n", storePath);
+
+        long totalRows = 0, checked = 0, mismatches = 0, skippedNoId = 0;
+        try (TaoTree tree = TaoTree.open(storePath, buildLayout());
+             Arena arena = Arena.ofConfined()) {
+            var h = new Handles(tree);
+            KeyBuilder kb = tree.newKeyBuilder(arena);
+
+            for (File file : files) {
+                try (var fr = ParquetFileReader.open(InputFile.of(file.toPath()));
+                     RowReader rows = fr.createRowReader()) {
+                    while (rows.hasNext()) {
+                        rows.next();
+                        totalRows++;
+
+                        long gbifId = parseGbifId(rows);
+                        if (gbifId == 0) { skippedNoId++; continue; }
+
+                        // Rebuild the same key used during ingest.
+                        setDict(kb, h.kingdom, readTaxon(rows, "kingdom"));
+                        setDict(kb, h.phylum,  readTaxon(rows, "phylum"));
+                        setDict(kb, h.clazz,   readTaxon(rows, "class"));
+                        setDict(kb, h.ordr,    readTaxon(rows, "order"));
+                        setDict(kb, h.family,  readTaxon(rows, "family"));
+                        setDictU32(kb, h.genus,   readTaxon(rows, "genus"));
+                        setDictU32(kb, h.species, readTaxon(rows, "species"));
+                        kb.set(h.gbifid, gbifId);
+
+                        Map<String, Value> stored;
+                        try (var r = tree.read()) {
+                            stored = r.getAll(kb);
+                        }
+
+                        for (GbifSchema.Column col : attrCols) {
+                            Value expected = ParquetCells.read(rows, col);
+                            Value actual   = stored.get(col.name());
+                            if (!valueEquals(expected, actual)) {
+                                mismatches++;
+                                if (mismatches <= 8) {
+                                    System.out.printf("  mismatch gbifid=%d col=%s expected=%s actual=%s%n",
+                                        gbifId, col.name(), expected, actual);
                                 }
-                                w = tree.write();
                             }
                         }
-                        } finally {
-                            w.close();
-                        }
+                        checked++;
                     }
                 }
+            }
+        }
 
-                // Flush to disk
-                tree.sync();
+        System.out.printf("%nrows=%,d  checked=%,d  skipped(no-id)=%,d  cell-mismatches=%,d%n",
+            totalRows, checked, skippedNoId, mismatches);
+        if (mismatches == 0) System.out.println("  ✓ reversible round-trip verified");
+        else System.exit(1);
+    }
 
-                double elapsedSec = (System.nanoTime() - startNs) / 1e9;
+    // ── Query: prefix scan by taxonomic levels ───────────────────────────
 
-                System.out.println();
-                System.out.println("=== Results ===");
-                System.out.printf("Total rows:     %,d%n", totalRows);
-                System.out.printf("Forwarded:      %,d (new or updated)%n", forwarded);
-                System.out.printf("Suppressed:     %,d (older duplicate)%n", suppressed);
-                System.out.printf("Skipped:        %,d (no species)%n", skipped);
-                try (var r = tree.read()) {
-                    System.out.printf("ART entries:    %,d%n", r.size());
+    static void query(Path storePath, String[] levels) throws Exception {
+        try (TaoTree tree = TaoTree.open(storePath, buildLayout());
+             Arena arena = Arena.ofConfined()) {
+            var h = new Handles(tree);
+            KeyBuilder prefix = tree.newKeyBuilder(arena);
+
+            // Set as many taxonomic fields as provided.
+            KeyHandle lastHandle = null;
+            for (int i = 0; i < levels.length && i < h.taxonomy.length; i++) {
+                KeyHandle handle = h.taxonomy[i];
+                if (handle instanceof KeyHandle.Dict16 d) {
+                    prefix.set(d, levels[i]);
+                } else if (handle instanceof KeyHandle.Dict32 d) {
+                    prefix.set(d, levels[i]);
                 }
-                System.out.printf("Key size:       %d bytes (%d fields)%n",
-                    tree.keyLayout().totalWidth(), tree.keyLayout().fieldCount());
-                System.out.printf("Leaf size:      %d bytes (%d fields)%n",
-                    LEAF_LAYOUT.totalWidth(), LEAF_LAYOUT.fieldCount());
-                System.out.printf("Store file:     %s (%,.1f MB)%n",
-                    storePath.getFileName(), Files.size(storePath) / (1024.0 * 1024));
-                System.out.printf("Elapsed:        %.2f sec%n", elapsedSec);
-                System.out.printf("Throughput:     %,.0f rows/sec%n", totalRows / elapsedSec);
-                System.out.println();
-                System.out.println("=== Dictionaries ===");
-                for (var dict : tree.dictionaries()) {
-                    var kl = tree.keyLayout();
-                    for (int i = 0; i < kl.fieldCount(); i++) {
-                        var f = kl.field(i);
-                        if (f instanceof KeyField.DictU16 d && d.dict() == dict
-                         || f instanceof KeyField.DictU32 d2 && d2.dict() == dict) {
-                            System.out.printf("  %-16s %,d entries%n", f.name() + ":", dict.size());
-                        }
+                lastHandle = handle;
+            }
+            if (lastHandle == null) throw new IllegalArgumentException("provide at least a kingdom");
+
+            final KeyHandle up = lastHandle;
+            System.out.printf("Prefix scan under %s=%s%s%n",
+                String.join("/", Arrays.stream(h.taxonomy)
+                    .limit(levels.length).map(KeyHandle::name).toList()),
+                String.join("/", levels),
+                levels.length == h.taxonomy.length ? " (full path)" : "");
+
+            // Resolve dictionaries once for pretty-printing key bytes.
+            int[] count = {0};
+            try (var r = tree.read()) {
+                r.scan(prefix, up, entityKey -> {
+                    count[0]++;
+                    if (count[0] <= 20) {
+                        String decoded = decodeKey(entityKey, h);
+                        System.out.println("  " + decoded);
                     }
-                }
-                System.out.println();
-                System.out.println("=== Memory ===");
-                System.out.printf("  Slab:     %,.1f MB (%,d segments in use)%n",
-                    tree.totalSlabBytes() / (1024.0 * 1024),
-                    tree.totalSegmentsInUse());
-                System.out.printf("  Overflow: %,.1f MB (%,d pages)%n",
-                    tree.totalOverflowBytes() / (1024.0 * 1024),
-                    tree.overflowPageCount());
+                    return true;
+                });
+            }
+            System.out.printf("matches=%,d%n", count[0]);
+        }
+    }
+
+    // ── Stats ────────────────────────────────────────────────────────────
+
+    static void stats(Path storePath) throws Exception {
+        try (TaoTree tree = TaoTree.open(storePath, buildLayout());
+             Arena arena = Arena.ofConfined()) {
+            var h = new Handles(tree);
+            long size;
+            try (var r = tree.read()) { size = r.size(); }
+            System.out.printf("entities:       %,d%n", size);
+            System.out.printf("dictionaries:   %d%n", tree.dictionaries().size());
+            for (int i = 0; i < tree.dictionaries().size(); i++) {
+                var d = tree.dictionaries().get(i);
+                System.out.printf("  [%d] size=%,d%n", i, d.size());
+            }
+            System.out.println("sample entities:");
+            try (var r = tree.read()) {
+                int[] n = {0};
+                r.forEach(key -> {
+                    if (n[0]++ < 5) System.out.println("  " + decodeKey(key, h));
+                    return n[0] < 5;
+                });
             }
         }
     }
 
-    /** Read a nullable string field. For list fields (e.g. recordedBy), joins elements with "; ". */
-    static String nullSafe(RowReader rows, String field) {
-        if (rows.isNull(field)) return null;
+    // ── Helpers ──────────────────────────────────────────────────────────
+
+    static long parseGbifId(RowReader rows) {
+        if (rows.isNull("gbifid")) return 0L;
         try {
-            String v = rows.getString(field);
-            return (v == null || v.isEmpty()) ? null : v;
-        } catch (RuntimeException ignored) {}
-        // Field is a LIST<STRING> — join elements
-        try { return joinList(rows.getList(field)); } catch (RuntimeException ignored) {}
-        return null;
+            return Long.parseUnsignedLong(rows.getString("gbifid"));
+        } catch (Exception ignore) { return 0L; }
     }
 
-    /** Read a nullable int field; handles INT32, INT64, and STRING Parquet column types. */
-    static int safeInt(RowReader rows, String field) {
-        if (rows.isNull(field)) return 0;
-        try { return rows.getInt(field);                } catch (RuntimeException ignored) {}
-        try { return (int) rows.getLong(field);         } catch (RuntimeException ignored) {}
-        try { return Integer.parseInt(rows.getString(field)); } catch (RuntimeException ignored) {}
-        return 0;
+    static String readTaxon(RowReader rows, String col) {
+        if (rows.isNull(col)) return GbifSchema.NULL_TAXON_SENTINEL;
+        String s = rows.getString(col);
+        return (s == null) ? GbifSchema.NULL_TAXON_SENTINEL : s;
     }
 
-    /** Read a nullable double field; handles DOUBLE and STRING Parquet column types. */
-    static double safeDouble(RowReader rows, String field) {
-        if (rows.isNull(field)) return Double.NaN;
-        try { return rows.getDouble(field);                    } catch (RuntimeException ignored) {}
-        try { return Double.parseDouble(rows.getString(field)); } catch (RuntimeException ignored) {}
-        return Double.NaN;
+    static void setDict(KeyBuilder kb, KeyHandle.Dict16 h, String value) { kb.set(h, value); }
+    static void setDictU32(KeyBuilder kb, KeyHandle.Dict32 h, String value) { kb.set(h, value); }
+
+    static String decodeKey(byte[] key, Handles h) {
+        var sb = new StringBuilder(128);
+        decodeDict(sb, key, h.kingdom);   sb.append('/');
+        decodeDict(sb, key, h.phylum);    sb.append('/');
+        decodeDict(sb, key, h.clazz);     sb.append('/');
+        decodeDict(sb, key, h.ordr);      sb.append('/');
+        decodeDict(sb, key, h.family);    sb.append('/');
+        decodeDict32(sb, key, h.genus);   sb.append('/');
+        decodeDict32(sb, key, h.species); sb.append("  gbifid=");
+        long id = 0;
+        for (int i = 0; i < 8; i++) id = (id << 8) | (key[h.gbifid.offset() + i] & 0xffL);
+        sb.append(Long.toUnsignedString(id));
+        return sb.toString();
     }
 
-    private static String joinList(dev.hardwood.row.PqList list) {
-        if (list == null || list.isEmpty()) return null;
-        var sb = new StringBuilder();
-        for (var s : list.strings()) {
-            if (s != null) { if (!sb.isEmpty()) sb.append("; "); sb.append(s); }
+    static void decodeDict(StringBuilder out, byte[] key, KeyHandle.Dict16 h) {
+        int code = ((key[h.offset()] & 0xff) << 8) | (key[h.offset() + 1] & 0xff);
+        appendTaxon(out, h.dict().reverseLookup(code));
+    }
+
+    static void decodeDict32(StringBuilder out, byte[] key, KeyHandle.Dict32 h) {
+        int code = ((key[h.offset()]     & 0xff) << 24)
+                 | ((key[h.offset() + 1] & 0xff) << 16)
+                 | ((key[h.offset() + 2] & 0xff) << 8)
+                 |  (key[h.offset() + 3] & 0xff);
+        appendTaxon(out, h.dict().reverseLookup(code));
+    }
+
+    static void appendTaxon(StringBuilder out, String s) {
+        if (s == null || GbifSchema.NULL_TAXON_SENTINEL.equals(s)) out.append("<null>");
+        else out.append(s);
+    }
+
+    static boolean valueEquals(Value a, Value b) {
+        if (a == null) a = Value.ofNull();
+        if (b == null) b = Value.ofNull();
+        if (a instanceof Value.Null && b instanceof Value.Null) return true;
+        if (a.getClass() != b.getClass()) return false;
+        return switch (a) {
+            case Value.Int32 x    -> x.value() == ((Value.Int32) b).value();
+            case Value.Int64 x    -> x.value() == ((Value.Int64) b).value();
+            case Value.Float32 x  -> Float.compare(x.value(), ((Value.Float32) b).value()) == 0;
+            case Value.Float64 x  -> Double.compare(x.value(), ((Value.Float64) b).value()) == 0;
+            case Value.Bool x     -> x.value() == ((Value.Bool) b).value();
+            case Value.Str x      -> x.value().equals(((Value.Str) b).value());
+            case Value.Json x     -> x.value().equals(((Value.Json) b).value());
+            case Value.Bytes x    -> Arrays.equals(x.value(), ((Value.Bytes) b).value());
+            case Value.Null x     -> true;
+        };
+    }
+
+    // ── File helpers ─────────────────────────────────────────────────────
+
+    static File[] resolveFiles(File input) {
+        if (input.isDirectory()) {
+            File[] files = input.listFiles((d, n) -> n.endsWith(".parquet"));
+            if (files == null || files.length == 0) {
+                System.err.println("No .parquet files in " + input);
+                return null;
+            }
+            Arrays.sort(files);
+            return files;
         }
-        return sb.isEmpty() ? null : sb.toString();
+        return new File[]{input};
     }
 
-    static String buildExtrasJson(RowReader rows) {
-        var sb = new StringBuilder(64);
-        sb.append('{');
-        boolean first = true;
-        first = appendStr(sb, first, "class", nullSafe(rows, "class"));
-        first = appendStr(sb, first, "order", nullSafe(rows, "order"));
-        first = appendStr(sb, first, "basisOfRecord", nullSafe(rows, "basisofrecord"));
-        first = appendStr(sb, first, "license", nullSafe(rows, "license"));
-        first = appendStr(sb, first, "occurrenceStatus", nullSafe(rows, "occurrencestatus"));
-        first = appendStr(sb, first, "scientificName", nullSafe(rows, "scientificname"));
-        first = appendStr(sb, first, "institutionCode", nullSafe(rows, "institutioncode"));
-        first = appendStr(sb, first, "catalogNumber", nullSafe(rows, "catalognumber"));
-        first = appendStr(sb, first, "eventDate", nullSafe(rows, "eventdate"));
-        if (!rows.isNull("coordinateuncertaintyinmeters")) {
-            if (!first) sb.append(',');
-            sb.append("\"coordinateUncertainty\":").append(rows.getDouble("coordinateuncertaintyinmeters"));
-            first = false;
-        }
-        sb.append('}');
-        return first ? null : sb.toString();
-    }
-
-    private static boolean appendStr(StringBuilder sb, boolean first, String key, String value) {
-        if (value == null) return first;
-        if (!first) sb.append(',');
-        sb.append('"').append(key).append("\":\"");
-        for (int i = 0; i < value.length(); i++) {
-            char c = value.charAt(i);
-            if (c == '"') sb.append("\\\"");
-            else if (c == '\\') sb.append("\\\\");
-            else if (c < 0x20) sb.append(' ');
-            else sb.append(c);
-        }
-        sb.append('"');
-        return false;
+    static Path sidecarPath(Path storePath) {
+        String n = storePath.getFileName().toString();
+        int dot = n.lastIndexOf('.');
+        String base = (dot >= 0) ? n.substring(0, dot) : n;
+        Path parent = storePath.getParent();
+        return (parent == null ? Path.of(".") : parent).resolve(base + ".schema.json");
     }
 }

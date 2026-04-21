@@ -154,7 +154,7 @@ class CompactorTest {
             Path tmp = Files.createTempFile("compactor-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var slab = new SlabAllocator(arena, cs, 1 << 16);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
@@ -182,7 +182,7 @@ class CompactorTest {
             Path tmp = Files.createTempFile("compactor-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var slab = new SlabAllocator(arena, cs, 1 << 16);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
@@ -228,7 +228,7 @@ class CompactorTest {
             Path tmp = Files.createTempFile("compactor-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var slab = new SlabAllocator(arena, cs, 1 << 16);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
@@ -297,7 +297,7 @@ class CompactorTest {
             Path tmp = Files.createTempFile("compactor-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var slab = new SlabAllocator(arena, cs, 1 << 16);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
@@ -355,7 +355,7 @@ class CompactorTest {
             Path tmp = Files.createTempFile("compactor-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var slab = new SlabAllocator(arena, cs, 1 << 16);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
@@ -423,7 +423,7 @@ class CompactorTest {
             Path tmp = Files.createTempFile("compactor-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var slab = new SlabAllocator(arena, cs, 1 << 16);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
@@ -457,7 +457,7 @@ class CompactorTest {
             Path tmp = Files.createTempFile("compactor-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var slab = new SlabAllocator(arena, cs, 1 << 16);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
@@ -503,7 +503,7 @@ class CompactorTest {
             Path tmp = Files.createTempFile("compactor-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var slab = new SlabAllocator(arena, cs, 1 << 20);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);
@@ -548,7 +548,7 @@ class CompactorTest {
             Path tmp = Files.createTempFile("compactor-test-", ".dat");
             tmp.toFile().deleteOnExit();
             Files.delete(tmp);
-            var cs = ChunkStore.createV2(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
+            var cs = ChunkStore.createCheckpointed(tmp, arena, ChunkStore.DEFAULT_CHUNK_SIZE, false);
             var slab = new SlabAllocator(arena, cs, 1 << 20);
             int prefixId = slab.registerClass(NodeConstants.PREFIX_SIZE);
             int n4Id     = slab.registerClass(NodeConstants.NODE4_SIZE);

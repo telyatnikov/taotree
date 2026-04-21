@@ -7,7 +7,7 @@ import org.taotree.internal.alloc.ChunkStore;
 /**
  * Recovery algorithm for log-structured shadow paging in TaoTree v2.
  *
- * <p>After opening a v2 file, recovery scans forward from the last checkpoint
+ * <p>After opening a file, recovery scans forward from the last checkpoint
  * to find valid commit records and reconstruct the latest state. Each valid
  * {@link CommitRecord} advances the recovered state; scanning stops at the
  * first invalid or stale page (garbage from a crashed scope).
@@ -28,6 +28,10 @@ public final class ShadowPagingRecovery {
         public long[] dictNextCodes;
         public long[] dictSizes;
         public int nextPage;  // end of last valid commit's arena (for resuming allocations)
+        // Child trees (HINT, time index for temporal trees)
+        public int childTreeCount;
+        public long[] childTreeRoots = new long[0];
+        public long[] childTreeSizes = new long[0];
     }
 
     /**
@@ -43,16 +47,19 @@ public final class ShadowPagingRecovery {
      *   <li>Return the final recovered state</li>
      * </ol>
      *
-     * @param cs                the chunk store
-     * @param baseGen           generation from the checkpoint
-     * @param basePrimaryRoot   primary root from the checkpoint
-     * @param basePrimarySize   primary size from the checkpoint
-     * @param baseDictCount     number of dictionaries from the checkpoint
-     * @param baseDictRoots     dict roots from the checkpoint
-     * @param baseDictNextCodes dict next codes from the checkpoint
-     * @param baseDictSizes     dict sizes from the checkpoint
-     * @param baseNextPage      the next page after the checkpoint (where commit records start)
-     * @param totalPages        total committed pages in the file
+     * @param cs                    the chunk store
+     * @param baseGen               generation from the checkpoint
+     * @param basePrimaryRoot       primary root from the checkpoint
+     * @param basePrimarySize       primary size from the checkpoint
+     * @param baseDictCount         number of dictionaries from the checkpoint
+     * @param baseDictRoots         dict roots from the checkpoint
+     * @param baseDictNextCodes     dict next codes from the checkpoint
+     * @param baseDictSizes         dict sizes from the checkpoint
+     * @param baseChildTreeCount    number of child trees from the checkpoint
+     * @param baseChildTreeRoots    child tree roots from the checkpoint
+     * @param baseChildTreeSizes    child tree sizes from the checkpoint
+     * @param baseNextPage          the next page after the checkpoint (where commit records start)
+     * @param totalPages            total committed pages in the file
      * @return the recovered state
      */
     public static RecoveryState recover(ChunkStore cs,
@@ -63,6 +70,9 @@ public final class ShadowPagingRecovery {
                                          long[] baseDictRoots,
                                          long[] baseDictNextCodes,
                                          long[] baseDictSizes,
+                                         int baseChildTreeCount,
+                                         long[] baseChildTreeRoots,
+                                         long[] baseChildTreeSizes,
                                          int baseNextPage,
                                          int totalPages) {
         var state = new RecoveryState();
@@ -73,6 +83,9 @@ public final class ShadowPagingRecovery {
         state.dictRoots = baseDictRoots != null ? baseDictRoots.clone() : new long[0];
         state.dictNextCodes = baseDictNextCodes != null ? baseDictNextCodes.clone() : new long[0];
         state.dictSizes = baseDictSizes != null ? baseDictSizes.clone() : new long[0];
+        state.childTreeCount = baseChildTreeCount;
+        state.childTreeRoots = baseChildTreeRoots != null ? baseChildTreeRoots.clone() : new long[0];
+        state.childTreeSizes = baseChildTreeSizes != null ? baseChildTreeSizes.clone() : new long[0];
         state.nextPage = baseNextPage;
 
         int cursor = baseNextPage;
@@ -99,6 +112,9 @@ public final class ShadowPagingRecovery {
             state.dictRoots = commit.dictRoots != null ? commit.dictRoots.clone() : new long[0];
             state.dictNextCodes = commit.dictNextCodes != null ? commit.dictNextCodes.clone() : new long[0];
             state.dictSizes = commit.dictSizes != null ? commit.dictSizes.clone() : new long[0];
+            state.childTreeCount = commit.childTreeCount;
+            state.childTreeRoots = commit.childTreeRoots != null ? commit.childTreeRoots.clone() : new long[0];
+            state.childTreeSizes = commit.childTreeSizes != null ? commit.childTreeSizes.clone() : new long[0];
 
             // Advance cursor past this commit's arena — with bounds validation.
             if (commit.arenaEndPage <= cursor || commit.arenaEndPage > totalPages) {

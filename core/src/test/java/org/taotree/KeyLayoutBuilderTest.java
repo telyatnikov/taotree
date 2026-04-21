@@ -51,7 +51,7 @@ class KeyLayoutBuilderTest {
 
     @Test
     void encodeDictFields() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KeyLayout.of(KeyField.uint8("k")))) {
             var kingdomDict = TaoDictionary.u16(tree);
             var speciesDict = TaoDictionary.u32(tree);
 
@@ -79,7 +79,7 @@ class KeyLayoutBuilderTest {
 
     @Test
     void encodeDictNull() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KeyLayout.of(KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
             var layout = KeyLayout.of(KeyField.dict16("field", dict));
 
@@ -93,7 +93,7 @@ class KeyLayoutBuilderTest {
 
     @Test
     void fullGbifKey() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"), 512 * 1024)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KeyLayout.of(KeyField.uint8("k")))) {
             var kingdomDict  = TaoDictionary.u16(tree);
             var phylumDict   = TaoDictionary.u16(tree);
             var familyDict   = TaoDictionary.u16(tree);
@@ -143,7 +143,7 @@ class KeyLayoutBuilderTest {
 
     @Test
     void keySchemaWithArt() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"), 512 * 1024)) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KeyLayout.of(KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
             var layout = KeyLayout.of(
                 KeyField.dict16("a", dict),
@@ -332,7 +332,7 @@ class KeyLayoutBuilderTest {
 
     @Test
     void setDictByNameChaining() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KeyLayout.of(KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
             var layout = KeyLayout.of(KeyField.dict16("d", dict), KeyField.uint32("n"));
             try (var arena = Arena.ofConfined()) {
@@ -354,7 +354,7 @@ class KeyLayoutBuilderTest {
 
     @Test
     void setDictNullEncodesZero() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), KeyLayout.of(KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
             var layout = KeyLayout.of(KeyField.dict16("d", dict));
 

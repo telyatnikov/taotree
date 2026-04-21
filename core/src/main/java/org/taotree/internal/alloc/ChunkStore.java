@@ -42,8 +42,8 @@ public final class ChunkStore implements AutoCloseable {
     /** Default chunk size: 64 MB (16384 pages per chunk). */
     public static final long DEFAULT_CHUNK_SIZE = 64L * 1024 * 1024;
 
-    /** Number of reserved pages for v2 checkpoint slots (pages 0-7, 32 KB: two 16 KB slots). */
-    public static final int V2_RESERVED_PAGES = 8;
+    /** Number of reserved pages for checkpoint slots (pages 0-255, 1 MB: two 512 KB slots). */
+    public static final int CHECKPOINT_RESERVED_PAGES = 256;
 
     private static final int MAX_CHUNKS = 16384; // 64 MB × 16384 = 1 TB max
 
@@ -108,14 +108,14 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     /**
-     * Create a new v2 store file with 4 reserved pages for two checkpoint slots.
+     * Create a new store file with 4 reserved pages for two checkpoint slots.
      *
      * @param path        path to the store file
      * @param arena       arena controlling the lifetime of mapped segments
      * @param chunkSize   chunk size in bytes (must be a multiple of PAGE_SIZE)
      * @param preallocate if true, use OS-specific preallocation to reserve physical blocks
      */
-    public static ChunkStore createV2(Path path, Arena arena, long chunkSize,
+    public static ChunkStore createCheckpointed(Path path, Arena arena, long chunkSize,
                                        boolean preallocate) throws IOException {
         validateChunkSize(chunkSize);
         var channel = FileChannel.open(path,
@@ -123,14 +123,14 @@ public final class ChunkStore implements AutoCloseable {
             StandardOpenOption.READ,
             StandardOpenOption.WRITE);
         var store = new ChunkStore(path, channel, arena, chunkSize, preallocate);
-        store.growFile(V2_RESERVED_PAGES);
-        store.nextPage.set(V2_RESERVED_PAGES);
+        store.growFile(CHECKPOINT_RESERVED_PAGES);
+        store.nextPage.set(CHECKPOINT_RESERVED_PAGES);
         return store;
     }
 
-    /** Create a new v2 store file with the default chunk size (64 MB) and preallocation enabled. */
-    public static ChunkStore createV2(Path path, Arena arena) throws IOException {
-        return createV2(path, arena, DEFAULT_CHUNK_SIZE, Preallocator.isSupported());
+    /** Create a new store file with the default chunk size (64 MB) and preallocation enabled. */
+    public static ChunkStore createCheckpointed(Path path, Arena arena) throws IOException {
+        return createCheckpointed(path, arena, DEFAULT_CHUNK_SIZE, Preallocator.isSupported());
     }
 
     /**
@@ -272,18 +272,18 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     // -----------------------------------------------------------------------
-    // V2 checkpoint slot access
+    // Checkpoint slot access (mirrored A/B slots)
     // -----------------------------------------------------------------------
 
-    /** Returns a writable MemorySegment for checkpoint slot A (pages 0-3, 16 KB). */
+    /** Returns a writable MemorySegment for checkpoint slot A (pages 0-31, 128 KB). */
     public MemorySegment checkpointSlotA() {
-        int slotSizePages = V2_RESERVED_PAGES / 2;
+        int slotSizePages = CHECKPOINT_RESERVED_PAGES / 2;
         return resolve(0, slotSizePages);
     }
 
-    /** Returns a writable MemorySegment for checkpoint slot B (pages 4-7, 16 KB). */
+    /** Returns a writable MemorySegment for checkpoint slot B (pages 32-63, 128 KB). */
     public MemorySegment checkpointSlotB() {
-        int slotSizePages = V2_RESERVED_PAGES / 2;
+        int slotSizePages = CHECKPOINT_RESERVED_PAGES / 2;
         return resolve(slotSizePages, slotSizePages);
     }
 

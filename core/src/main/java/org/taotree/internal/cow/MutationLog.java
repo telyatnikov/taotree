@@ -11,8 +11,7 @@ import java.lang.foreign.MemorySegment;
  * value at the time of first access (before the application modifies it).
  *
  * <p>On rebase, each entry is replayed: {@code getOrCreateCopy} against the
- * new root, then a {@link org.taotree.ConflictResolver} merges the values
- * using the pending, published, and snapshot leaf values.
+ * new root, then last-writer-wins semantics merge the values.
  *
  * <p>Uses parallel arrays for cache-friendliness and zero per-entry object
  * allocation. Entries are de-duplicated by leaf pointer (only the first

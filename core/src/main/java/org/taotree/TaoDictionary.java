@@ -5,6 +5,7 @@ import org.taotree.internal.persist.Superblock;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -51,6 +52,10 @@ public final class TaoDictionary {
     // Per-dictionary lock for COW mode: serializes dict writes without holding
     // the global tree lock. Multiple dicts can be interned concurrently.
     private final ReentrantLock dictLock = new ReentrantLock();
+
+    // Lazy reverse cache: code → string. Populated on intern() and lazily
+    // rebuilt via full tree scan on reverseLookup() cache miss.
+    private final ConcurrentHashMap<Integer, String> reverseCache = new ConcurrentHashMap<>();
 
     /**
      * Create a dictionary.
@@ -163,6 +168,40 @@ public final class TaoDictionary {
         return nextCode;
     }
 
+    /**
+     * Reverse-lookup: return the string for a given code.
+     *
+     * <p>Uses a lazy cache populated on {@link #intern(String)} and rebuilt on
+     * cache miss by scanning the dict tree. Safe for concurrent use.
+     *
+     * @param code the integer code to look up
+     * @return the interned string, or {@code null} if the code is unknown
+     */
+    public String reverseLookup(int code) {
+        String cached = reverseCache.get(code);
+        if (cached != null) return cached;
+        rebuildReverseCache();
+        return reverseCache.get(code);
+    }
+
+    private void rebuildReverseCache() {
+        // Use the tree's internal scan to iterate all dict entries.
+        // The dict tree stores encoded_string → code (int32).
+        tree.scanAllLeaves((keySegment, valueSegment) -> {
+            int code = valueSegment.get(ValueLayout.JAVA_INT_UNALIGNED, 0);
+            if (code != 0) {
+                byte[] keyBytes = new byte[MAX_KEY_LEN];
+                MemorySegment.copy(keySegment, 0,
+                    MemorySegment.ofArray(keyBytes), 0, MAX_KEY_LEN);
+                String value = TaoKey.decodeString(keyBytes);
+                if (value != null) {
+                    reverseCache.putIfAbsent(code, value);
+                }
+            }
+            return true;
+        });
+    }
+
     // -----------------------------------------------------------------------
     // ReadScope
     // -----------------------------------------------------------------------
@@ -242,7 +281,9 @@ public final class TaoDictionary {
                 throw new IllegalArgumentException(
                     "maxCode mismatch: source=" + source.maxCode + " target=" + this.maxCode);
             }
-            tree.copyFromImpl(source.tree);
+            var ws = tree.beginWrite();
+            tree.copyFromImpl(source.tree, ws);
+            tree.commitWrite(ws);
             this.nextCode = source.nextCode;
         } finally {
             dictLock.unlock();
@@ -270,6 +311,7 @@ public final class TaoDictionary {
         }
         int code = nextCode++;
         leaf.set(ValueLayout.JAVA_INT_UNALIGNED, 0, code);
+        reverseCache.put(code, value);
         // Commit: publish new root + size, retire old nodes
         tree.commitWrite(ws);
         return code;

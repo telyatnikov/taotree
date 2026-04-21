@@ -7,7 +7,7 @@ import org.taotree.internal.alloc.ChunkStore;
 
 /**
  * Bridges TaoTree's internal metadata ({@link Superblock.SuperblockData}) and
- * the v2 checkpoint format ({@link CheckpointV2}).
+ * the checkpoint format ({@link Checkpoint}).
  *
  * <p>All section payloads are packed into the checkpoint's inline data area.
  * No extent-backed sections are used — typical metadata easily fits within
@@ -22,19 +22,19 @@ public final class CheckpointIO {
     private CheckpointIO() {}
 
     // -----------------------------------------------------------------------
-    // SuperblockData → CheckpointV2.CheckpointData
+    // SuperblockData → Checkpoint.CheckpointData
     // -----------------------------------------------------------------------
 
     /**
-     * Convert a {@link Superblock.SuperblockData} into a v2 checkpoint
-     * ready for {@link CheckpointV2#write}.
+     * Convert a {@link Superblock.SuperblockData} into a checkpoint
+     * ready for {@link Checkpoint#write}.
      *
      * @param sb         the superblock data to convert
      * @param generation the checkpoint generation number
      * @param slotId     the target slot (0 = A, 1 = B)
-     * @return a fully populated {@link CheckpointV2.CheckpointData}
+     * @return a fully populated {@link Checkpoint.CheckpointData}
      */
-    public static CheckpointV2.CheckpointData toCheckpoint(Superblock.SuperblockData sb,
+    public static Checkpoint.CheckpointData toCheckpoint(Superblock.SuperblockData sb,
                                                             long generation, long slotId) {
         // Serialize each section payload into byte arrays
         byte[] coreState = serializeCoreState(sb);
@@ -42,22 +42,28 @@ public final class CheckpointIO {
         byte[] bumpTable = serializeBumpPageTable(sb);
         byte[] treeTable = serializeTreeTable(sb);
         byte[] dictTable = serializeDictTable(sb);
+        byte[] schemaBinding = (sb.schemaBinding != null) ? sb.schemaBinding : new byte[0];
+        boolean hasSchema = schemaBinding.length > 0;
 
         // Compute total inline size and offsets
-        int sectionCount = 5;
+        int sectionCount = hasSchema ? 6 : 5;
         int inlineOffset = 0;
 
-        CheckpointV2.SectionRef[] sections = new CheckpointV2.SectionRef[sectionCount];
-        sections[0] = inlineSection(CheckpointV2.SECTION_CORE_STATE, coreState, inlineOffset);
+        Checkpoint.SectionRef[] sections = new Checkpoint.SectionRef[sectionCount];
+        sections[0] = inlineSection(Checkpoint.SECTION_CORE_STATE, coreState, inlineOffset);
         inlineOffset += coreState.length;
-        sections[1] = inlineSection(CheckpointV2.SECTION_SLAB_CLASS_TABLE, slabTable, inlineOffset);
+        sections[1] = inlineSection(Checkpoint.SECTION_SLAB_CLASS_TABLE, slabTable, inlineOffset);
         inlineOffset += slabTable.length;
-        sections[2] = inlineSection(CheckpointV2.SECTION_BUMP_PAGE_TABLE, bumpTable, inlineOffset);
+        sections[2] = inlineSection(Checkpoint.SECTION_BUMP_PAGE_TABLE, bumpTable, inlineOffset);
         inlineOffset += bumpTable.length;
-        sections[3] = inlineSection(CheckpointV2.SECTION_TREE_TABLE, treeTable, inlineOffset);
+        sections[3] = inlineSection(Checkpoint.SECTION_TREE_TABLE, treeTable, inlineOffset);
         inlineOffset += treeTable.length;
-        sections[4] = inlineSection(CheckpointV2.SECTION_DICT_TABLE, dictTable, inlineOffset);
+        sections[4] = inlineSection(Checkpoint.SECTION_DICT_TABLE, dictTable, inlineOffset);
         inlineOffset += dictTable.length;
+        if (hasSchema) {
+            sections[5] = inlineSection(Checkpoint.SECTION_SCHEMA_BINDING, schemaBinding, inlineOffset);
+            inlineOffset += schemaBinding.length;
+        }
 
         // Concatenate inline data
         byte[] inlineData = new byte[inlineOffset];
@@ -66,13 +72,17 @@ public final class CheckpointIO {
         System.arraycopy(slabTable, 0, inlineData, pos, slabTable.length); pos += slabTable.length;
         System.arraycopy(bumpTable, 0, inlineData, pos, bumpTable.length); pos += bumpTable.length;
         System.arraycopy(treeTable, 0, inlineData, pos, treeTable.length); pos += treeTable.length;
-        System.arraycopy(dictTable, 0, inlineData, pos, dictTable.length);
+        System.arraycopy(dictTable, 0, inlineData, pos, dictTable.length); pos += dictTable.length;
+        if (hasSchema) {
+            System.arraycopy(schemaBinding, 0, inlineData, pos, schemaBinding.length);
+        }
 
-        var data = new CheckpointV2.CheckpointData();
+        var data = new Checkpoint.CheckpointData();
         data.generation = generation;
         data.slotId = slotId;
-        data.incompatibleFeatures = 0;
-        data.compatibleFeatures = 0;
+        // v3 format marker — always set on write.
+        data.incompatibleFeatures = Checkpoint.FEATURE_INCOMPAT_UNIFIED_TEMPORAL;
+        data.compatibleFeatures = hasSchema ? Checkpoint.FEATURE_COMPAT_SCHEMA : 0;
         data.pageSize = ChunkStore.PAGE_SIZE;
         data.chunkSize = sb.chunkSize;
         data.totalPages = sb.totalPages;
@@ -83,13 +93,24 @@ public final class CheckpointIO {
     }
 
     // -----------------------------------------------------------------------
-    // CheckpointV2.CheckpointData → SuperblockData
+    // Checkpoint.CheckpointData → SuperblockData
     // -----------------------------------------------------------------------
 
     /**
-     * Reconstruct a {@link Superblock.SuperblockData} from a v2 checkpoint.
+     * Reconstruct a {@link Superblock.SuperblockData} from a checkpoint.
      */
-    public static Superblock.SuperblockData fromCheckpoint(CheckpointV2.CheckpointData cp) {
+    public static Superblock.SuperblockData fromCheckpoint(Checkpoint.CheckpointData cp) {
+        // v3 format check: refuse legacy v2 files. The unified-temporal data
+        // model is the only one supported, and v2 files lack the runtime
+        // structures (per-entity ARTs, attribute dictionary) needed to read
+        // them as unified-temporal trees.
+        if ((cp.incompatibleFeatures & Checkpoint.FEATURE_INCOMPAT_UNIFIED_TEMPORAL) == 0) {
+            throw new java.io.UncheckedIOException(new java.io.IOException(
+                    "TaoTree file format v2 is no longer supported. "
+                  + "This build only reads v3 files (created with the unified-temporal API). "
+                  + "Recreate the store with TaoTree.create(Path, KeyLayout) and re-import the data."));
+        }
+
         var sb = new Superblock.SuperblockData();
         sb.chunkSize = cp.chunkSize;
         sb.totalPages = cp.totalPages;
@@ -98,16 +119,18 @@ public final class CheckpointIO {
         byte[] inline = cp.inlineData;
 
         for (var ref : cp.sections) {
-            if (ref.encoding() != CheckpointV2.ENCODING_INLINE) continue;
+            if (ref.encoding() != Checkpoint.ENCODING_INLINE) continue;
             byte[] payload = new byte[ref.inlineLength()];
             System.arraycopy(inline, ref.inlineOffset(), payload, 0, ref.inlineLength());
 
             switch (ref.sectionType()) {
-                case CheckpointV2.SECTION_CORE_STATE -> deserializeCoreState(payload, sb);
-                case CheckpointV2.SECTION_SLAB_CLASS_TABLE -> deserializeSlabClassTable(payload, sb);
-                case CheckpointV2.SECTION_BUMP_PAGE_TABLE -> deserializeBumpPageTable(payload, sb);
-                case CheckpointV2.SECTION_TREE_TABLE -> deserializeTreeTable(payload, sb);
-                case CheckpointV2.SECTION_DICT_TABLE -> deserializeDictTable(payload, sb);
+                case Checkpoint.SECTION_CORE_STATE -> deserializeCoreState(payload, sb);
+                case Checkpoint.SECTION_SLAB_CLASS_TABLE -> deserializeSlabClassTable(payload, sb);
+                case Checkpoint.SECTION_BUMP_PAGE_TABLE -> deserializeBumpPageTable(payload, sb);
+                case Checkpoint.SECTION_TREE_TABLE -> deserializeTreeTable(payload, sb);
+                case Checkpoint.SECTION_DICT_TABLE -> deserializeDictTable(payload, sb);
+                case Checkpoint.SECTION_SCHEMA_BINDING -> sb.schemaBinding = payload;
+                // Unknown section types are ignored for forward-compat.
             }
         }
         return sb;
@@ -117,11 +140,11 @@ public final class CheckpointIO {
     // Section serialization helpers
     // -----------------------------------------------------------------------
 
-    private static CheckpointV2.SectionRef inlineSection(int sectionType, byte[] data,
+    private static Checkpoint.SectionRef inlineSection(int sectionType, byte[] data,
                                                           int inlineOffset) {
-        return new CheckpointV2.SectionRef(
+        return new Checkpoint.SectionRef(
             sectionType,
-            CheckpointV2.ENCODING_INLINE,
+            Checkpoint.ENCODING_INLINE,
             (short) 0,  // flags
             0,           // itemCount (not used for these sections)
             data.length, // payloadBytes

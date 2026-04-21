@@ -32,7 +32,7 @@ public final class PersistenceManager {
     /** Create for a new file-backed store (generation 0, slot A active). */
     public PersistenceManager(ChunkStore chunkStore) {
         this.chunkStore = chunkStore;
-        this.activeSlotPage = CheckpointV2.SLOT_A_PAGE;
+        this.activeSlotPage = Checkpoint.SLOT_A_PAGE;
     }
 
     /** Restore from an existing store with known generation and active slot. */
@@ -50,21 +50,21 @@ public final class PersistenceManager {
     // -----------------------------------------------------------------------
 
     /**
-     * Write a v2 checkpoint to the inactive slot (mirrored A/B).
+     * Write a checkpoint to the inactive slot (mirrored A/B).
      * Each call toggles between slot A and slot B, so a torn write
      * to the new slot never corrupts the previous valid checkpoint.
      */
     public void writeCheckpoint(Superblock.SuperblockData metadata) {
-        int targetSlotPage = CheckpointV2.inactiveSlotPage(activeSlotPage);
-        long targetSlotId = (targetSlotPage == CheckpointV2.SLOT_A_PAGE) ? 0 : 1;
+        int targetSlotPage = Checkpoint.inactiveSlotPage(activeSlotPage);
+        long targetSlotId = (targetSlotPage == Checkpoint.SLOT_A_PAGE) ? 0 : 1;
         generation++;
 
         var cpData = CheckpointIO.toCheckpoint(metadata, generation, targetSlotId);
         // Checkpoint slot pages may have been synced in a previous cycle — re-mark dirty
         chunkStore.markDirty(targetSlotPage);
-        MemorySegment slot = chunkStore.resolve(targetSlotPage, CheckpointV2.SLOT_SIZE_PAGES);
+        MemorySegment slot = chunkStore.resolve(targetSlotPage, Checkpoint.SLOT_SIZE_PAGES);
         slot.fill((byte) 0);
-        CheckpointV2.write(slot, cpData);
+        Checkpoint.write(slot, cpData);
 
         activeSlotPage = targetSlotPage;
     }

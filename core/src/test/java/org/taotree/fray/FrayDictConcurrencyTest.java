@@ -23,7 +23,7 @@ class FrayDictConcurrencyTest extends FrayTestBase {
     @FrayTest(iterations = 10)
     void concurrentInternDistinct() throws Exception {
         Path tmpDir = newTempDir();
-        try (var tree = TaoTree.forDictionaries(tmpDir.resolve("t.tao"))) {
+        try (var tree = TaoTree.create(tmpDir.resolve("t.tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
             var errors = new java.util.concurrent.ConcurrentLinkedQueue<Throwable>();
             int[] codeA = new int[1], codeB = new int[1];
@@ -51,7 +51,7 @@ class FrayDictConcurrencyTest extends FrayTestBase {
     @FrayTest(iterations = 10)
     void concurrentInternSameString() throws Exception {
         Path tmpDir = newTempDir();
-        try (var tree = TaoTree.forDictionaries(tmpDir.resolve("t.tao"))) {
+        try (var tree = TaoTree.create(tmpDir.resolve("t.tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
             var errors = new java.util.concurrent.ConcurrentLinkedQueue<Throwable>();
             int[] codeA = new int[1], codeB = new int[1];
@@ -82,7 +82,7 @@ class FrayDictConcurrencyTest extends FrayTestBase {
     @FrayTest(iterations = 10)
     void internWhileResolve() throws Exception {
         Path tmpDir = newTempDir();
-        try (var tree = TaoTree.forDictionaries(tmpDir.resolve("t.tao"))) {
+        try (var tree = TaoTree.create(tmpDir.resolve("t.tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
             var errors = new java.util.concurrent.ConcurrentLinkedQueue<Throwable>();
             int[] internCode = new int[1];

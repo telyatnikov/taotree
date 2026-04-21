@@ -33,9 +33,9 @@ class MappedTaoDictionaryTest {
         Path file = tmp.resolve("test.tao");
 
         // Phase 1: create tree + dict, intern strings, close
-        try (var tree = TaoTree.create(file, KEY_LEN, VALUE_SIZE)) {
+        try (var tree = TaoTree.create(file, org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint32("id")))) {
             var dict = TaoDictionary.u16(tree);
-            assertEquals(1, tree.dictionaryCount());
+            assertEquals(2, tree.dictionaryCount());
 
             int animalia = dict.intern("Animalia");
             int plantae = dict.intern("Plantae");
@@ -48,9 +48,9 @@ class MappedTaoDictionaryTest {
         }
 
         // Phase 2: reopen and verify dict is restored
-        try (var tree = TaoTree.open(file)) {
-            assertEquals(1, tree.dictionaryCount());
-            var dict = tree.dictionary(0);
+        try (var tree = TaoTree.open(file, org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint32("id")))) {
+            assertEquals(2, tree.dictionaryCount());
+            var dict = tree.dictionary(1);
             assertNotNull(dict);
 
             // Resolve should find all interned strings with same codes
@@ -67,8 +67,8 @@ class MappedTaoDictionaryTest {
         }
 
         // Phase 3: reopen again, verify new entry persisted
-        try (var tree = TaoTree.open(file)) {
-            var dict = tree.dictionary(0);
+        try (var tree = TaoTree.open(file, org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint32("id")))) {
+            var dict = tree.dictionary(1);
             assertEquals(4, dict.size());
             assertEquals(4, dict.resolve("Bacteria"));
         }
@@ -79,12 +79,12 @@ class MappedTaoDictionaryTest {
         Path file = tmp.resolve("test.tao");
 
         // Phase 1: create tree + 3 dicts
-        try (var tree = TaoTree.create(file, KEY_LEN, VALUE_SIZE)) {
+        try (var tree = TaoTree.create(file, org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint32("id")))) {
             var kingdomDict = TaoDictionary.u16(tree);
             var familyDict = TaoDictionary.u16(tree);
             var countryDict = TaoDictionary.u32(tree);
 
-            assertEquals(3, tree.dictionaryCount());
+            assertEquals(4, tree.dictionaryCount());
 
             kingdomDict.intern("Animalia");
             kingdomDict.intern("Plantae");
@@ -102,12 +102,12 @@ class MappedTaoDictionaryTest {
         }
 
         // Phase 2: reopen and verify all dicts restored
-        try (var tree = TaoTree.open(file)) {
-            assertEquals(3, tree.dictionaryCount());
+        try (var tree = TaoTree.open(file, org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint32("id")))) {
+            assertEquals(4, tree.dictionaryCount());
 
-            var kingdomDict = tree.dictionary(0);
-            var familyDict = tree.dictionary(1);
-            var countryDict = tree.dictionary(2);
+            var kingdomDict = tree.dictionary(1);
+            var familyDict = tree.dictionary(2);
+            var countryDict = tree.dictionary(3);
 
             assertEquals(2, kingdomDict.size());
             assertEquals(1, kingdomDict.resolve("Animalia"));
@@ -129,7 +129,7 @@ class MappedTaoDictionaryTest {
         Path file = tmp.resolve("test.tao");
 
         // Phase 1: dict + data tree together
-        try (var tree = TaoTree.create(file, KEY_LEN, VALUE_SIZE)) {
+        try (var tree = TaoTree.create(file, org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint32("id")))) {
             var dict = TaoDictionary.u16(tree);
 
             // Intern some strings
@@ -148,7 +148,7 @@ class MappedTaoDictionaryTest {
         }
 
         // Phase 2: verify both data tree and dict
-        try (var tree = TaoTree.open(file)) {
+        try (var tree = TaoTree.open(file, org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint32("id")))) {
             // Data tree
             try (var r = tree.read()) {
                 assertEquals(50, r.size());
@@ -161,8 +161,8 @@ class MappedTaoDictionaryTest {
             }
 
             // Dict
-            assertEquals(1, tree.dictionaryCount());
-            var dict = tree.dictionary(0);
+            assertEquals(2, tree.dictionaryCount());
+            var dict = tree.dictionary(1);
             assertEquals(2, dict.size());
             assertEquals(1, dict.resolve("Alpha"));
             assertEquals(2, dict.resolve("Beta"));
@@ -174,7 +174,7 @@ class MappedTaoDictionaryTest {
         Path file = tmp.resolve("test.tao");
 
         // Phase 1: intern 1000 unique strings
-        try (var tree = TaoTree.create(file, KEY_LEN, VALUE_SIZE)) {
+        try (var tree = TaoTree.create(file, org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint32("id")))) {
             var dict = TaoDictionary.u16(tree);
             for (int i = 0; i < 1000; i++) {
                 int code = dict.intern("string_" + i);
@@ -184,8 +184,8 @@ class MappedTaoDictionaryTest {
         }
 
         // Phase 2: verify all 1000 strings
-        try (var tree = TaoTree.open(file)) {
-            var dict = tree.dictionary(0);
+        try (var tree = TaoTree.open(file, org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint32("id")))) {
+            var dict = tree.dictionary(1);
             assertEquals(1000, dict.size());
 
             for (int i = 0; i < 1000; i++) {

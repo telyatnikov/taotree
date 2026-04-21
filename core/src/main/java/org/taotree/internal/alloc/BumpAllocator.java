@@ -6,16 +6,15 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import org.taotree.TaoString;
 
 /**
  * Append-only bump allocator for variable-length, immutable payloads.
  *
- * <p>Primary use case: overflow storage for {@code TaoString} leaves (strings longer
+ * <p>Primary use case: overflow storage for string leaves (strings longer
  * than 12 bytes). Also suitable for any immutable blob that doesn't fit a fixed slab class.
  *
  * <p>Payloads are packed contiguously within pages with no per-entry metadata. The length
- * of each payload is known by the caller (stored in the TaoString leaf's {@code len} field).
+ * of each payload is known by the caller (stored in the string leaf's {@code len} field).
  *
  * <p>Pages are allocated from a {@link ChunkStore} (file-backed).
  *
@@ -115,6 +114,50 @@ public final class BumpAllocator implements AutoCloseable {
         int pageId = OverflowPtr.pageId(overflowPtr);
         int offset = OverflowPtr.offset(overflowPtr);
         return pages[pageId].asSlice(offset, length);
+    }
+
+    /**
+     * Best-effort structural validation that {@code ref} could have been produced by
+     * this allocator's {@link #allocate} for a slot of {@code length} bytes.
+     *
+     * <p>Returns {@code true} iff the decoded {@code (pageId, offset)} fall within
+     * some allocated page and {@code offset + length} fits its backing size. Pages
+     * before {@link #currentPage} are fully populated so {@code offset < pageSize};
+     * for the current page {@code offset < bumpOffset}.
+     *
+     * <p>This is used by the raw temporal API to reject callers passing opaque
+     * synthetic longs (e.g., {@code 100L}) as value refs — such refs will alias
+     * into live bump-page bytes and cause silent duplicate detection errors via
+     * {@code ValueCodec.slotEquals}. It is not a security boundary: a caller that
+     * constructs a structurally-plausible but semantically-wrong ref can still
+     * cause incorrect merging. Callers must pass refs produced by
+     * {@code ValueCodec.encodeStandalone}.
+     */
+    public boolean isValidSlotRef(long ref, int length) {
+        if (ref <= 0 || length <= 0) return false;
+        int pageId = OverflowPtr.pageId(ref);
+        int offset = OverflowPtr.offset(ref);
+        if (pageId < 0 || pageId >= pageCount) return false;
+        if (offset < 0) return false;
+        var page = pages[pageId];
+        if (page == null) return false;
+        long pageBytes = page.byteSize();
+        if ((long) offset + length > pageBytes) return false;
+        // Past-current page: nothing has been allocated there yet.
+        if (pageId > currentPage) return false;
+        // Current page: offset must be before the bump cursor.
+        if (pageId == currentPage && (long) offset + length > bumpOffset) return false;
+        return true;
+    }
+
+    /**
+     * Return the raw backing {@link MemorySegment} for a page without slicing. Used on
+     * performance-critical read paths (e.g., {@code ChampMap.iterate}) to avoid creating
+     * a fresh {@code MemorySegment} per node via {@link #resolve}. The caller is
+     * responsible for reading only within validly-allocated byte ranges on the page.
+     */
+    public MemorySegment page(int pageId) {
+        return pages[pageId];
     }
 
     /** Total payload bytes allocated (including dead space from deleted leaves). */

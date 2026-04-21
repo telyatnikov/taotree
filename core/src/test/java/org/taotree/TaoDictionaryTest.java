@@ -14,7 +14,7 @@ class TaoDictionaryTest {
 
     @Test
     void internBasic() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
 
             int code1 = dict.intern("Animalia");
@@ -31,7 +31,7 @@ class TaoDictionaryTest {
 
     @Test
     void resolveOnly() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
             dict.intern("Chordata");
             assertEquals(-1, dict.resolve("Unknown"));
@@ -41,7 +41,7 @@ class TaoDictionaryTest {
 
     @Test
     void monotonicallyIncreasing() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
             int c1 = dict.intern("first");
             int c2 = dict.intern("second");
@@ -53,7 +53,7 @@ class TaoDictionaryTest {
 
     @Test
     void nullSentinel() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
             int code = dict.intern("test");
             assertEquals(1, code);
@@ -62,7 +62,7 @@ class TaoDictionaryTest {
 
     @Test
     void manyEntries() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u32(tree);
             String[] names = {
                 "Animalia", "Plantae", "Fungi", "Protista", "Archaea", "Bacteria", "Chromista",
@@ -92,7 +92,7 @@ class TaoDictionaryTest {
 
     @Test
     void u16TaoDictionaryCapacity() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = new TaoDictionary(tree, 3, 1);
             dict.intern("a");
             dict.intern("b");
@@ -103,7 +103,7 @@ class TaoDictionaryTest {
 
     @Test
     void newDictEntryCodeIsNeverZero() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
             // All assigned codes must be > 0 (0 is sentinel)
             for (int i = 0; i < 50; i++) {
@@ -117,7 +117,7 @@ class TaoDictionaryTest {
 
     @Test
     void ownerReturnsTree() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
             assertSame(tree, dict.owner());
         }
@@ -127,7 +127,7 @@ class TaoDictionaryTest {
 
     @Test
     void nextCodeTracksState() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
             assertEquals(1, dict.nextCode()); // starts at 1
             dict.intern("first");
@@ -143,7 +143,7 @@ class TaoDictionaryTest {
 
     @Test
     void scopedReadAccess() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
             dict.intern("test");
 
@@ -157,7 +157,7 @@ class TaoDictionaryTest {
 
     @Test
     void scopedWriteAccess() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
 
             try (var w = dict.write()) {
@@ -174,7 +174,7 @@ class TaoDictionaryTest {
 
     @Test
     void sizeTracksEntries() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
             assertEquals(0, dict.size());
             dict.intern("a");
@@ -190,7 +190,7 @@ class TaoDictionaryTest {
 
     @Test
     void longStringNearMaxKeyLen() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u32(tree);
             // Create a string that, after encoding, fits within 128 bytes
             StringBuilder sb = new StringBuilder();
@@ -205,7 +205,7 @@ class TaoDictionaryTest {
 
     @Test
     void readScopeCloseReleasesLock() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
             dict.intern("test");
 
@@ -224,7 +224,7 @@ class TaoDictionaryTest {
 
     @Test
     void writeScopeCloseReleasesLock() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
 
             // Open and close a write scope
@@ -243,7 +243,7 @@ class TaoDictionaryTest {
 
     @Test
     void stringExceedingMaxKeyLenThrows() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u32(tree);
             // Create a string whose encoded form exceeds 128 bytes
             // Each char is 1 byte in UTF-8 + null terminator, so 128 chars → 129 bytes encoded
@@ -257,7 +257,7 @@ class TaoDictionaryTest {
 
     @Test
     void stringExactlyAtMaxKeyLenSucceeds() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u32(tree);
             // Encoded form = raw bytes + null terminator.
             // 127 chars → 127 bytes + 1 null = 128 bytes = MAX_KEY_LEN → should succeed
@@ -273,7 +273,7 @@ class TaoDictionaryTest {
 
     @Test
     void writeScopeCloseReleasesLockFromAnotherThread() throws Exception {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var dict = TaoDictionary.u16(tree);
 
             // Open write scope and close it
@@ -296,7 +296,7 @@ class TaoDictionaryTest {
 
     @Test
     void copyFromSelfLocking() throws IOException {
-        try (var tree = TaoTree.forDictionaries(tmp.resolve(fc++ + ".tao"))) {
+        try (var tree = TaoTree.create(tmp.resolve(fc++ + ".tao"), org.taotree.layout.KeyLayout.of(org.taotree.layout.KeyField.uint8("k")))) {
             var source = TaoDictionary.u16(tree);
             source.intern("hello");
 

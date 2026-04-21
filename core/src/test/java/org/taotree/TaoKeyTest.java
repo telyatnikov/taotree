@@ -150,6 +150,44 @@ class TaoKeyTest {
         assertTrue(compareBytesArr(abd, abcd) > 0); // 'd' > 'c' + terminator
     }
 
+    @Test
+    void decodeStringRoundTripEmpty() {
+        byte[] encoded = TaoKey.encodeString("");
+        assertEquals("", TaoKey.decodeString(encoded));
+    }
+
+    @Test
+    void decodeStringRoundTripBasic() {
+        byte[] encoded = TaoKey.encodeString("hello");
+        assertEquals("hello", TaoKey.decodeString(encoded));
+    }
+
+    @Test
+    void decodeStringRoundTripNullByte() {
+        // A string containing an actual NUL byte
+        String s = "\u0000";
+        byte[] encoded = TaoKey.encodeStringBytes(s.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        assertEquals(s, TaoKey.decodeString(encoded));
+    }
+
+    @Test
+    void decodeStringRoundTripEscapedBytes() {
+        // String containing 0x00 and 0x01 bytes interleaved with regular chars
+        byte[] raw = {0x41, 0x00, 0x42, 0x01, 0x43};
+        byte[] encoded = TaoKey.encodeStringBytes(raw);
+        String decoded = TaoKey.decodeString(encoded);
+        byte[] decodedBytes = decoded.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+        assertArrayEquals(raw, decodedBytes);
+    }
+
+    @Test
+    void decodeStringRoundTripAllAscii() {
+        String s = "abc\u0000def\u0001ghi";
+        byte[] raw = s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] encoded = TaoKey.encodeStringBytes(raw);
+        assertEquals(s, TaoKey.decodeString(encoded));
+    }
+
     // -- helpers --
 
     private static int compareBytes(MemorySegment a, MemorySegment b, int len) {

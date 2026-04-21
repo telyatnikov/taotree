@@ -2,16 +2,19 @@ package org.taotree.jmh;
 
 import org.openjdk.jmh.annotations.*;
 import org.taotree.*;
+import org.taotree.layout.KeyField;
+import org.taotree.layout.KeyHandle;
+import org.taotree.layout.KeyLayout;
 
 import java.io.IOException;
-import java.lang.foreign.ValueLayout;
+import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
 /**
- * JMH benchmarks for ART point lookup and insert throughput.
+ * JMH benchmarks for ART point lookup and insert throughput using the temporal API.
  */
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.SECONDS)
@@ -21,14 +24,13 @@ import java.util.concurrent.TimeUnit;
 @Fork(1)
 public class TaoTreeBenchmark {
 
-    private static final int KEY_LEN = 16;
-    private static final int VALUE_SIZE = 24;
-
     @Param({"10000", "100000", "1000000"})
     int keyCount;
 
     private TaoTree tree;
-    private byte[][] keys;
+    private Arena arena;
+    private org.taotree.layout.KeyBuilder[] keyBuilders;
+    private KeyHandle.UInt32 idHandle;
     private int lookupIndex;
 
     @Setup(Level.Trial)
@@ -36,16 +38,22 @@ public class TaoTreeBenchmark {
         Path tmp = Files.createTempFile("jmh-taotree-", ".dat");
         tmp.toFile().deleteOnExit();
         Files.delete(tmp);
-        tree = TaoTree.create(tmp, KEY_LEN, VALUE_SIZE, 4L * 1024 * 1024, false);
+
+        KeyLayout layout = KeyLayout.of(KeyField.uint32("id"));
+        tree = TaoTree.create(tmp, layout);
+        idHandle = tree.keyUint32("id");
+        arena = Arena.ofShared();
 
         var rng = new Random(42);
-        keys = new byte[keyCount][KEY_LEN];
+        keyBuilders = new org.taotree.layout.KeyBuilder[keyCount];
+        for (int i = 0; i < keyCount; i++) {
+            keyBuilders[i] = tree.newKeyBuilder(arena);
+            keyBuilders[i].set(idHandle, rng.nextInt());
+        }
 
         try (var w = tree.write()) {
             for (int i = 0; i < keyCount; i++) {
-                rng.nextBytes(keys[i]);
-                long leaf = w.getOrCreate(keys[i], 0);
-                w.leafValue(leaf).set(ValueLayout.JAVA_LONG_UNALIGNED, 0, (long) i);
+                w.put(keyBuilders[i], "v", Value.ofInt(i));
             }
         }
         lookupIndex = 0;
@@ -53,31 +61,33 @@ public class TaoTreeBenchmark {
 
     @TearDown(Level.Trial)
     public void tearDown() {
+        arena.close();
         tree.close();
     }
 
     @Benchmark
-    public long lookupExisting() {
-        byte[] key = keys[lookupIndex++ % keyCount];
+    public Value lookupExisting() {
+        var kb = keyBuilders[lookupIndex++ % keyCount];
         try (var r = tree.read()) {
-            return r.lookup(key);
+            return r.get(kb, "v");
         }
     }
 
     @Benchmark
-    public long lookupMissing() {
-        byte[] key = keys[lookupIndex++ % keyCount].clone();
-        key[KEY_LEN - 1] ^= (byte) 0xFF;
-        try (var r = tree.read()) {
-            return r.lookup(key);
+    public Value lookupMissing() {
+        try (var missArena = Arena.ofConfined();
+             var r = tree.read()) {
+            var kb = tree.newKeyBuilder(missArena);
+            kb.set(idHandle, Integer.MIN_VALUE ^ (lookupIndex++ % keyCount));
+            return r.get(kb, "v");
         }
     }
 
     @Benchmark
-    public long getOrCreateExisting() {
-        byte[] key = keys[lookupIndex++ % keyCount];
+    public boolean insertOrUpdate() {
+        var kb = keyBuilders[lookupIndex++ % keyCount];
         try (var w = tree.write()) {
-            return w.getOrCreate(key, 0);
+            return w.put(kb, "v", Value.ofInt(lookupIndex));
         }
     }
 }
